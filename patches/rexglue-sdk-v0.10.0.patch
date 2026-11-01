@@ -1,0 +1,2010 @@
+diff --git a/include/rex/ui/d3d12/d3d12_presenter.h b/include/rex/ui/d3d12/d3d12_presenter.h
+index 83d09f7..8928d1d 100644
+--- a/include/rex/ui/d3d12/d3d12_presenter.h
++++ b/include/rex/ui/d3d12/d3d12_presenter.h
+@@ -16,6 +16,7 @@
+ #include <utility>
+ 
+ #include <rex/math.h>
++#include <rex/ui/d3d12/d3d12_frame_interpolator.h>
+ #include <rex/ui/d3d12/d3d12_provider.h>
+ #include <rex/ui/d3d12/d3d12_submission_tracker.h>
+ #include <rex/ui/presenter.h>
+@@ -275,6 +276,13 @@ class D3D12Presenter final : public Presenter {
+ 
+   const D3D12Provider& provider_;
+ 
++  // NG2 ADDITION: vendor-neutral frame generation (cvar frame_generation).
++  std::unique_ptr<D3D12FrameInterpolator> frame_interpolator_;
++  bool frame_interpolator_failed_ = false;
++  std::chrono::steady_clock::time_point frame_gen_last_new_frame_{};
++  double frame_gen_interval_us_ = 16667.0;
++  bool frame_gen_showing_generated_ = false;  // last new-frame paint showed a generated frame
++
+   // Whether DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING is supported by DXGI (depends in
+   // particular on the Windows 10 version and hardware support), primarily for
+   // variable refresh rate support.
+diff --git a/include/rex/ui/imgui_dialog.h b/include/rex/ui/imgui_dialog.h
+index a7ab6b3..4b6cb11 100644
+--- a/include/rex/ui/imgui_dialog.h
++++ b/include/rex/ui/imgui_dialog.h
+@@ -39,6 +39,12 @@ class ImGuiDialog {
+ 
+   void Draw();
+ 
++  // NG2 ADDITION: whether the ImGui drawer should keep requesting UI repaints every
++  // host tick while this dialog is open. Dialogs that only overlay guest frames can
++  // return false and get drawn when the guest presents, so the host presents once per
++  // guest frame (needed for driver frame generation such as NVIDIA Smooth Motion).
++  virtual bool WantsContinuousPaint() const { return true; }
++
+  protected:
+   ImGuiDialog(ImGuiDrawer* imgui_drawer);
+ 
+diff --git a/include/rex/ui/overlay/achievement_toast.h b/include/rex/ui/overlay/achievement_toast.h
+index 7642601..5f9fc16 100644
+--- a/include/rex/ui/overlay/achievement_toast.h
++++ b/include/rex/ui/overlay/achievement_toast.h
+@@ -35,6 +35,12 @@ class AchievementToastDialog : public AchievementNotificationDialog {
+   // Thread-safe: safe to call from any thread, including guest threads.
+   void Push(const rex::system::AchievementEvent& event) override;
+ 
++  // NG2 ADDITION: idle toasts don't force continuous host repaints.
++  bool WantsContinuousPaint() const override {
++    std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mutex_));
++    return !queue_.empty();
++  }
++
+  protected:
+   void OnDraw(ImGuiIO& io) override;
+ 
+diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
+index afb4a30..9cfa510 100644
+--- a/include/rex/ui/presenter.h
++++ b/include/rex/ui/presenter.h
+@@ -13,6 +13,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
++#include <chrono>
+ #include <climits>
+ #include <cmath>
+ #include <condition_variable>
+@@ -668,6 +669,15 @@ class Presenter {
+   [[nodiscard]] std::unique_lock<std::mutex> ConsumeGuestOutput(
+       uint32_t& mailbox_index_or_max_if_inactive_out, GuestOutputProperties* properties_out,
+       GuestOutputPaintConfig* paint_config_out);
++  // NG2 ADDITION (frame generation): whether the last ConsumeGuestOutput acquired an
++  // image the guest produced since the previous consumption. Consumer-side only.
++  bool LastConsumedGuestOutputIsNew() const { return guest_output_last_consume_new_; }
++  // NG2 ADDITION (frame generation): paint again after the delay (from a timer thread),
++  // through the same path a guest output refresh uses. A later request replaces an
++  // earlier pending one.
++  void RequestPaintAfterDelay(std::chrono::microseconds delay);
++  // Must be called by derived destructors before their state goes away.
++  void StopDelayedPaint();
+   // The properties are passed explicitly, not taken from the current acquired
+   // image, so it can be called for a copy of the acquired image's properties
+   // outside the consumer lock if the implementation has its own synchronization
+@@ -1051,6 +1061,16 @@ class Presenter {
+ 
+   std::thread dxgi_ui_tick_thread_;
+ #endif  // XE_PLATFORM
++
++  // NG2 ADDITION (frame generation).
++  bool guest_output_last_consume_new_ = false;
++  void DelayedPaintThread();
++  std::mutex delayed_paint_mutex_;
++  std::condition_variable delayed_paint_condition_;
++  std::chrono::steady_clock::time_point delayed_paint_deadline_{};
++  bool delayed_paint_pending_ = false;
++  bool delayed_paint_shutdown_ = false;
++  std::thread delayed_paint_thread_;
+ };
+ 
+ }  // namespace ui
+diff --git a/include/rex/ui/window.h b/include/rex/ui/window.h
+index f607be2..0b12328 100644
+--- a/include/rex/ui/window.h
++++ b/include/rex/ui/window.h
+@@ -274,6 +274,10 @@ class Window {
+   bool IsFullscreen() const { return fullscreen_; }
+   void SetFullscreen(bool new_fullscreen);
+ 
++  // NG2 ADDITION: move the open window to a display (1-based enumeration order, same
++  // numbering as the `monitor` cvar; 0 = primary), keeping its fullscreen state.
++  virtual void MoveToMonitor(int32_t monitor_index) { (void)monitor_index; }
++
+   // Desired state stored by the common Window, externally modifiable, read-only
+   // in the implementation.
+   const std::string& GetTitle() const { return title_; }
+diff --git a/include/rex/ui/window_sdl.h b/include/rex/ui/window_sdl.h
+index 71e7473..83cb2fe 100644
+--- a/include/rex/ui/window_sdl.h
++++ b/include/rex/ui/window_sdl.h
+@@ -50,6 +50,11 @@ class WindowSDL final : public Window {
+   void RequestCloseImpl() override;
+ 
+   void ApplyNewFullscreen() override;
++
++ public:
++  void MoveToMonitor(int32_t monitor_index) override;  // NG2 ADDITION
++
++ protected:
+   void ApplyNewTitle() override;
+   void ApplyNewMouseCapture() override;
+   void ApplyNewMouseRelease() override;
+diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
+index 20a2cd8..4edf38e 100644
+--- a/src/audio/sdl/sdl_audio_driver.cpp
++++ b/src/audio/sdl/sdl_audio_driver.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <cstring>
+ 
+ #include <rex/assert.h>
+@@ -28,6 +29,9 @@ REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
+ 
+ namespace rex::audio::sdl {
+ 
++// NG2 DIAG: count SDL callbacks that found no queued frame (played silence).
++static std::atomic<uint64_t> g_ng2_silence_fills{0};
++
+ SDLAudioDriver::SDLAudioDriver(memory::Memory* memory, rex::thread::Semaphore* semaphore)
+     : AudioDriver(memory), semaphore_(semaphore) {}
+ 
+@@ -131,11 +135,31 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
+     sdl_submit_count++;
+   }
+ 
++  size_t queued_now;
+   {
+     std::unique_lock<std::mutex> guard(frames_mutex_);
+     frames_queued_.push(output_frame);
++    queued_now = frames_queued_.size();
+     PROFILE_BUFFER_QUEUE_DEPTH(static_cast<int64_t>(frames_queued_.size()));
+   }
++
++  {  // NG2 DIAG: audio heartbeat (frames submitted, queue depth, peak level, underruns)
++    static uint32_t submitted = 0;
++    static float window_peak = 0.0f;
++    const auto* raw = reinterpret_cast<const uint32_t*>(output_frame);
++    for (size_t i = 0; i < frame_samples_; ++i) {
++      uint32_t u = rex::byte_swap(raw[i]);
++      float f;
++      std::memcpy(&f, &u, sizeof(f));
++      f = f < 0 ? -f : f;
++      if (f > window_peak && f < 1e6f) window_peak = f;
++    }
++    if ((++submitted % 1000) == 0) {
++      REXAPU_WARN("NG2DIAG AUDIO frames {} queued {} peak {:.4f} silence_fills {}", submitted,
++                  queued_now, window_peak, g_ng2_silence_fills.load());
++      window_peak = 0.0f;
++    }
++  }
+ }
+ 
+ void SDLAudioDriver::Shutdown() {
+@@ -182,6 +206,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+     static uint32_t sdl_callback_count = 0;
+     std::unique_lock<std::mutex> guard(driver->frames_mutex_);
+     if (driver->frames_queued_.empty()) {
++      g_ng2_silence_fills.fetch_add(1);  // NG2 DIAG
+       if (sdl_callback_count < 10) {
+         REXAPU_DEBUG("SDLCallback: no frames queued (silence)");
+         sdl_callback_count++;
+@@ -191,6 +216,14 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+         REXAPU_ERROR("SDL_PutAudioStreamData() failed while filling silence: {}", SDL_GetError());
+         break;
+       }
++      // NG2 FIX: the render clock keeps ticking while we play silence, so give the
++      // guest its callback slot back. Previously a token was returned only when a
++      // queued frame was consumed; every time the guest callback returned without
++      // submitting a frame one token was lost for good, and once all queued_frames_
++      // tokens were gone the audio worker never ran the callback again (permanent
++      // silence while the game kept running). Release fails harmlessly at the
++      // semaphore's maximum, so tokens never exceed the normal in-flight count.
++      driver->semaphore_->Release(1, nullptr);
+       additional_amount -= len;
+     } else {
+       auto buffer = driver->frames_queued_.front();
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index a744375..a5179c5 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -10,6 +10,9 @@
+  */
+ 
+ #include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <mutex>
+ #include <cinttypes>
+ #include <cmath>
+ #include <cstring>
+@@ -37,6 +40,15 @@
+ 
+ REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+ 
++// NG2 FIX: ring-reset synchronization between VdInitializeRingBuffer (guest thread)
++// and the command processor worker. File-scope so CommandProcessor's layout (and
++// the SDK ABI) is unchanged; there is one command processor per process.
++static std::atomic<uint32_t> g_ring_gen{0};
++static std::mutex& RingResetMutex() {
++  static std::mutex m;
++  return m;
++}
++
+ REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
+                     "Refresh page-valid state from GPU-written memory at frame end. "
+                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
+@@ -210,7 +222,13 @@ void CommandProcessor::WorkerThreadMain() {
+       fn();
+     }
+ 
+-    uint32_t write_ptr_index = write_ptr_index_.load();
++    uint32_t write_ptr_index;
++    uint32_t ring_gen;
++    {
++      std::lock_guard<std::mutex> lock(RingResetMutex());
++      write_ptr_index = write_ptr_index_.load();
++      ring_gen = g_ring_gen.load();
++    }
+     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
+       SCOPE_profile_cpu_i("gpu", "rex::graphics::CommandProcessor::Stall");
+       // We've run out of commands to execute.
+@@ -228,7 +246,11 @@ void CommandProcessor::WorkerThreadMain() {
+ 
+         rex::thread::MaybeYield();
+         loop_count++;
+-        write_ptr_index = write_ptr_index_.load();
++        {
++          std::lock_guard<std::mutex> lock(RingResetMutex());
++          write_ptr_index = write_ptr_index_.load();
++          ring_gen = g_ring_gen.load();
++        }
+       } while (worker_running_ && pending_fns_.empty() &&
+                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
+       ReturnFromWait();
+@@ -239,7 +261,21 @@ void CommandProcessor::WorkerThreadMain() {
+     assert_true(read_ptr_index_ != write_ptr_index);
+ 
+     // Execute. Note that we handle wraparound transparently.
+-    read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
++    // NG2 FIX: VdInitializeRingBuffer can reset the ring while we execute (or between
++    // sampling the pointers and executing). Only commit the new read pointer if no
++    // reset happened; otherwise the reset already set read=write=0 and anything we
++    // would replay from the old ring is stale.
++    uint32_t start_read = read_ptr_index_;
++    if (g_ring_gen.load() != ring_gen) {
++      continue;
++    }
++    uint32_t new_read = ExecutePrimaryBuffer(start_read, write_ptr_index);
++    {
++      std::lock_guard<std::mutex> lock(RingResetMutex());
++      if (g_ring_gen.load() == ring_gen) {
++        read_ptr_index_ = new_read;
++      }
++    }
+ 
+     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
+     //     that many indices.
+@@ -312,9 +348,18 @@ bool CommandProcessor::SetupContext() {
+ void CommandProcessor::ShutdownContext() {}
+ 
+ void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
+-  read_ptr_index_ = 0;
++  REXGPU_ERROR("NG2DIAG InitializeRingBuffer ptr {:08X} size_log2 {} (old ptr {:08X} rd {:X} wr {:X})",
++               ptr, size_log2, primary_buffer_ptr_, read_ptr_index_, write_ptr_index_.load());
++  // NG2 FIX: a ring (re)initialization resets both pointers, like the hardware does.
++  // Previously only the read pointer was reset, so until the guest wrote the new
++  // CP_RB_WPTR the GPU thread replayed the stale ring from 0 to the old write
++  // pointer, executing indirect buffers whose memory had already been reused.
++  std::lock_guard<std::mutex> lock(RingResetMutex());
++  g_ring_gen.fetch_add(1);
+   primary_buffer_ptr_ = ptr;
+   primary_buffer_size_ = uint32_t(1) << (size_log2 + 3);
++  read_ptr_index_ = 0;
++  write_ptr_index_.store(0);
+ }
+ 
+ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) {
+@@ -328,6 +373,14 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_s
+ }
+ 
+ void CommandProcessor::UpdateWritePointer(uint32_t value) {
++  {  // NG2 DIAG: log write-pointer moves that go backwards (wrap/reset)
++    uint32_t old = write_ptr_index_.load();
++    static int n = 0;
++    if (old != 0xBAADF00D && value < old && n++ < 40) {
++      REXGPU_ERROR("NG2DIAG WPTR back {:X} -> {:X} (rd {:X}, size dw {:X})", old, value,
++                   read_ptr_index_, primary_buffer_size_ / 4);
++    }
++  }
+   write_ptr_index_ = value;
+   write_ptr_index_event_->Set();
+ }
+@@ -619,10 +672,24 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
+   memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
+   reader.set_read_offset(read_index * sizeof(uint32_t));
+   reader.set_write_offset(write_index * sizeof(uint32_t));
++  uint32_t ng2_last_pkt_off = reader.read_offset();  // NG2 DIAG
+   do {
++    ng2_last_pkt_off = reader.read_offset();  // NG2 DIAG
+     if (!ExecutePacket(&reader)) {
+       // This probably should be fatal - but we're going to continue anyways.
+       REXGPU_ERROR("**** PRIMARY RINGBUFFER: Failed to execute packet.");
++      {  // NG2 DIAG: dump ring around the failing packet header
++        auto* w = memory_->TranslatePhysical<const uint32_t*>(primary_buffer_ptr_);
++        uint32_t n = primary_buffer_size_ / 4, at = ng2_last_pkt_off / 4;
++        REXGPU_ERROR("NG2DIAG RB fail: base {:08X} size {:X} rd {:X} wr {:X} pkt_at {:X}",
++                     primary_buffer_ptr_, primary_buffer_size_, read_index, write_index, at);
++        for (int k = -12; k <= 8; k += 4) {
++          uint32_t i = (at + n + k) % n;
++          REXGPU_ERROR("NG2DIAG   [{:+3}] {:08X} {:08X} {:08X} {:08X}", k,
++                       rex::byte_swap(w[i]), rex::byte_swap(w[(i + 1) % n]),
++                       rex::byte_swap(w[(i + 2) % n]), rex::byte_swap(w[(i + 3) % n]));
++        }
++      }
+       assert_always();
+       break;
+     }
+@@ -633,9 +700,61 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
+   return write_index;
+ }
+ 
++// NG2 DIAG: walk PM4 packet headers without executing; true if the packets end
++// exactly at `count` dwords.
++static bool Ng2IbWellFormed(const uint32_t* w, uint32_t count, uint32_t* bad_at) {
++  uint32_t i = 0;
++  while (i < count) {
++    uint32_t p = rex::byte_swap(w[i]);
++    uint32_t len;
++    if (p == 0) {
++      len = 1;
++    } else {
++      switch (p >> 30) {
++        case 0:
++        case 3:
++          len = 1 + ((p >> 16) & 0x3FFF) + 1;
++          break;
++        case 1:
++          len = 3;
++          break;
++        default:
++          len = 1;
++          break;
++      }
++    }
++    if (i + len > count) {
++      *bad_at = i;
++      return false;
++    }
++    i += len;
++  }
++  return true;
++}
++
+ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
+   SCOPE_profile_cpu_f("gpu");
+ 
++  {  // NG2 DIAG: if the IB isn't well-formed yet, wait for the CPU to finish it.
++    auto* w = memory_->TranslatePhysical<const uint32_t*>(ptr);
++    uint32_t bad_at = 0;
++    if (!Ng2IbWellFormed(w, count, &bad_at)) {
++      auto t0 = std::chrono::steady_clock::now();
++      bool ok = false;
++      long long us = 0;
++      do {
++        rex::thread::MaybeYield();
++        rex::thread::SyncMemory();
++        us = std::chrono::duration_cast<std::chrono::microseconds>(
++                 std::chrono::steady_clock::now() - t0)
++                 .count();
++        ok = Ng2IbWellFormed(w, count, &bad_at);
++      } while (!ok && us < 50000);
++      REXGPU_ERROR("NG2DIAG IB {:08X} len {:X} malformed at submit (dword {:X}); {} after {} us",
++                   ptr, count, bad_at, ok ? "became VALID" : "still INVALID", us);
++    }
++  }
++
+   // Execute commands!
+   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
+   reader.set_write_offset(count * sizeof(uint32_t));
+@@ -643,6 +762,15 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
+     if (!ExecutePacket(&reader)) {
+       // Return up a level if we encounter a bad packet.
+       REXGPU_ERROR("**** INDIRECT RINGBUFFER: Failed to execute packet.");
++      {  // NG2 DIAG: dump the failing indirect buffer head
++        auto* w = memory_->TranslatePhysical<const uint32_t*>(ptr);
++        REXGPU_ERROR("NG2DIAG IB fail: phys {:08X} count {:X} fail_at_byte {:X} words: "
++                     "{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
++                     ptr, count, reader.read_offset(), rex::byte_swap(w[0]),
++                     rex::byte_swap(w[1]), rex::byte_swap(w[2]), rex::byte_swap(w[3]),
++                     rex::byte_swap(w[4]), rex::byte_swap(w[5]), rex::byte_swap(w[6]),
++                     rex::byte_swap(w[7]));
++      }
+       assert_always();
+       break;
+     }
+@@ -960,6 +1088,14 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+ 
+   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+ 
++  {  // NG2 DIAG: present heartbeat
++    static uint32_t swaps = 0;
++    if ((++swaps % 30) == 1) {
++      REXGPU_ERROR("NG2DIAG SWAP #{} fb {:08X} {}x{}", swaps, frontbuffer_ptr, frontbuffer_width,
++                   frontbuffer_height);
++    }
++  }
++
+   ++counter_;
+   return true;
+ }
+@@ -971,6 +1107,20 @@ bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* re
+   uint32_t list_length = reader->ReadAndSwap<uint32_t>();
+   assert_zero(list_length & ~0xFFFFF);
+   list_length &= 0xFFFFF;
++  {  // NG2 DIAG: log every indirect buffer dispatch (first 64)
++    static int n = 0;
++    if (n++ < 24) {
++      // 12 dwords preceding this INDIRECT_BUFFER packet's header in its stream
++      auto* hdr = reinterpret_cast<const uint32_t*>(reader->read_ptr()) - 3;
++      REXGPU_ERROR("NG2DIAG IB #{} cpu {:08X} len {:X} | prev: {:08X} {:08X} {:08X} {:08X} {:08X} "
++                   "{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
++                   n, GpuToCpu(list_ptr), list_length, rex::byte_swap(hdr[-12]),
++                   rex::byte_swap(hdr[-11]), rex::byte_swap(hdr[-10]), rex::byte_swap(hdr[-9]),
++                   rex::byte_swap(hdr[-8]), rex::byte_swap(hdr[-7]), rex::byte_swap(hdr[-6]),
++                   rex::byte_swap(hdr[-5]), rex::byte_swap(hdr[-4]), rex::byte_swap(hdr[-3]),
++                   rex::byte_swap(hdr[-2]), rex::byte_swap(hdr[-1]));
++    }
++  }
+   ExecuteIndirectBuffer(GpuToCpu(list_ptr), list_length);
+   return true;
+ }
+@@ -1102,6 +1252,13 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
+ bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, uint32_t packet,
+                                                     uint32_t count) {
+   uint32_t write_addr = reader->ReadAndSwap<uint32_t>();
++  {  // NG2 DIAG: log memory fence writes
++    static int n = 0;
++    if (n++ < 40) {
++      REXGPU_ERROR("NG2DIAG MEM_WRITE #{} addr {:08X} count {} first {:08X}", n, write_addr,
++                   count - 1, count > 1 ? memory::load_and_swap<uint32_t>(reinterpret_cast<const void*>(reader->read_ptr())) : 0);
++    }
++  }
+   for (uint32_t i = 0; i < count - 1; i++) {
+     uint32_t write_data = reader->ReadAndSwap<uint32_t>();
+ 
+@@ -1211,6 +1368,13 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
+     // Write value.
+     data_value = value;
+   }
++  {  // NG2 DIAG: log fence writes
++    static int n = 0;
++    if (n++ < 40) {
++      REXGPU_ERROR("NG2DIAG EVENT_WRITE_SHD #{} init {:08X} addr {:08X} value {:08X} counter {} -> wrote {:08X}",
++                   n, initiator, address, value, counter_, data_value);
++    }
++  }
+   auto endianness = static_cast<xenos::Endian>(address & 0x3);
+   address &= ~0x3;
+   data_value = GpuSwap(data_value, endianness);
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 19874a5..26d5462 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -3092,6 +3092,13 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
+   bool should_copy = (readback_mode == ReadbackResolveMode::kSome) ? is_cache_miss : true;
+   if (should_copy && rb.buffers[read_index] && written_length <= rb.sizes[read_index] &&
+       rb.mapped_data[read_index]) {
++    // NG2 FIX: pages watched by the texture/shared-memory caches are write-protected,
++    // and the access-violation handler doesn't service faults raised by this (non-
++    // guest) GPU thread, so the memcpy below crashed. Fire the watch callbacks and
++    // unprotect the destination range first, exactly as a guest CPU write would.
++    memory_->TriggerPhysicalMemoryCallbacks(
++        rex::thread::global_critical_region::AcquireDirect(),
++        0xA0000000u | (written_address & 0x1FFFFFFFu), written_length, true, false, true);
+     uint8_t* destination = memory_->TranslatePhysical(written_address);
+     if (destination) {
+       std::memcpy(destination, static_cast<uint8_t*>(rb.mapped_data[read_index]), written_length);
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 8f2fcb0..667c103 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -28,6 +28,16 @@
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xthread.h>
+ #include <rex/ui/graphics_provider.h>
++
++#if defined(_WIN32)
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++#endif
+ #include <rex/ui/window.h>
+ #include <rex/ui/windowed_app_context.h>
+ 
+@@ -158,16 +168,73 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
+         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
+         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
++        // NG2 FIX: fire the vblank at its due time instead of on the first 1 ms sleep
++        // wake-up after it (which jittered game frame starts by ~1-2 ms). Wait with a
++        // high-resolution timer until ~1 ms before, then yield-spin.
++#if defined(_WIN32)
++        HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr,
++                                              CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
++                                              TIMER_ALL_ACCESS);
++#endif
++        // NG2 DIAG: vblank lateness.
++        double late_sum = 0.0, late_max = 0.0;
++        uint32_t late_n = 0;
++        uint64_t late_report = last_frame_time;
+         while (vsync_worker_running_) {
+           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+           uint64_t interval_ticks =
+               REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
+           while (current_time - last_frame_time >= interval_ticks) {
+             MarkVblank();
++            double late_us = double(current_time - last_frame_time - interval_ticks) * 1e6 /
++                             double(guest_tick_frequency);
++            late_sum += late_us;
++            late_max = std::max(late_max, late_us);
++            ++late_n;
+             last_frame_time += interval_ticks;
+           }
++          if (current_time - late_report >= guest_tick_frequency * 5) {
++            if (late_n) {
++              REXLOG_INFO("NG2DIAG vblank lateness: avg {:.0f}us max {:.0f}us ({} vblanks)",
++                          late_sum / late_n, late_max, late_n);
++            }
++            late_sum = late_max = 0.0;
++            late_n = 0;
++            late_report = current_time;
++          }
++          uint64_t elapsed = current_time - last_frame_time;
++          double remaining_us =
++              elapsed < interval_ticks
++                  ? double(interval_ticks - elapsed) * 1e6 / double(guest_tick_frequency)
++                  : 0.0;
++#if defined(_WIN32)
++          const bool precise = interval_ticks == vsync_interval_ticks;
++          if (!precise) {
++            rex::thread::Sleep(std::chrono::milliseconds(1));
++            continue;
++          }
++          if (timer && remaining_us > 1000.0) {
++            LARGE_INTEGER due;
++            due.QuadPart = -int64_t((remaining_us - 600.0) * 10.0);  // 100 ns, relative
++            if (SetWaitableTimerEx(timer, &due, 0, nullptr, nullptr, nullptr, 0)) {
++              WaitForSingleObject(timer, 100);
++              continue;
++            }
++          }
++          if (remaining_us > 0.0) {
++            if (remaining_us > 1000.0) {
++              rex::thread::Sleep(std::chrono::milliseconds(1));
++            } else {
++              SwitchToThread();
++            }
++          }
++#else
+           rex::thread::Sleep(std::chrono::milliseconds(1));
++#endif
+         }
++#if defined(_WIN32)
++        if (timer) CloseHandle(timer);
++#endif
+         return 0;
+       }));
+   // TODO: set_can_debugger_suspend not yet ported
+diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
+index 813bb1c..2bdc8d5 100644
+--- a/src/input/input_system.cpp
++++ b/src/input/input_system.cpp
+@@ -1,4 +1,4 @@
+-/**
++﻿/**
+  ******************************************************************************
+  * Xenia : Xbox 360 Emulator Research Project                                 *
+  ******************************************************************************
+@@ -15,6 +15,7 @@
+ #include <rex/dbg.h>
+ #include <rex/input/device_assignment.h>
+ #include <rex/input/flags.h>
++#include <rex/input/input_filter.h>
+ #include <rex/input/input_driver.h>
+ #include <rex/input/input_system.h>
+ #include <rex/input/mnk/mnk_input_driver.h>
+@@ -212,6 +213,18 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+   return driver->GetDeviceCapabilities(chosen, flags, out_caps);
+ }
+ 
++// NG2 ADDITION: see rex/input/input_filter.h
++static StateFilter& StateFilterStorage() {
++  static StateFilter f;
++  return f;
++}
++static VibrationFilter& VibrationFilterStorage() {
++  static VibrationFilter f;
++  return f;
++}
++void SetStateFilter(StateFilter filter) { StateFilterStorage() = std::move(filter); }
++void SetVibrationFilter(VibrationFilter filter) { VibrationFilterStorage() = std::move(filter); }
++
+ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+   SCOPE_profile_cpu_f("hid");
+   if (!assignment_) {
+@@ -245,6 +258,9 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+   if (!any) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
++  if (StateFilterStorage()) {
++    StateFilterStorage()(user_index, &merged);
++  }
+   if (out_state) {
+     *out_state = merged;
+   }
+@@ -253,6 +269,12 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+ 
+ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
+   SCOPE_profile_cpu_f("hid");
++  X_INPUT_VIBRATION filtered_vibration;
++  if (vibration && VibrationFilterStorage()) {
++    filtered_vibration = *vibration;
++    VibrationFilterStorage()(user_index, &filtered_vibration);
++    vibration = &filtered_vibration;
++  }
+   if (!assignment_) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+@@ -356,3 +378,4 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
+ }
+ 
+ }  // namespace rex::input
++
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_io.cpp b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
+index 3f1a852..1bebf23 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_io.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
+@@ -13,6 +13,7 @@
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
+ #include <rex/filesystem/device.h>
++#include <rex/kernel/file_read_hook.h>
+ #include <rex/kernel/xboxkrnl/private.h>
+ #include <rex/logging.h>
+ #include <rex/memory.h>
+@@ -184,6 +185,19 @@ u32 NtOpenFile_entry(mapped_u32 handle_out, u32 desired_access,
+                             open_options);
+ }
+ 
++}  // namespace rex::kernel::xboxkrnl
++
++namespace rex::kernel {
++// NG2 ADDITION: see rex/kernel/file_read_hook.h
++static FileReadHook& FileReadHookStorage() {
++  static FileReadHook hook;
++  return hook;
++}
++void SetFileReadHook(FileReadHook hook) { FileReadHookStorage() = std::move(hook); }
++}  // namespace rex::kernel
++
++namespace rex::kernel::xboxkrnl {
++
+ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_ptr,
+                      mapped_void apc_context, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block,
+                      mapped_void buffer, u32 buffer_length, mapped_u64 byte_offset_ptr) {
+@@ -213,9 +227,16 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
+     if (true || file->is_synchronous()) {
+       // Synchronous.
+       uint32_t bytes_read = 0;
++      // Effective file offset of this read (-1 = current position).
++      const uint64_t read_offset = byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr)
++                                                   : file->position();
+       result = file->Read(buffer.guest_address(), buffer_length,
+                           byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
+                           &bytes_read, apc_context.guest_address());
++      if (XSUCCEEDED(result) && bytes_read && rex::kernel::FileReadHookStorage()) {
++        rex::kernel::FileReadHookStorage()(file->path(), read_offset, buffer.guest_address(),
++                                           bytes_read);
++      }
+       if (io_status_block) {
+         io_status_block->status = result;
+         io_status_block->information = bytes_read;
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index 77bce25..c04b6c6 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -408,6 +408,8 @@ X_STATUS XThread::Create() {
+                      stack_limit_, stack_base_);
+ 
+   uint8_t cpu_index = GetFakeCpuNumber(static_cast<uint8_t>(creation_params_.creation_flags >> 24));
++  REXSYS_WARN("NG2DIAG thread create handle {:08X} start {:08X} mask {:02X} -> cpu {}", handle(),
++              creation_params_.start_address, creation_params_.creation_flags >> 24, cpu_index);
+ 
+   // Initialize the KTHREAD object.
+   InitializeGuestObject();
+@@ -859,7 +861,9 @@ void XThread::SetPriority(int32_t increment) {
+ }
+ 
+ void XThread::SetAffinity(uint32_t affinity) {
+-  SetActiveCpu(GetFakeCpuNumber(affinity));
++  uint8_t cpu = GetFakeCpuNumber(affinity);
++  REXSYS_WARN("NG2DIAG thread affinity handle {:08X} mask {:08X} -> cpu {}", handle(), affinity, cpu);
++  SetActiveCpu(cpu);
+ }
+ 
+ uint8_t XThread::active_cpu() const {
+diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
+index 5bd3dc5..a8d5edc 100644
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -55,6 +55,7 @@ if(REXGLUE_USE_D3D12)
+         d3d12/d3d12_cpu_descriptor_pool.cpp
+         d3d12/d3d12_descriptor_heap_pool.cpp
+         d3d12/d3d12_immediate_drawer.cpp
++        d3d12/d3d12_frame_interpolator.cpp
+         d3d12/d3d12_presenter.cpp
+         d3d12/d3d12_provider.cpp
+         d3d12/d3d12_submission_tracker.cpp
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+index 306118e..803e78d 100644
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -10,7 +10,9 @@
+  */
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <climits>
++#include <cstring>
+ #include <cmath>
+ #include <memory>
+ #include <utility>
+@@ -30,6 +32,20 @@
+ #include <ffx_api/ffx_upscale.h>
+ #endif
+ 
++REXCVAR_DECLARE(bool, frame_generation);  // NG2 ADDITION (presenter.cpp)
++REXCVAR_DECLARE(int32_t, frame_generation_debug);  // NG2 DIAG (presenter.cpp)
++// NG2 ADDITION: host-side vsync. The guest `vsync` cvar is the emulated vblank, which
++// paces the game's simulation and must stay on for NG2 (off = the game runs too fast).
++REXCVAR_DEFINE_BOOL(present_vsync, false, "UI/Presenter",
++                    "Sync window presents to the display refresh (no tearing). Off presents "
++                    "immediately, allowing tearing / variable refresh rate");
++// NG2 ADDITION: display-side 30 fps cap. NG2's simulation is frame-locked to the guest
++// vblank, so lowering the guest frame rate would slow the game down; instead every other
++// new guest frame is simply not presented (ignored while frame generation is on).
++REXCVAR_DEFINE_BOOL(present_half_rate, false, "UI/Presenter",
++                    "Present only every other guest frame (e.g. 60 -> 30 fps); the game "
++                    "itself keeps running at full rate");
++
+ REXCVAR_DEFINE_BOOL(d3d12_allow_variable_refresh_rate_and_tearing, true, "UI/D3D12",
+                     "Allow variable refresh rate and tearing");
+ 
+@@ -52,6 +68,7 @@ namespace shaders {
+ }  // namespace shaders
+ 
+ D3D12Presenter::~D3D12Presenter() {
++  StopDelayedPaint();  // NG2 ADDITION: the frame generation timer paints through us.
+   // Await completion of the usage of everything before destroying anything.
+   // From most likely the latest to most likely the earliest to be signaled, so
+   // just one sleep will likely be needed.
+@@ -601,6 +618,123 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+     // (and multiple threads can't paint the main target at the same time).
+   }
+ 
++  // NG2 ADDITION: half-rate presentation (see present_half_rate).
++  if (guest_output_resource && REXCVAR_GET(present_half_rate) && !REXCVAR_GET(frame_generation) &&
++      LastConsumedGuestOutputIsNew()) {
++    static uint32_t half_rate_counter = 0;
++    if (++half_rate_counter & 1) {
++      command_list->Close();
++      ID3D12CommandList* execute_command_list = command_list;
++      provider_.GetDirectQueue()->ExecuteCommandLists(1, &execute_command_list);
++      paint_context_.paint_submission_tracker.NextSubmission();
++      return PaintResult::kNotPresented;
++    }
++  }
++
++  // NG2 ADDITION: frame generation. On a new guest frame, show a generated frame halfway
++  // between it and the previous one now, and the real frame half a guest frame later.
++  // (A pacing buffer that delayed both to a smoothed schedule was tried and reverted: the
++  // user found it felt worse, findings #29.)
++  if (guest_output_resource && REXCVAR_GET(frame_generation) && !frame_interpolator_failed_) {
++    if (!frame_interpolator_) {
++      frame_interpolator_ = std::make_unique<D3D12FrameInterpolator>(
++          provider_, paint_context_.paint_submission_tracker);
++      if (!frame_interpolator_->Initialize()) {
++        frame_interpolator_.reset();
++        frame_interpolator_failed_ = true;
++      }
++    }
++    if (frame_interpolator_) {
++      // NG2 DIAG: per-paint cadence. G = generated frame shown on a new guest frame,
++      // R = real frame after a generated one, N = new guest frame shown without
++      // generation (unsteady timing), F = push failed, r = repeat without a new frame.
++      static char diag_seq[64];
++      static uint32_t diag_len = 0, diag_g = 0, diag_n = 0, diag_f = 0, diag_r = 0, diag_x = 0;
++      static auto diag_last = std::chrono::steady_clock::now();
++      char diag_c = 'r';
++      if (LastConsumedGuestOutputIsNew() || !frame_interpolator_->HasPrevious()) {
++        auto now = std::chrono::steady_clock::now();
++        double interval_us =
++            std::chrono::duration<double, std::micro>(now - frame_gen_last_new_frame_).count();
++        frame_gen_last_new_frame_ = now;
++        bool steady = interval_us > 4000.0 && interval_us < 40000.0;
++        if (steady) frame_gen_interval_us_ += (interval_us - frame_gen_interval_us_) * 0.1;
++        frame_gen_showing_generated_ = false;
++        {
++          int32_t dbg = REXCVAR_GET(frame_generation_debug);
++          frame_interpolator_->set_debug_split(dbg == 2 ? 1u : dbg == 3 ? 2u : 0u);
++        }
++        if (!frame_interpolator_->PushFrame(command_list, guest_output_resource.Get(),
++                                            current_paint_submission)) {
++          frame_interpolator_->Reset();
++          diag_c = 'F';
++          ++diag_f;
++        } else if (steady && frame_interpolator_->HasPrevious() &&
++                   frame_interpolator_->Interpolate(command_list, current_paint_submission)) {
++          guest_output_resource = frame_interpolator_->interpolated();
++          frame_gen_showing_generated_ = true;
++          RequestPaintAfterDelay(
++              std::chrono::microseconds(int64_t(frame_gen_interval_us_ * 0.5)));
++          diag_c = 'G';
++          ++diag_g;
++        } else {
++          guest_output_resource = frame_interpolator_->current();
++          diag_c = 'N';
++          ++diag_n;
++          if (!steady) ++diag_x;
++        }
++      } else {
++        // The real frame after a generated one (or a UI-only repaint).
++        bool debug_generated = REXCVAR_GET(frame_generation_debug) >= 1 &&
++                               frame_gen_showing_generated_;
++        guest_output_resource = debug_generated ? frame_interpolator_->interpolated()
++                                                : frame_interpolator_->current();
++        diag_c = frame_gen_showing_generated_ ? 'R' : 'r';
++        ++diag_r;
++      }
++      if (diag_len < sizeof(diag_seq) - 1) diag_seq[diag_len++] = diag_c;
++      // NG2 DIAG: paint-to-paint intervals. gr = generated -> real (ideal half a guest
++      // frame), rg = real -> next generated (ideal the other half).
++      static auto diag_prev_paint = std::chrono::steady_clock::now();
++      static char diag_prev_c = 0;
++      static double gr_sum = 0, gr_sq = 0, gr_max = 0, rg_sum = 0, rg_sq = 0, rg_max = 0;
++      static uint32_t gr_n = 0, rg_n = 0;
++      {
++        auto t = std::chrono::steady_clock::now();
++        double dt = std::chrono::duration<double, std::milli>(t - diag_prev_paint).count();
++        diag_prev_paint = t;
++        if (diag_prev_c == 'G' && diag_c == 'R') {
++          gr_sum += dt; gr_sq += dt * dt; gr_max = std::max(gr_max, dt); ++gr_n;
++        } else if (diag_prev_c == 'R' && diag_c == 'G') {
++          rg_sum += dt; rg_sq += dt * dt; rg_max = std::max(rg_max, dt); ++rg_n;
++        }
++        diag_prev_c = diag_c;
++      }
++      auto now = std::chrono::steady_clock::now();
++      if (now - diag_last >= std::chrono::seconds(5)) {
++        diag_seq[diag_len] = 0;
++        REXLOG_INFO("NG2DIAG framegen 5s: generated {} new-ungenerated {} (unsteady {}) "
++                    "push-fail {} repeats {} interval {:.0f}us seq {}",
++                    diag_g, diag_n, diag_x, diag_f, diag_r, frame_gen_interval_us_, diag_seq);
++        auto sd = [](double sum, double sq, uint32_t n) {
++          if (!n) return 0.0;
++          double m = sum / n;
++          return std::sqrt(std::max(sq / n - m * m, 0.0));
++        };
++        REXLOG_INFO("NG2DIAG framegen pacing ms: gen->real avg {:.2f} sd {:.2f} max {:.2f} | "
++                    "real->gen avg {:.2f} sd {:.2f} max {:.2f}",
++                    gr_n ? gr_sum / gr_n : 0.0, sd(gr_sum, gr_sq, gr_n), gr_max,
++                    rg_n ? rg_sum / rg_n : 0.0, sd(rg_sum, rg_sq, rg_n), rg_max);
++        gr_sum = gr_sq = gr_max = rg_sum = rg_sq = rg_max = 0;
++        gr_n = rg_n = 0;
++        diag_len = diag_g = diag_n = diag_f = diag_r = diag_x = 0;
++        diag_last = now;
++      }
++    }
++  } else if (frame_interpolator_) {
++    frame_interpolator_->Reset();
++  }
++
+   if (guest_output_resource) {
+     GuestOutputPaintFlow guest_output_flow = GetGuestOutputPaintFlow(
+         guest_output_properties, paint_context_.swap_chain_width, paint_context_.swap_chain_height,
+@@ -1155,9 +1289,12 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+   // fullscreen is ever used in, the allow tearing flag must not be passed in
+   // fullscreen, but DXGI fullscreen is largely unneeded with the flip
+   // presentation model used in Direct3D 12).
++  const bool present_vsync = REXCVAR_GET(present_vsync);  // NG2 ADDITION
+   HRESULT present_result = paint_context_.swap_chain->Present(
+-      0, DXGI_PRESENT_RESTART |
+-             (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
++      present_vsync ? 1 : 0,
++      DXGI_PRESENT_RESTART |
++          (!present_vsync && paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING
++                                                                      : 0));
+   // Even if presentation has failed, work might have been enqueued anyway
+   // internally before the failure according to Jesse Natalie from the DirectX
+   // Discord server.
+diff --git a/src/ui/imgui_drawer.cpp b/src/ui/imgui_drawer.cpp
+index f270f3c..069b05f 100644
+--- a/src/ui/imgui_drawer.cpp
++++ b/src/ui/imgui_drawer.cpp
+@@ -436,7 +436,15 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
+   // it now if needed.
+   DetachIfLastDialogRemoved();
+ 
+-  if (!dialogs_.empty()) {
++  // NG2 ADDITION: only dialogs that want it force continuous repaint.
++  bool wants_continuous_paint = false;
++  for (ImGuiDialog* dialog : dialogs_) {
++    if (dialog->WantsContinuousPaint()) {
++      wants_continuous_paint = true;
++      break;
++    }
++  }
++  if (wants_continuous_paint) {
+     // Repaint (and handle input) continuously if still active. In detached mode
+     // there is no presenter; the app drives repaint via its own present loop.
+     if (presenter_) {
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 7360ed9..fb4f4ce 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <chrono>
+ #include <cctype>
+ #include <utility>
+ 
+@@ -21,11 +22,34 @@
+ #include <rex/ui/presenter.h>
+ #include <rex/ui/window.h>
+ 
++// NG2 DIAG: paint source counters, read by the app's fps logger.
++std::atomic<uint64_t> ng2diag_guest_refreshes{0};
++std::atomic<uint64_t> ng2diag_ui_paint_requests{0};
++std::atomic<uint64_t> ng2diag_window_paint_requests{0};
++namespace rex::ui {
++extern std::atomic<uint64_t> ng2diag_sdl_paints;
++}
++using rex::ui::ng2diag_sdl_paints;
++
+ #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+ #include <ffx_api/ffx_api.h>
+ #include <ffx_api/ffx_upscale.h>
+ #endif
+ 
++// NG2 ADDITION: vendor-neutral frame generation (D3D12 presenter).
++REXCVAR_DEFINE_BOOL(frame_generation, false, "UI/Presenter",
++                    "Show a generated frame between guest frames (doubles the displayed frame "
++                    "rate; adds about half a guest frame of latency)");
++
++// NG2 DIAG: 1 = show only generated frames (the real-frame paint repeats the generated
++// one), to inspect interpolation output in screenshots.
++REXCVAR_DEFINE_INT32(frame_generation_debug, 0, "UI/Presenter",
++                     "Frame generation debug view: 0 off, 1 generated frames only, 2 split generated|real, 3 split real|generated");
++
++// NG2 ADDITION: see RefreshGuestOutput.
++REXCVAR_DEFINE_DOUBLE(present_aspect_ratio, 0.0, "UI/Presenter",
++                      "Display the guest image at this aspect ratio (0 = the guest's own)");
++
+ REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
+                     "Allow presentation from non-UI thread");
+ 
+@@ -287,6 +311,8 @@ Presenter::~Presenter() {
+   // it if needed.
+   assert_false(is_executing_ui_drawers_);
+ 
++  StopDelayedPaint();  // NG2 ADDITION
++
+ #if REX_PLATFORM_WIN32
+   if (dxgi_ui_tick_thread_.joinable()) {
+     {
+@@ -556,6 +582,12 @@ bool Presenter::RefreshGuestOutput(
+   writable_properties.frontbuffer_height = frontbuffer_height;
+   writable_properties.display_aspect_ratio_x = display_aspect_ratio_x;
+   writable_properties.display_aspect_ratio_y = display_aspect_ratio_y;
++  // NG2 ADDITION: present the guest image at another aspect ratio (anamorphic
++  // ultrawide: the game renders a wider view squeezed into its 16:9 frame).
++  if (double aspect = REXCVAR_GET(present_aspect_ratio); aspect > 0.0) {
++    writable_properties.display_aspect_ratio_x = uint32_t(aspect * 10000.0 + 0.5);
++    writable_properties.display_aspect_ratio_y = 10000;
++  }
+   writable_properties.is_8bpc = false;
+   bool is_active = writable_properties.IsActive();
+   if (is_active) {
+@@ -615,6 +647,23 @@ bool Presenter::RefreshGuestOutput(
+ 
+   // Trigger the presentation on the host.
+   PaintResult paint_result = PaintResult::kNotPresented;
++  ng2diag_guest_refreshes.fetch_add(1, std::memory_order_relaxed);  // NG2 DIAG
++  {
++    static uint64_t last_ms = 0;
++    uint64_t now_ms = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
++                                   std::chrono::steady_clock::now().time_since_epoch())
++                                   .count());
++    if (now_ms - last_ms >= 5000) {
++      static uint64_t lg = 0, lu = 0, lw = 0, ls = 0;
++      uint64_t g = ng2diag_guest_refreshes, u = ng2diag_ui_paint_requests,
++               w = ng2diag_window_paint_requests, sp = ng2diag_sdl_paints;
++      double secs = last_ms ? double(now_ms - last_ms) / 1000.0 : 1.0;
++      REXLOG_INFO("NG2DIAG paint/s: guest refresh {:.1f}, ui requests {:.1f}, window requests "
++                  "{:.1f}, sdl paints {:.1f}",
++                  (g - lg) / secs, (u - lu) / secs, (w - lw) / secs, (sp - ls) / secs);
++      lg = g; lu = u; lw = w; ls = sp; last_ms = now_ms;
++    }
++  }
+   {
+     std::lock_guard<std::mutex> paint_mode_mutex_lock(paint_mode_mutex_);
+     switch (paint_mode_) {
+@@ -767,6 +816,7 @@ void Presenter::RemoveUIDrawerFromUIThread(UIDrawer* drawer) {
+ }
+ 
+ void Presenter::RequestUIPaintFromUIThread() {
++  ng2diag_ui_paint_requests.fetch_add(1, std::memory_order_relaxed);  // NG2 DIAG
+   if (is_in_ui_thread_paint_) {
+     // The paint request will be done once in the end of PaintFromUIThread
+     // according to the actual state at the moment that happens. It's common for
+@@ -840,6 +890,8 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
+         (old_acquired_and_ready & ~uint32_t(3)) | (old_acquired_and_ready >> 2);
+   }
+   uint32_t mailbox_index = desired_acquired_and_ready & 3;
++  // NG2 ADDITION: a different acquired index means a new guest image.
++  guest_output_last_consume_new_ = (old_acquired_and_ready & 3) != mailbox_index;
+   // Give the current acquired image to the caller, or UINT32_MAX if it's
+   // inactive.
+   const GuestOutputProperties& properties = guest_output_properties_[mailbox_index];
+@@ -850,6 +902,97 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
+   return std::move(consumer_lock);
+ }
+ 
++// NG2 ADDITION (frame generation).
++void Presenter::RequestPaintAfterDelay(std::chrono::microseconds delay) {
++  {
++    std::scoped_lock<std::mutex> lock(delayed_paint_mutex_);
++    if (delayed_paint_shutdown_) return;
++    delayed_paint_deadline_ = std::chrono::steady_clock::now() + delay;
++    delayed_paint_pending_ = true;
++    if (!delayed_paint_thread_.joinable()) {
++      delayed_paint_thread_ = std::thread([this] { DelayedPaintThread(); });
++    }
++  }
++  delayed_paint_condition_.notify_all();
++}
++
++void Presenter::StopDelayedPaint() {
++  {
++    std::scoped_lock<std::mutex> lock(delayed_paint_mutex_);
++    delayed_paint_shutdown_ = true;
++  }
++  delayed_paint_condition_.notify_all();
++  if (delayed_paint_thread_.joinable()) delayed_paint_thread_.join();
++}
++
++void Presenter::DelayedPaintThread() {
++  std::unique_lock<std::mutex> lock(delayed_paint_mutex_);
++  while (!delayed_paint_shutdown_) {
++    if (!delayed_paint_pending_) {
++      delayed_paint_condition_.wait(lock);
++      continue;
++    }
++    // Sleep until shortly before the deadline (OS wake-ups run ~0.5 ms late), then spin.
++    auto early = delayed_paint_deadline_ - std::chrono::microseconds(700);
++    if (std::chrono::steady_clock::now() < early &&
++        delayed_paint_condition_.wait_until(lock, early) != std::cv_status::timeout) {
++      continue;  // re-check: shutdown or a new deadline
++    }
++    if (!delayed_paint_pending_ || delayed_paint_shutdown_) continue;
++    if (std::chrono::steady_clock::now() < delayed_paint_deadline_) {
++      lock.unlock();
++      std::this_thread::yield();
++      lock.lock();
++      continue;
++    }
++    delayed_paint_pending_ = false;
++    {
++      // NG2 DIAG: how late the delayed paint fires.
++      static double late_sum = 0.0, late_max = 0.0;
++      static uint32_t late_n = 0, late_over1ms = 0;
++      static auto late_last = std::chrono::steady_clock::now();
++      auto now = std::chrono::steady_clock::now();
++      double late_us =
++          std::chrono::duration<double, std::micro>(now - delayed_paint_deadline_).count();
++      late_sum += late_us;
++      late_max = std::max(late_max, late_us);
++      ++late_n;
++      if (late_us > 1000.0) ++late_over1ms;
++      if (now - late_last >= std::chrono::seconds(5)) {
++        REXLOG_INFO("NG2DIAG delayed paint lateness: avg {:.0f}us max {:.0f}us, >1ms {}/{}",
++                    late_sum / late_n, late_max, late_over1ms, late_n);
++        late_sum = late_max = 0.0;
++        late_n = late_over1ms = 0;
++        late_last = now;
++      }
++    }
++    lock.unlock();
++    // Same as the end of RefreshGuestOutput.
++    PaintResult paint_result = PaintResult::kNotPresented;
++    {
++      std::lock_guard<std::mutex> paint_mode_mutex_lock(paint_mode_mutex_);
++      switch (paint_mode_) {
++        case PaintMode::kNone:
++          break;
++        case PaintMode::kUIThreadOnRequest:
++          RequestPaintOrConnectionRecoveryViaWindow(true);
++          break;
++        case PaintMode::kGuestOutputThreadImmediately:
++          if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable) {
++            paint_result = PaintAndPresent(false);
++            if (surface_paint_connection_state_ ==
++                SurfacePaintConnectionState::kConnectedOutdated) {
++              RequestPaintOrConnectionRecoveryViaWindow(true);
++            }
++          }
++          break;
++      }
++    }
++    (void)paint_result;  // GPU loss is handled by the next guest refresh
++    lock.lock();
++  }
++}
++
+ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
+     const GuestOutputProperties& properties, uint32_t host_rt_width, uint32_t host_rt_height,
+     uint32_t max_rt_width, uint32_t max_rt_height, const GuestOutputPaintConfig& config) const {
+@@ -1421,6 +1564,7 @@ bool Presenter::RequestPaintOrConnectionRecoveryViaWindow(bool force_ui_thread_p
+   if (force_ui_thread_paint_tick) {
+     ForceUIThreadPaintTick();
+   }
++  ng2diag_window_paint_requests.fetch_add(1, std::memory_order_relaxed);  // NG2 DIAG
+   window_->RequestPaint();
+   return true;
+ }
+diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
+index 2251429..887ed79 100644
+--- a/src/ui/window_sdl.cpp
++++ b/src/ui/window_sdl.cpp
+@@ -291,6 +291,36 @@ uint32_t WindowSDL::GetLatestDpiImpl() const {
+   return uint32_t(scale * float(GetMediumDpi()) + 0.5f);
+ }
+ 
++// NG2 ADDITION: live version of the startup `monitor` placement above.
++void WindowSDL::MoveToMonitor(int32_t monitor_index) {
++  if (!sdl_window_) {
++    return;
++  }
++  SDL_DisplayID display = SDL_GetPrimaryDisplay();
++  if (monitor_index > 0) {
++    int display_count = 0;
++    SDL_DisplayID* displays = SDL_GetDisplays(&display_count);
++    if (displays) {
++      if (monitor_index <= display_count) {
++        display = displays[monitor_index - 1];
++      }
++      SDL_free(displays);
++    }
++  }
++  if (!display || SDL_GetDisplayForWindow(sdl_window_) == display) {
++    return;
++  }
++  const bool fullscreen = IsFullscreen();
++  if (fullscreen) {
++    SDL_SetWindowFullscreen(sdl_window_, false);
++  }
++  SDL_SetWindowPosition(sdl_window_, SDL_WINDOWPOS_CENTERED_DISPLAY(display),
++                        SDL_WINDOWPOS_CENTERED_DISPLAY(display));
++  if (fullscreen) {
++    SDL_SetWindowFullscreen(sdl_window_, true);
++  }
++}
++
+ void WindowSDL::ApplyNewFullscreen() {
+   if (!sdl_window_) {
+     return;
+@@ -434,7 +464,10 @@ void WindowSDL::RequestPaintImpl() {
+   SDL_PushEvent(&event);
+ }
+ 
++extern std::atomic<uint64_t> ng2diag_sdl_paints;  // NG2 DIAG
++std::atomic<uint64_t> ng2diag_sdl_paints{0};
+ void WindowSDL::HandlePaintEvent() {
++  ng2diag_sdl_paints.fetch_add(1, std::memory_order_relaxed);  // NG2 DIAG
+   paint_pending_.store(false, std::memory_order_release);
+   OnPaint();
+ }
+diff --git a/include/rex/input/input_filter.h b/include/rex/input/input_filter.h
+new file mode 100644
+index 0000000..8943925
+--- /dev/null
++++ b/include/rex/input/input_filter.h
+@@ -0,0 +1,21 @@
++#pragma once
++// NG2 ADDITION: optional host-side filters on controller state and vibration, so the app
++// can implement deadzones, camera inversion and vibration strength without touching
++// game code.
++
++#include <cstdint>
++#include <functional>
++
++#include <rex/input/input.h>
++
++namespace rex::input {
++
++// Called on the merged pad state for a user before it is returned to the game.
++using StateFilter = std::function<void(uint32_t user_index, X_INPUT_STATE* state)>;
++// Called on a vibration request before it reaches the pads (edit in place).
++using VibrationFilter = std::function<void(uint32_t user_index, X_INPUT_VIBRATION* vibration)>;
++
++void SetStateFilter(StateFilter filter);
++void SetVibrationFilter(VibrationFilter filter);
++
++}  // namespace rex::input
+diff --git a/include/rex/kernel/file_read_hook.h b/include/rex/kernel/file_read_hook.h
+new file mode 100644
+index 0000000..0b03c29
+--- /dev/null
++++ b/include/rex/kernel/file_read_hook.h
+@@ -0,0 +1,19 @@
++#pragma once
++// NG2 ADDITION: optional hook called after every successful guest NtReadFile, so the
++// host app can patch file data in guest memory as it is read (e.g. replace strings in
++// a data archive) without modifying game files on disk.
++
++#include <cstdint>
++#include <functional>
++#include <string>
++
++namespace rex::kernel {
++
++// path: guest file path; file_offset: offset of the first byte read;
++// guest_buffer: guest address the data was read into; length: bytes read.
++using FileReadHook = std::function<void(const std::string& path, uint64_t file_offset,
++                                        uint32_t guest_buffer, uint32_t length)>;
++
++void SetFileReadHook(FileReadHook hook);
++
++}  // namespace rex::kernel
+diff --git a/include/rex/ui/d3d12/d3d12_frame_interpolator.h b/include/rex/ui/d3d12/d3d12_frame_interpolator.h
+new file mode 100644
+index 0000000..5124869
+--- /dev/null
++++ b/include/rex/ui/d3d12/d3d12_frame_interpolator.h
+@@ -0,0 +1,108 @@
++/**
++ * @file        ui/d3d12/d3d12_frame_interpolator.h
++ * @brief       NG2 ADDITION: vendor-neutral frame generation for the D3D12 presenter.
++ *
++ * Generates a frame halfway between the two most recent guest frames using only the
++ * final images (no game motion vectors):
++ *  - a luma pyramid per frame (analysis base ~960 px wide, 5 levels);
++ *  - dense per-pixel optical flow in both directions, coarse to fine: at each level every
++ *    pixel picks the best of a few candidates (upsampled coarser flow, its neighbours,
++ *    zero, last frame's flow; a small full search at the coarsest level) by zero-mean
++ *    patch difference, refines it with Lucas-Kanade iterations, then the field is
++ *    smoothed edge-aware (weighted by luma similarity and match quality);
++ *  - synthesis at full resolution: both frames are warped to the midpoint and blended
++ *    by forward-backward consistency (occlusion), then softly mixed with the zero-motion
++ *    blend (static HUD) and the newer frame (nothing explains the change). Every choice
++ *    is a soft weight, so there are no seams between pixels that chose differently.
++ * Compute shaders are compiled at runtime with d3dcompiler_47.dll (ships with Windows).
++ */
++
++#pragma once
++
++#include <array>
++#include <cstdint>
++
++#include <rex/platform.h>
++#include <rex/ui/d3d12/d3d12_api.h>
++
++namespace rex::ui::d3d12 {
++
++class D3D12Provider;
++class D3D12SubmissionTracker;
++
++class D3D12FrameInterpolator {
++ public:
++  D3D12FrameInterpolator(const D3D12Provider& provider, D3D12SubmissionTracker& paint_tracker);
++  ~D3D12FrameInterpolator();
++
++  // Compiles the shaders and creates the pipelines. False if unavailable.
++  bool Initialize();
++
++  // Copies a new guest frame (in D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) into the
++  // history and builds its luma pyramid. Records commands on the paint command list.
++  bool PushFrame(ID3D12GraphicsCommandList* command_list, ID3D12Resource* guest_frame,
++                 uint64_t paint_submission);
++  // Generates the frame halfway between the previous and the current pushed frames.
++  bool Interpolate(ID3D12GraphicsCommandList* command_list, uint64_t paint_submission);
++
++  bool HasPrevious() const { return frame_count_ >= 2; }
++  // The textures are in PIXEL_SHADER_RESOURCE | NON_PIXEL_SHADER_RESOURCE, the guest
++  // output format, and the guest output size.
++  ID3D12Resource* current() const { return history_[current_].Get(); }
++  ID3D12Resource* interpolated() const { return interpolated_.Get(); }
++
++  // Forget the history (frame generation turned off, or a discontinuity).
++  void Reset() {
++    frame_count_ = 0;
++    prior_valid_ = false;
++  }
++
++  // NG2 DIAG: 0 off, 1 generated left | real right, 2 real left | generated right.
++  void set_debug_split(uint32_t split) { debug_split_ = split; }
++
++ private:
++  static constexpr uint32_t kLevels = 5;
++  enum Pass { kPassLuma, kPassDown, kPassRefine, kPassSmooth, kPassSynth, kPassCount };
++  // Per dispatch: t0..t3, u0, u1 (unused), written into a ring of the shader-visible heap.
++  static constexpr uint32_t kTableSize = 6;
++  static constexpr uint32_t kHeapDescriptors = 32768;
++  static constexpr uint32_t kConstantCount = 16;
++
++  struct Binding {
++    ID3D12Resource* srv[4] = {};
++    ID3D12Resource* uav = nullptr;
++    D3D12_RESOURCE_STATES uav_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++  };
++
++  bool EnsureTextures(uint32_t width, uint32_t height);
++  void ReleaseTextures();
++  void Run(ID3D12GraphicsCommandList* command_list, Pass pass, const Binding& binding,
++           uint32_t thread_width, uint32_t thread_height, const uint32_t* constants);
++
++  const D3D12Provider& provider_;
++  D3D12SubmissionTracker& paint_tracker_;
++  bool initialized_ = false;
++
++  Microsoft::WRL::ComPtr<ID3D12RootSignature> root_signature_;
++  std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, kPassCount> pipelines_;
++  Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap_;
++  uint32_t heap_next_ = 0;
++
++  uint32_t width_ = 0, height_ = 0;
++  std::array<uint32_t, kLevels> level_width_{}, level_height_{};
++  std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 2> history_;
++  // [frame slot][level] luma.
++  std::array<std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kLevels>, 2> pyramid_;
++  // [direction: 0 = previous->current, 1 = current->previous][level] flow (xy, cost).
++  std::array<std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kLevels>, 2> flow_;
++  std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kLevels> flow_scratch_;
++  Microsoft::WRL::ComPtr<ID3D12Resource> interpolated_;
++  uint64_t last_usage_ = 0;
++
++  uint32_t current_ = 0;
++  uint32_t frame_count_ = 0;
++  bool prior_valid_ = false;  // flow_[*][0] holds the previous pair's flow
++  uint32_t debug_split_ = 0;
++};
++
++}  // namespace rex::ui::d3d12
+diff --git a/src/ui/d3d12/d3d12_frame_interpolator.cpp b/src/ui/d3d12/d3d12_frame_interpolator.cpp
+new file mode 100644
+index 0000000..71c1819
+--- /dev/null
++++ b/src/ui/d3d12/d3d12_frame_interpolator.cpp
+@@ -0,0 +1,608 @@
++/**
++ * @file        ui/d3d12/d3d12_frame_interpolator.cpp
++ * @brief       NG2 ADDITION: vendor-neutral frame generation (see the header).
++ */
++
++#include <rex/ui/d3d12/d3d12_frame_interpolator.h>
++
++#include <algorithm>
++#include <cmath>
++#include <cstring>
++
++#include <d3dcompiler.h>
++
++#include <rex/logging.h>
++#include <rex/ui/d3d12/d3d12_provider.h>
++#include <rex/ui/d3d12/d3d12_submission_tracker.h>
++#include <rex/ui/d3d12/d3d12_util.h>
++
++namespace rex::ui::d3d12 {
++
++namespace {
++
++constexpr DXGI_FORMAT kColorFormat = DXGI_FORMAT_R10G10B10A2_UNORM;  // = guest output
++constexpr DXGI_FORMAT kLumaFormat = DXGI_FORMAT_R16_FLOAT;
++constexpr DXGI_FORMAT kFlowFormat = DXGI_FORMAT_R32G32B32A32_FLOAT;
++constexpr D3D12_RESOURCE_STATES kAllShaderResource =
++    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++constexpr D3D12_RESOURCE_STATES kNonPixel = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++constexpr uint32_t kAnalysisWidth = 960;  // target width of pyramid level 0
++constexpr uint32_t kCoarseSearchRadius = 4;
++
++// Flow convention: a flow field from frame A to frame B stores, per pixel q of A, the
++// displacement F such that A(q) ~ B(q + F), in pixels of its own pyramid level.
++const char kShaderSource[] = R"HLSL(
++cbuffer Root : register(b0) {
++  uint4 c0;
++  uint4 c1;
++  uint4 c2;
++  uint4 c3;
++};
++Texture2D<float4> t0 : register(t0);
++Texture2D<float4> t1 : register(t1);
++Texture2D<float4> t2 : register(t2);
++Texture2D<float4> t3 : register(t3);
++RWTexture2D<float4> u0 : register(u0);
++SamplerState sLinear : register(s0);
++SamplerState sPoint : register(s1);
++
++static const float3 kLuma = float3(0.299, 0.587, 0.114);
++
++// ---- pyramid ----------------------------------------------------------------------
++// c0.xy = dst size, c0.zw = src size. Box filter of the (src/dst) footprint (<= 4x4)
++// with four bilinear taps.
++[numthreads(8, 8, 1)] void CSLuma(uint2 id : SV_DispatchThreadID) {
++  if (any(id >= c0.xy)) return;
++  float2 scale = float2(c0.zw) / float2(c0.xy);
++  float2 inv = 1.0 / float2(c0.zw);
++  float s = 0.0;
++  [unroll] for (int y = 0; y < 2; ++y) {
++    [unroll] for (int x = 0; x < 2; ++x) {
++      float2 pos = (float2(id) + float2(0.25 + 0.5 * x, 0.25 + 0.5 * y)) * scale;
++      s += dot(t0.SampleLevel(sLinear, pos * inv, 0).rgb, kLuma);
++    }
++  }
++  u0[id] = float4(s * 0.25, 0, 0, 0);
++}
++
++// 2x2 average (one bilinear tap at the centre of the 2x2 footprint).
++[numthreads(8, 8, 1)] void CSDown(uint2 id : SV_DispatchThreadID) {
++  if (any(id >= c0.xy)) return;
++  float2 pos = (float2(id) + 0.5) * float2(c0.zw) / float2(c0.xy);
++  u0[id] = float4(t0.SampleLevel(sLinear, pos / float2(c0.zw), 0).r, 0, 0, 0);
++}
++
++// ---- flow -------------------------------------------------------------------------
++#define WIN 25  // 5x5 window
++
++float LoadL(Texture2D<float4> t, int2 q, int2 size) {
++  return t.Load(int3(clamp(q, int2(0, 0), size - 1), 0)).r;
++}
++
++int2 WinOffset(int j) { return int2(j % 5 - 2, j / 5 - 2); }
++
++// Zero-mean mean-absolute difference between the template window of A at p and the
++// window of B (t1) at p + F. Zero-mean makes it insensitive to fades/brightness ramps.
++float WindowCost(float A[WIN], float meanA, int2 p, float2 F, float2 inv) {
++  float B[WIN];
++  float s = 0.0;
++  [unroll] for (int j = 0; j < WIN; ++j) {
++    B[j] = t1.SampleLevel(sLinear, (float2(p + WinOffset(j)) + 0.5 + F) * inv, 0).r;
++    s += B[j];
++  }
++  float meanB = s / WIN;
++  float c = 0.0;
++  [unroll] for (int k = 0; k < WIN; ++k) c += abs((B[k] - meanB) - (A[k] - meanA));
++  return c / WIN;
++}
++
++// One pyramid level of flow from A (t0) to B (t1).
++// c0.xy = level size; c1.xy = coarser level size, c1.z = has coarser flow (t2),
++// c1.w = has prior flow (t3, level-0 flow of the previous frame pair);
++// c2.xy = prior scale (asfloat), c2.zw = coarser-to-this scale (asfloat);
++// c3.y = full search radius (coarsest level only).
++[numthreads(8, 8, 1)] void CSRefine(uint2 id : SV_DispatchThreadID) {
++  if (any(id >= c0.xy)) return;
++  int2 size = int2(c0.xy);
++  float2 inv = 1.0 / float2(size);
++  int2 p = int2(id);
++  float2 uv = (float2(p) + 0.5) * inv;
++
++  // Template window, its mean and gradients.
++  float A[WIN], gx[WIN], gy[WIN];
++  float meanA = 0.0;
++  float h00 = 0.0, h01 = 0.0, h11 = 0.0;
++  [unroll] for (int j = 0; j < WIN; ++j) {
++    int2 q = p + WinOffset(j);
++    A[j] = LoadL(t0, q, size);
++    meanA += A[j];
++    gx[j] = 0.5 * (LoadL(t0, q + int2(1, 0), size) - LoadL(t0, q - int2(1, 0), size));
++    gy[j] = 0.5 * (LoadL(t0, q + int2(0, 1), size) - LoadL(t0, q - int2(0, 1), size));
++    h00 += gx[j] * gx[j];
++    h01 += gx[j] * gy[j];
++    h11 += gy[j] * gy[j];
++  }
++  meanA /= WIN;
++
++  // Candidates.
++  float2 best = float2(0, 0);
++  float best_cost = WindowCost(A, meanA, p, best, inv) - 0.002;  // slight zero preference
++  float2 up = asfloat(c2.zw);
++  if (c1.z) {
++    int2 csize = int2(c1.xy);
++    int2 cp = clamp(int2(uv * float2(csize)), int2(0, 0), csize - 1);
++    float2 cand[5];
++    cand[0] = t2.SampleLevel(sLinear, uv, 0).xy * up;
++    cand[1] = t2.Load(int3(clamp(cp + int2(-1, 0), int2(0, 0), csize - 1), 0)).xy * up;
++    cand[2] = t2.Load(int3(clamp(cp + int2(1, 0), int2(0, 0), csize - 1), 0)).xy * up;
++    cand[3] = t2.Load(int3(clamp(cp + int2(0, -1), int2(0, 0), csize - 1), 0)).xy * up;
++    cand[4] = t2.Load(int3(clamp(cp + int2(0, 1), int2(0, 0), csize - 1), 0)).xy * up;
++    [loop] for (int i = 0; i < 5; ++i) {
++      float c = WindowCost(A, meanA, p, cand[i], inv) + 0.0005 * length(cand[i]);
++      if (c < best_cost) { best_cost = c; best = cand[i]; }
++    }
++  }
++  if (c1.w) {
++    float2 prior = t3.SampleLevel(sLinear, uv, 0).xy * asfloat(c2.xy);
++    float c = WindowCost(A, meanA, p, prior, inv) + 0.0005 * length(prior);
++    if (c < best_cost) { best_cost = c; best = prior; }
++  }
++  int r = int(c3.y);
++  [loop] for (int vy = -r; vy <= r; ++vy) {
++    [loop] for (int vx = -r; vx <= r; ++vx) {
++      float2 v = float2(vx, vy);
++      float c = WindowCost(A, meanA, p, v, inv) + 0.002 * length(v);
++      if (c < best_cost) { best_cost = c; best = v; }
++    }
++  }
++
++  // Lucas-Kanade refinement (template gradients, zero-mean residual). Flat windows have
++  // ~zero gradients and therefore don't move.
++  const float lambda = 0.002;
++  h00 += lambda;
++  h11 += lambda;
++  float det = h00 * h11 - h01 * h01;
++  float2 F = best;
++  [loop] for (int it = 0; it < 3; ++it) {
++    float B[WIN];
++    float s = 0.0;
++    [unroll] for (int k = 0; k < WIN; ++k) {
++      B[k] = t1.SampleLevel(sLinear, (float2(p + WinOffset(k)) + 0.5 + F) * inv, 0).r;
++      s += B[k];
++    }
++    float meanB = s / WIN;
++    float2 b = float2(0, 0);
++    [unroll] for (int m = 0; m < WIN; ++m) {
++      float e = (B[m] - meanB) - (A[m] - meanA);
++      b += float2(gx[m], gy[m]) * e;
++    }
++    float2 d = -float2(h11 * b.x - h01 * b.y, h00 * b.y - h01 * b.x) / det;
++    float dl = length(d);
++    if (dl > 1.0) d /= dl;
++    F += d;
++  }
++  float lk_cost = WindowCost(A, meanA, p, F, inv);
++  if (lk_cost > best_cost + 0.002) {
++    F = best;  // LK diverged
++  } else {
++    best_cost = lk_cost;
++  }
++  u0[id] = float4(F, max(best_cost, 0.0), 0);
++}
++
++// Edge-aware smoothing of a flow level: 5x5, weighted by luma similarity in A (t0),
++// match quality and distance. t1 = raw flow.
++[numthreads(8, 8, 1)] void CSSmooth(uint2 id : SV_DispatchThreadID) {
++  if (any(id >= c0.xy)) return;
++  int2 size = int2(c0.xy);
++  int2 p = int2(id);
++  float ap = LoadL(t0, p, size);
++  float2 sum = float2(0, 0);
++  float wsum = 0.0;
++  [unroll] for (int dy = -2; dy <= 2; ++dy) {
++    [unroll] for (int dx = -2; dx <= 2; ++dx) {
++      int2 q = clamp(p + int2(dx, dy), int2(0, 0), size - 1);
++      float4 f = t1.Load(int3(q, 0));
++      float dl = LoadL(t0, q, size) - ap;
++      float w = exp(-dl * dl * 312.5) * exp(-float(dx * dx + dy * dy) * 0.125) /
++                (f.z + 0.02);
++      sum += f.xy * w;
++      wsum += w;
++    }
++  }
++  u0[id] = float4(sum / wsum, t1.Load(int3(p, 0)).z, 0);
++}
++
++// ---- synthesis --------------------------------------------------------------------
++// t0 = previous frame, t1 = current frame, t2 = flow prev->cur, t3 = flow cur->prev
++// (level 0). c0.xy = output size, c2.xy = flow scale to output pixels (asfloat),
++// c3.x = debug split.
++float2 FlowAt(Texture2D<float4> t, float2 pos, float2 inv, float2 scale) {
++  return t.SampleLevel(sLinear, pos * inv, 0).xy * scale;
++}
++float3 Col(Texture2D<float4> t, float2 pos, float2 inv) {
++  return t.SampleLevel(sLinear, pos * inv, 0).rgb;
++}
++float Diff3(float3 a, float3 b) { return dot(abs(a - b), 1.0 / 3.0); }
++
++[numthreads(8, 8, 1)] void CSSynth(uint2 id : SV_DispatchThreadID) {
++  if (any(id >= c0.xy)) return;
++  float2 inv = 1.0 / float2(c0.xy);
++  float2 fs = asfloat(c2.xy);
++  float2 p = float2(id) + 0.5;
++
++  // Flows from the midpoint (linear-motion approximation, t = 0.5).
++  float2 f01 = FlowAt(t2, p, inv, fs);
++  float2 f10 = FlowAt(t3, p, inv, fs);
++  float2 y0 = p + 0.25 * (f10 - f01);
++  float2 y1 = p + 0.25 * (f01 - f10);
++
++  // Forward-backward consistency of each source sample (occlusion).
++  float2 a01 = FlowAt(t2, y0, inv, fs);
++  float e0 = length(a01 + FlowAt(t3, y0 + a01, inv, fs));
++  float2 a10 = FlowAt(t3, y1, inv, fs);
++  float e1 = length(a10 + FlowAt(t2, y1 + a10, inv, fs));
++  float s0 = 1.5 + 0.05 * length(a01), s1 = 1.5 + 0.05 * length(a10);
++  float v0 = max(exp(-e0 * e0 / (2.0 * s0 * s0)), 0.02);
++  float v1 = max(exp(-e1 * e1 / (2.0 * s1 * s1)), 0.02);
++
++  const float2 d = float2(1.5, 1.5);
++  float3 c0s = Col(t0, y0, inv), c1s = Col(t1, y1, inv);
++  float3 flow_res = (v0 * c0s + v1 * c1s) / (v0 + v1);
++  float e_flow = (Diff3(c0s, c1s) + Diff3(Col(t0, y0 + d, inv), Col(t1, y1 + d, inv)) +
++                  Diff3(Col(t0, y0 - d, inv), Col(t1, y1 - d, inv))) / 3.0;
++  // Where one side is occluded the two samples are expected to differ.
++  e_flow *= 2.0 * min(v0, v1) / (v0 + v1);
++
++  float3 z0 = Col(t0, p, inv), z1 = Col(t1, p, inv);
++  float e_zero = (Diff3(z0, z1) + Diff3(Col(t0, p + d, inv), Col(t1, p + d, inv)) +
++                  Diff3(Col(t0, p - d, inv), Col(t1, p - d, inv))) / 3.0;
++  float3 zero_res = 0.5 * (z0 + z1);
++  const float e_hold = 0.08;  // the newer frame wins once nothing explains the change
++
++  float e_min = min(min(e_flow, e_zero), e_hold);
++  const float s = 0.015;
++  float w_flow = exp(-(e_flow - e_min) / s);
++  float w_zero = exp(-(e_zero - e_min) / s);
++  float w_hold = exp(-(e_hold - e_min) / s);
++  float3 o = (w_flow * flow_res + w_zero * zero_res + w_hold * z1) / (w_flow + w_zero + w_hold);
++
++  if (c3.x == 1u && id.x >= c0.x / 2u) o = z1;
++  if (c3.x == 2u && id.x < c0.x / 2u) o = z1;
++  if (c3.x != 0u && id.x / 4u == c0.x / 8u) o = float3(1.0, 0.0, 1.0);
++  u0[id] = float4(o, 1.0);
++}
++)HLSL";
++
++const char* const kEntryPoints[] = {"CSLuma", "CSDown", "CSRefine", "CSSmooth", "CSSynth"};
++
++uint32_t DivUp(uint32_t a, uint32_t b) { return (a + b - 1) / b; }
++uint32_t AsUint(float f) {
++  uint32_t u;
++  std::memcpy(&u, &f, sizeof(u));
++  return u;
++}
++
++D3D12_RESOURCE_BARRIER Transition(ID3D12Resource* r, D3D12_RESOURCE_STATES before,
++                                  D3D12_RESOURCE_STATES after) {
++  D3D12_RESOURCE_BARRIER b{};
++  b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++  b.Transition.pResource = r;
++  b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++  b.Transition.StateBefore = before;
++  b.Transition.StateAfter = after;
++  return b;
++}
++
++}  // namespace
++
++D3D12FrameInterpolator::D3D12FrameInterpolator(const D3D12Provider& provider,
++                                               D3D12SubmissionTracker& paint_tracker)
++    : provider_(provider), paint_tracker_(paint_tracker) {}
++
++D3D12FrameInterpolator::~D3D12FrameInterpolator() { ReleaseTextures(); }
++
++bool D3D12FrameInterpolator::Initialize() {
++  if (initialized_) return true;
++  HMODULE compiler = LoadLibraryW(L"d3dcompiler_47.dll");
++  if (!compiler) {
++    REXLOG_ERROR("Frame generation: d3dcompiler_47.dll is not available");
++    return false;
++  }
++  auto compile = reinterpret_cast<pD3DCompile>(GetProcAddress(compiler, "D3DCompile"));
++  if (!compile) {
++    REXLOG_ERROR("Frame generation: D3DCompile not found");
++    return false;
++  }
++
++  // Root signature: b0 constants, a table of 4 SRVs + 2 UAVs, two static samplers.
++  D3D12_DESCRIPTOR_RANGE ranges[2]{};
++  ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
++  ranges[0].NumDescriptors = 4;
++  ranges[0].OffsetInDescriptorsFromTableStart = 0;
++  ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
++  ranges[1].NumDescriptors = 2;
++  ranges[1].OffsetInDescriptorsFromTableStart = 4;
++  D3D12_ROOT_PARAMETER params[2]{};
++  params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
++  params[0].Constants.Num32BitValues = kConstantCount;
++  params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
++  params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++  params[1].DescriptorTable.NumDescriptorRanges = 2;
++  params[1].DescriptorTable.pDescriptorRanges = ranges;
++  params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
++  D3D12_STATIC_SAMPLER_DESC samplers[2]{};
++  for (int i = 0; i < 2; ++i) {
++    samplers[i].Filter =
++        i ? D3D12_FILTER_MIN_MAG_MIP_POINT : D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
++    samplers[i].AddressU = samplers[i].AddressV = samplers[i].AddressW =
++        D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
++    samplers[i].MaxLOD = D3D12_FLOAT32_MAX;
++    samplers[i].ShaderRegister = i;
++    samplers[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
++  }
++  D3D12_ROOT_SIGNATURE_DESC rs{};
++  rs.NumParameters = 2;
++  rs.pParameters = params;
++  rs.NumStaticSamplers = 2;
++  rs.pStaticSamplers = samplers;
++  root_signature_.Attach(util::CreateRootSignature(provider_, rs));
++  if (!root_signature_) {
++    REXLOG_ERROR("Frame generation: failed to create the root signature");
++    return false;
++  }
++
++  for (int i = 0; i < kPassCount; ++i) {
++    Microsoft::WRL::ComPtr<ID3DBlob> code, errors;
++    HRESULT hr = compile(kShaderSource, sizeof(kShaderSource) - 1, "ng2_frame_interpolator", nullptr,
++                         nullptr, kEntryPoints[i], "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
++                         &code, &errors);
++    if (FAILED(hr)) {
++      REXLOG_ERROR("Frame generation: failed to compile {}: {}", kEntryPoints[i],
++                   errors ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
++      return false;
++    }
++    pipelines_[i].Attach(util::CreateComputePipeline(provider_.GetDevice(), code->GetBufferPointer(),
++                                                     code->GetBufferSize(), root_signature_.Get()));
++    if (!pipelines_[i]) {
++      REXLOG_ERROR("Frame generation: failed to create the {} pipeline", kEntryPoints[i]);
++      return false;
++    }
++  }
++
++  D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
++  heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
++  heap_desc.NumDescriptors = kHeapDescriptors;
++  heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
++  if (FAILED(provider_.GetDevice()->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap_)))) {
++    REXLOG_ERROR("Frame generation: failed to create the descriptor heap");
++    return false;
++  }
++  initialized_ = true;
++  REXLOG_INFO("Frame generation: initialized (dense optical flow)");
++  return true;
++}
++
++void D3D12FrameInterpolator::ReleaseTextures() {
++  if (width_) paint_tracker_.AwaitSubmissionCompletion(last_usage_);
++  for (auto& t : history_) t.Reset();
++  for (auto& slot : pyramid_) {
++    for (auto& t : slot) t.Reset();
++  }
++  for (auto& dir : flow_) {
++    for (auto& t : dir) t.Reset();
++  }
++  for (auto& t : flow_scratch_) t.Reset();
++  interpolated_.Reset();
++  width_ = height_ = 0;
++  frame_count_ = 0;
++  prior_valid_ = false;
++}
++
++bool D3D12FrameInterpolator::EnsureTextures(uint32_t width, uint32_t height) {
++  if (width == width_ && height == height_) return true;
++  ReleaseTextures();
++  ID3D12Device* device = provider_.GetDevice();
++  auto create = [&](uint32_t w, uint32_t h, DXGI_FORMAT format, bool uav,
++                    D3D12_RESOURCE_STATES state, Microsoft::WRL::ComPtr<ID3D12Resource>& out) {
++    D3D12_RESOURCE_DESC desc{};
++    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++    desc.Width = std::max(w, 1u);
++    desc.Height = std::max(h, 1u);
++    desc.DepthOrArraySize = 1;
++    desc.MipLevels = 1;
++    desc.Format = format;
++    desc.SampleDesc.Count = 1;
++    desc.Flags = uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
++    return SUCCEEDED(device->CreateCommittedResource(&util::kHeapPropertiesDefault,
++                                                     provider_.GetHeapFlagCreateNotZeroed(), &desc,
++                                                     state, nullptr, IID_PPV_ARGS(&out)));
++  };
++  width_ = width;
++  height_ = height;
++  const uint32_t factor =
++      std::max(1u, uint32_t(std::lround(double(width) / double(kAnalysisWidth))));
++  level_width_[0] = DivUp(width, factor);
++  level_height_[0] = DivUp(height, factor);
++  for (uint32_t l = 1; l < kLevels; ++l) {
++    level_width_[l] = DivUp(level_width_[l - 1], 2);
++    level_height_[l] = DivUp(level_height_[l - 1], 2);
++  }
++  bool ok = true;
++  for (int i = 0; i < 2; ++i) {
++    ok &= create(width, height, kColorFormat, false, kAllShaderResource, history_[i]);
++  }
++  for (uint32_t l = 0; l < kLevels; ++l) {
++    for (int i = 0; i < 2; ++i) {
++      ok &= create(level_width_[l], level_height_[l], kLumaFormat, true, kNonPixel,
++                   pyramid_[i][l]);
++      ok &= create(level_width_[l], level_height_[l], kFlowFormat, true, kNonPixel, flow_[i][l]);
++    }
++    ok &= create(level_width_[l], level_height_[l], kFlowFormat, true, kNonPixel,
++                 flow_scratch_[l]);
++  }
++  ok &= create(width, height, kColorFormat, true, kAllShaderResource, interpolated_);
++  if (!ok) {
++    REXLOG_ERROR("Frame generation: failed to create {}x{} textures", width, height);
++    ReleaseTextures();
++    return false;
++  }
++  REXLOG_INFO("Frame generation: {}x{} (flow {}x{} .. {}x{})", width, height, level_width_[0],
++              level_height_[0], level_width_[kLevels - 1], level_height_[kLevels - 1]);
++  return true;
++}
++
++void D3D12FrameInterpolator::Run(ID3D12GraphicsCommandList* command_list, Pass pass,
++                                 const Binding& binding, uint32_t thread_width,
++                                 uint32_t thread_height, const uint32_t* constants) {
++  ID3D12Device* device = provider_.GetDevice();
++  if (heap_next_ + kTableSize > kHeapDescriptors) heap_next_ = 0;
++  const uint32_t base = heap_next_;
++  heap_next_ += kTableSize;
++  D3D12_CPU_DESCRIPTOR_HANDLE cpu = heap_->GetCPUDescriptorHandleForHeapStart();
++  for (uint32_t i = 0; i < 4; ++i) {
++    ID3D12Resource* r = binding.srv[i];
++    D3D12_SHADER_RESOURCE_VIEW_DESC d{};
++    d.Format = r ? r->GetDesc().Format : kLumaFormat;
++    d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++    d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++    d.Texture2D.MipLevels = 1;
++    device->CreateShaderResourceView(r, &d, provider_.OffsetViewDescriptor(cpu, base + i));
++  }
++  for (uint32_t i = 0; i < 2; ++i) {
++    ID3D12Resource* r = i ? nullptr : binding.uav;
++    D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
++    d.Format = r ? r->GetDesc().Format : kLumaFormat;
++    d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
++    device->CreateUnorderedAccessView(r, nullptr, &d,
++                                      provider_.OffsetViewDescriptor(cpu, base + 4 + i));
++  }
++
++  D3D12_RESOURCE_BARRIER b =
++      Transition(binding.uav, binding.uav_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++  command_list->ResourceBarrier(1, &b);
++  command_list->SetPipelineState(pipelines_[pass].Get());
++  command_list->SetComputeRoot32BitConstants(0, kConstantCount, constants, 0);
++  D3D12_GPU_DESCRIPTOR_HANDLE gpu = heap_->GetGPUDescriptorHandleForHeapStart();
++  command_list->SetComputeRootDescriptorTable(1, provider_.OffsetViewDescriptor(gpu, base));
++  command_list->Dispatch(DivUp(thread_width, 8), DivUp(thread_height, 8), 1);
++  b = Transition(binding.uav, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, binding.uav_state);
++  command_list->ResourceBarrier(1, &b);
++}
++
++bool D3D12FrameInterpolator::PushFrame(ID3D12GraphicsCommandList* command_list,
++                                       ID3D12Resource* guest_frame, uint64_t paint_submission) {
++  if (!initialized_ || !guest_frame) return false;
++  D3D12_RESOURCE_DESC desc = guest_frame->GetDesc();
++  if (desc.Format != kColorFormat) return false;
++  if (!EnsureTextures(uint32_t(desc.Width), desc.Height)) return false;
++  last_usage_ = paint_submission;
++
++  const uint32_t n = frame_count_ ? (current_ ^ 1) : current_;
++  D3D12_RESOURCE_BARRIER b[2] = {
++      Transition(guest_frame, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
++                 D3D12_RESOURCE_STATE_COPY_SOURCE),
++      Transition(history_[n].Get(), kAllShaderResource, D3D12_RESOURCE_STATE_COPY_DEST)};
++  command_list->ResourceBarrier(2, b);
++  command_list->CopyResource(history_[n].Get(), guest_frame);
++  b[0] = Transition(guest_frame, D3D12_RESOURCE_STATE_COPY_SOURCE,
++                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
++  b[1] = Transition(history_[n].Get(), D3D12_RESOURCE_STATE_COPY_DEST, kAllShaderResource);
++  command_list->ResourceBarrier(2, b);
++
++  ID3D12DescriptorHeap* heap = heap_.Get();
++  command_list->SetDescriptorHeaps(1, &heap);
++  command_list->SetComputeRootSignature(root_signature_.Get());
++
++  uint32_t c[kConstantCount] = {};
++  Binding bind;
++  bind.srv[0] = history_[n].Get();
++  bind.uav = pyramid_[n][0].Get();
++  c[0] = level_width_[0];
++  c[1] = level_height_[0];
++  c[2] = width_;
++  c[3] = height_;
++  Run(command_list, kPassLuma, bind, level_width_[0], level_height_[0], c);
++  for (uint32_t l = 1; l < kLevels; ++l) {
++    Binding down;
++    down.srv[0] = pyramid_[n][l - 1].Get();
++    down.uav = pyramid_[n][l].Get();
++    c[0] = level_width_[l];
++    c[1] = level_height_[l];
++    c[2] = level_width_[l - 1];
++    c[3] = level_height_[l - 1];
++    Run(command_list, kPassDown, down, level_width_[l], level_height_[l], c);
++  }
++
++  current_ = n;
++  frame_count_ = std::min(frame_count_ + 1, 2u);
++  return true;
++}
++
++bool D3D12FrameInterpolator::Interpolate(ID3D12GraphicsCommandList* command_list,
++                                         uint64_t paint_submission) {
++  if (!initialized_ || !HasPrevious()) return false;
++  last_usage_ = paint_submission;
++  const uint32_t cur = current_, prev = current_ ^ 1;
++  ID3D12DescriptorHeap* heap = heap_.Get();
++  command_list->SetDescriptorHeaps(1, &heap);
++  command_list->SetComputeRootSignature(root_signature_.Get());
++
++  // Flow in both directions, coarse to fine: 0 = previous->current, 1 = current->previous.
++  for (uint32_t dir = 0; dir < 2; ++dir) {
++    const uint32_t a = dir ? cur : prev, b = dir ? prev : cur;
++    for (int l = int(kLevels) - 1; l >= 0; --l) {
++      const bool coarsest = l == int(kLevels) - 1;
++      uint32_t c[kConstantCount] = {};
++      c[0] = level_width_[l];
++      c[1] = level_height_[l];
++      Binding refine;
++      refine.srv[0] = pyramid_[a][l].Get();
++      refine.srv[1] = pyramid_[b][l].Get();
++      if (!coarsest) {
++        refine.srv[2] = flow_[dir][l + 1].Get();
++        c[4] = level_width_[l + 1];
++        c[5] = level_height_[l + 1];
++        c[6] = 1;
++        c[10] = AsUint(float(level_width_[l]) / float(level_width_[l + 1]));
++        c[11] = AsUint(float(level_height_[l]) / float(level_height_[l + 1]));
++      }
++      if (prior_valid_) {
++        refine.srv[3] = flow_[dir][0].Get();  // the previous pair's final flow
++        c[7] = 1;
++        c[8] = AsUint(float(level_width_[l]) / float(level_width_[0]));
++        c[9] = AsUint(float(level_height_[l]) / float(level_height_[0]));
++      }
++      c[13] = coarsest ? kCoarseSearchRadius : 0;
++      refine.uav = flow_scratch_[l].Get();
++      Run(command_list, kPassRefine, refine, level_width_[l], level_height_[l], c);
++
++      Binding smooth;
++      smooth.srv[0] = pyramid_[a][l].Get();
++      smooth.srv[1] = flow_scratch_[l].Get();
++      smooth.uav = flow_[dir][l].Get();
++      Run(command_list, kPassSmooth, smooth, level_width_[l], level_height_[l], c);
++    }
++  }
++
++  uint32_t c[kConstantCount] = {};
++  c[0] = width_;
++  c[1] = height_;
++  c[4] = level_width_[0];
++  c[5] = level_height_[0];
++  c[8] = AsUint(float(width_) / float(level_width_[0]));
++  c[9] = AsUint(float(height_) / float(level_height_[0]));
++  c[12] = debug_split_;
++  Binding synth;
++  synth.srv[0] = history_[prev].Get();
++  synth.srv[1] = history_[cur].Get();
++  synth.srv[2] = flow_[0][0].Get();
++  synth.srv[3] = flow_[1][0].Get();
++  synth.uav = interpolated_.Get();
++  synth.uav_state = kAllShaderResource;
++  Run(command_list, kPassSynth, synth, width_, height_, c);
++  prior_valid_ = true;
++  return true;
++}
++
++}  // namespace rex::ui::d3d12

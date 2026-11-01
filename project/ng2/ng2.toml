@@ -1,0 +1,6 @@
+# ng2 runtime config. Copied next to ng2.exe by CMake on every build.
+# Keys are ReXGlue cvar names; the command line overrides anything set here.
+
+# Ninja Gaiden II's cutscenes render black (whole frames) with the default RTV
+# EDRAM path; the ROV path renders them correctly (notes\findings.md #16).
+render_target_path_d3d12 = "rov"
