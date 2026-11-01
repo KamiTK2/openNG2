@@ -1,4 +1,4 @@
-# Ninja Gaiden II (Xbox 360): native PC port
+# openNG2: Ninja Gaiden II (Xbox 360) native PC port
 
 Goal: a native Windows build of the **original 2008 Xbox 360 Ninja Gaiden II**,
 made by statically recompiling the game's PowerPC code to x64 C++. No game data
