@@ -4,11 +4,14 @@
 
 #pragma once
 
+#include <fstream>
 #include <memory>
 
 #include <rex/input/input_system.h>
 #include <rex/rex_app.h>
 #include <rex/runtime.h>
+#include <rex/system/kernel_state.h>
+#include <rex/system/xam/content_manager.h>
 
 #include "crash_handler.h"
 #ifdef NG2_TRACE_ALL
@@ -58,6 +61,11 @@ class Ng2App : public rex::ReXApp {
     ng2::InstallRecompInputFilters();
   }
 
+  // DLC: install every package in <game data>\dlc that isn't installed yet (extracted into the
+  // user data folder like a console's marketplace content), before the game starts and
+  // enumerates content. The launcher only has to put the player's DLC files there.
+  void OnPreLaunchModule() override { InstallDlc(); }
+
   void OnConfigureFonts(ImFontAtlas* atlas) override { ng2::LoadRecompSettingsFonts(atlas); }
 
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
@@ -73,6 +81,62 @@ class Ng2App : public rex::ReXApp {
  private:
   std::filesystem::path RecompSettingsPath() const {
     return user_data_root() / "recomp_settings.toml";
+  }
+
+  void InstallDlc() {
+    auto* ks = REX_KERNEL_STATE();
+    auto* content = ks ? ks->content_manager() : nullptr;
+    const auto dlc_dir = game_data_root() / "dlc";
+    std::error_code ec;
+    if (!content || !std::filesystem::is_directory(dlc_dir, ec)) return;
+    const auto markers = user_data_root() / "dlc_installed";
+    std::filesystem::create_directories(markers, ec);
+    for (const auto& e : std::filesystem::directory_iterator(dlc_dir, ec)) {
+      if (!e.is_regular_file()) continue;
+      const auto marker = markers / e.path().filename();
+      if (!std::filesystem::exists(marker, ec)) {
+        REXLOG_INFO("NG2 DLC: installing {}", e.path().filename().string());
+        const auto result = content->InstallContent(e.path());
+        if (result != 0) {
+          REXLOG_WARN("NG2 DLC: install of {} failed ({:#x})", e.path().filename().string(),
+                      uint32_t(result));
+          continue;
+        }
+        std::ofstream(marker) << "installed\n";
+        REXLOG_INFO("NG2 DLC: installed {}", e.path().filename().string());
+      }
+      FixDlcLicense(e.path(), ks->title_id());
+    }
+  }
+
+  // The runtime's installer only counts STFS license entries whose flags are non-zero, so a
+  // package whose only entry is {id 0xFFFFFFFFFFFFFFFF (anyone), bits 1, flags 0} - NG2's
+  // Mission Mode - gets no license mask in its .header, and the game treats it as
+  // unlicensed and hides it (findings #43). Append the mask from every entry with a licensee.
+  void FixDlcLicense(const std::filesystem::path& package, uint32_t title_id) {
+    char title[16];
+    std::snprintf(title, sizeof(title), "%08X", title_id);
+    const auto header = user_data_root() / "0000000000000000" / title / "Headers" / "00000002" /
+                        (package.filename().string() + ".header");
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(header, ec);
+    if (ec || size != sizeof(rex::system::xam::XCONTENT_AGGREGATE_DATA)) return;  // has a mask
+    std::ifstream in(package, std::ios::binary);
+    uint8_t lic[16 * 16] = {};
+    in.seekg(0x22C);
+    if (!in.read(reinterpret_cast<char*>(lic), sizeof(lic))) return;
+    auto be32 = [](const uint8_t* p) {
+      return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
+    };
+    uint32_t mask = 0;
+    for (int i = 0; i < 16; ++i) {
+      const uint8_t* entry = lic + 16 * i;
+      if (be32(entry) || be32(entry + 4)) mask |= be32(entry + 8);  // licensee id set
+    }
+    if (!mask) return;
+    std::ofstream(header, std::ios::binary | std::ios::app)
+        .write(reinterpret_cast<const char*>(&mask), sizeof(mask));
+    REXLOG_INFO("NG2 DLC: {} license mask {:#x} added", package.filename().string(), mask);
   }
 
   std::unique_ptr<ng2::RecompOptionsPane> recomp_pane_;

@@ -39,6 +39,8 @@ Hard = reverse-engineering + game patches.
 
 ## Distribution: easy launcher (end goal, user 2026-11-01)
 Players supply their own game; we never ship game data or game-derived code. A launcher:
+- [ ] Optional title update (player-supplied .xexp): needed for Mission Mode (findings #43); means recompiling the patched XEX and re-finding every hook address
+- [ ] Pick the player's DLC packages too (copied to game\dlc; installed by the game on first launch, findings #43)
 - [ ] Pick the dump (GOD package, extracted folder or default.xex); verify the SHA-256 /
       title ID / media ID (notes/findings.md target table) and extract (tools/god_extract.py).
 - [ ] Get the toolchain without manual setup: fetch ReXGlue v0.10.0 + apply
