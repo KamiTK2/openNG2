@@ -18,7 +18,7 @@ Hard = reverse-engineering + game patches.
 - (dropped: gamma / brightness: the game's own Screen Settings already has brightness/contrast)
 - (removed by user: FPS counter row; the game always runs at 60. Frame rate is still logged every 5 s)
 - [x] Mute in background   - [x] pause in background (XN_SYS_UI on focus loss, findings #41)
-- [x] Save management: open save folder, back up saves   - [x] restore backup   - [ ] import console save
+- [x] Save management: open save folder, back up saves   - [x] restore backup   - (dropped by user: import console save; the Cheats cover unlocks)
 - [x] Controller: stick deadzone, invert camera X/Y, vibration strength (SDK input filter)   - (dropped: camera sensitivity, the game's Camera Settings has it)   - [ ] remapping
 
 ## Phase C: Medium
