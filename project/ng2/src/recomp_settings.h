@@ -76,6 +76,7 @@ struct RecompSettings {
   int stick_deadzone = 0;  // extra radial deadzone, percent 0..30
   int vibration = 100;     // percent 0..100
   // System
+  bool skip_intro = false;  // skip the boot movie (cvar ng2_skip_intro; next launch)
   bool pause_in_background = false;  // sends XN_SYS_UI (like the Guide button) on focus loss
   // Cheats (cvars ng2_cheat_*; apply after a restart, nothing is written to the game save)
   bool cheat_difficulties = false;

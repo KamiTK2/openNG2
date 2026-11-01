@@ -731,3 +731,44 @@ bool Ng2IngameRecompRowSelected() {
   if (!menu || NowMs() - g_ingame_visible_ms.load() > 150) return false;
   return GuestLoadU32(menu + kIngameCursor) == kIngameRecompRow;
 }
+
+// ---- Skip Intro (Recomp Settings > System) -------------------------------------------------------
+// Boot plays movie 0 (game:\NinjaVI.wmv, path table 0x83AB96C8) from the movie scene sub_83660E68
+// via sub_83660C30(index), which uses the multi-stream player sub_836602D0 when the index has
+// side streams (table 0x83AB9760; movie 0 has NinjaVI_Left/Right) and sub_83660158 otherwise.
+// When a movie fails to open, both players clear its handle (0x84C557FC), set the "movie
+// finished" flag (0x84A69CC4) and return 0, and the scene moves on. With ng2_skip_intro, the
+// first play of movie 0 takes that same path without opening the files (findings #47).
+REXCVAR_DEFINE_BOOL(ng2_skip_intro, false, "NG2", "Skip the intro movie at boot");
+namespace {
+std::atomic<bool> g_intro_seen{false};
+// True (once) for the boot movie when Skip Intro is on; writes the players' failure state.
+bool SkipBootMovie(uint32_t index, uint32_t busy_flag) {
+  if (index != 0 || g_intro_seen.exchange(true) || !REXCVAR_GET(ng2_skip_intro)) return false;
+  auto* mem = REX_KERNEL_STATE()->memory();
+  auto put = [mem](uint32_t a, uint32_t v) {
+    rex::memory::store_and_swap<uint32_t>(mem->TranslateVirtual(a), v);
+  };
+  put(0x84C55808, busy_flag);  // each player sets this before opening (0 / 1)
+  put(0x84C557FC, 0);          // movie handle
+  put(0x84A69CC4, 1);          // movie finished
+  REXLOG_INFO("NG2 skip intro: boot movie skipped");
+  return true;
+}
+}  // namespace
+extern "C" REX_FUNC(__imp__sub_83660158);
+extern "C" REX_FUNC(sub_83660158) {
+  if (SkipBootMovie(ctx.r3.u32, 0)) {
+    ctx.r3.u64 = 0;
+    return;
+  }
+  __imp__sub_83660158(ctx, base);
+}
+extern "C" REX_FUNC(__imp__sub_836602D0);
+extern "C" REX_FUNC(sub_836602D0) {
+  if (SkipBootMovie(ctx.r3.u32, 1)) {
+    ctx.r3.u64 = 0;
+    return;
+  }
+  __imp__sub_836602D0(ctx, base);
+}
