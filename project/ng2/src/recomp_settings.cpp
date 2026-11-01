@@ -22,6 +22,7 @@
 #include <rex/cvar.h>
 #include <rex/input/input_filter.h>
 #include <rex/logging.h>
+#include <rex/system/kernel_state.h>
 #include <rex/ui/window.h>
 
 #pragma comment(lib, "xinput.lib")
@@ -96,6 +97,7 @@ std::atomic<bool> g_invert_x{false};
 std::atomic<bool> g_invert_y{false};
 std::atomic<int> g_deadzone_pct{0};
 std::atomic<int> g_vibration_pct{100};
+std::atomic<bool> g_pause_in_background{false};
 std::atomic<uint64_t> g_game_frames{0};
 
 void PublishCheats(const RecompSettings& s) {
@@ -108,6 +110,38 @@ void PublishInputSettings(const RecompSettings& s) {
   g_invert_y = s.invert_camera_y;
   g_deadzone_pct = s.stick_deadzone;
   g_vibration_pct = s.vibration;
+  g_pause_in_background = s.pause_in_background;
+}
+
+// "2026-11-01_01-53-09[_before-restore]" -> "2026-11-01 01:53" (+ " (pre-restore)").
+std::string BackupLabel(const std::string& name) {
+  if (name.size() < 16 || name[10] != '_') return name;
+  std::string out = name.substr(0, 10) + " " + name.substr(11, 2) + ":" + name.substr(14, 2);
+  if (name.find("before-restore") != std::string::npos) out += " (pre-restore)";
+  return out;
+}
+
+// Windowed presets for Window Size (client area, physical pixels).
+struct SizePreset {
+  int w, h;
+};
+constexpr SizePreset kWindowPresets[] = {{1280, 720},  {1600, 900},  {1920, 1080},
+                                         {2560, 1080}, {2560, 1440}, {3440, 1440},
+                                         {3840, 2160}};
+
+// Work area of the monitor the window is on (falls back to the primary).
+RECT WorkAreaFor(HWND h) {
+  MONITORINFO mi{sizeof(mi)};
+  GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTOPRIMARY), &mi);
+  return mi.rcWork;
+}
+
+// Outer window size for a client size, with the window's current style and DPI.
+SIZE OuterSizeFor(HWND h, int cw, int ch) {
+  RECT r{0, 0, cw, ch};
+  AdjustWindowRectExForDpi(&r, DWORD(GetWindowLongW(h, GWL_STYLE)), FALSE,
+                           DWORD(GetWindowLongW(h, GWL_EXSTYLE)), GetDpiForWindow(h));
+  return {r.right - r.left, r.bottom - r.top};
 }
 
 // The game's 16:9 frame inside the window (the presenter pillar/letterboxes it).
@@ -258,6 +292,12 @@ bool RecompSettings::Load(const std::filesystem::path& path) {
     else if (k == "ng2_invert_camera_y") invert_camera_y = ParseBool(v, invert_camera_y);
     else if (k == "ng2_stick_deadzone") stick_deadzone = ParseInt(v, stick_deadzone, 0, 30);
     else if (k == "ng2_vibration") vibration = ParseInt(v, vibration, 0, 100);
+    else if (k == "ng2_pause_in_background")
+      pause_in_background = ParseBool(v, pause_in_background);
+    else if (k == "ng2_window_width") window_width = ParseInt(v, window_width, 0, 16384);
+    else if (k == "ng2_window_height") window_height = ParseInt(v, window_height, 0, 16384);
+    else if (k == "ng2_window_x") window_x = ParseInt(v, window_x, -65536, 65536);
+    else if (k == "ng2_window_y") window_y = ParseInt(v, window_y, -65536, 65536);
     else if (k == "ng2_cheat_difficulties") cheat_difficulties = ParseBool(v, cheat_difficulties);
     else if (k == "ng2_cheat_costumes") cheat_costumes = ParseBool(v, cheat_costumes);
   }
@@ -287,6 +327,14 @@ bool RecompSettings::Save(const std::filesystem::path& path) const {
       << "ng2_invert_camera_y = " << b(invert_camera_y) << "\n"
       << "ng2_stick_deadzone = " << stick_deadzone << "\n"
       << "ng2_vibration = " << vibration << "\n"
+      << "ng2_pause_in_background = " << b(pause_in_background) << "\n"
+      << "ng2_window_width = " << window_width << "\n"
+      << "ng2_window_height = " << window_height << "\n";
+  if (window_x != INT_MIN && window_y != INT_MIN) {
+    out << "ng2_window_x = " << window_x << "\n"
+        << "ng2_window_y = " << window_y << "\n";
+  }
+  out
       << "ng2_cheat_difficulties = " << b(cheat_difficulties) << "\n"
       << "ng2_cheat_costumes = " << b(cheat_costumes) << "\n";
   return bool(out);
@@ -345,6 +393,7 @@ struct RowDef {
   const char* b = nullptr;
   bool a_selected = false;
   std::function<bool(int dir, bool accept)> change;  // returns true if settings changed
+  bool disabled = false;  // greyed out and skipped by the cursor
 };
 
 }  // namespace
@@ -366,9 +415,31 @@ RecompOptionsPane::RecompOptionsPane(rex::ui::ImGuiDrawer* drawer, rex::ui::Wind
   settings_.anti_aliasing = AaFromCvar(rex::cvar::GetFlagByName("swap_post_effect"));
   startup_ = settings_;
   applied_monitor_ = settings_.monitor;
+  RefreshBackups();
+  // Pause in Background: XN_SYS_UI is the notification the console sends when the Guide
+  // opens; the game pauses itself as it would on a console.
+  focus_thread_ = std::thread([this] {
+    bool paused = false;
+    while (!focus_thread_quit_) {
+      const bool want = g_pause_in_background && !OurWindowFocused();
+      if (want != paused) {
+        if (auto* ks = REX_KERNEL_STATE()) {
+          paused = want;
+          ks->BroadcastNotification(0x9 /* XN_SYS_UI */, want ? 1 : 0);
+          REXLOG_INFO("RECOMP SETTINGS: window {} focus, XN_SYS_UI = {}",
+                      want ? "lost" : "regained", want);
+        }
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  });
 }
 
-RecompOptionsPane::~RecompOptionsPane() { g_pane_focused = false; }
+RecompOptionsPane::~RecompOptionsPane() {
+  g_pane_focused = false;
+  focus_thread_quit_ = true;
+  if (focus_thread_.joinable()) focus_thread_.join();
+}
 
 void RecompOptionsPane::SyncFromRuntime() {
   if (window_) settings_.fullscreen = window_->IsFullscreen();
@@ -407,12 +478,13 @@ void RecompOptionsPane::UpdateBackgroundMute() {
   }
 }
 
-void RecompOptionsPane::BackUpSaves() {
-  char stamp[32];
+std::string RecompOptionsPane::BackUpSaves(const char* suffix) {
+  char stamp[48];
   std::time_t t = std::time(nullptr);
   std::tm tm{};
   localtime_s(&tm, &t);
   std::strftime(stamp, sizeof(stamp), "%Y-%m-%d_%H-%M-%S", &tm);
+  strncat_s(stamp, suffix, _TRUNCATE);
   std::error_code ec;
   const auto dst = user_data_root_ / "save_backups" / stamp;
   std::filesystem::create_directories(dst, ec);
@@ -427,10 +499,121 @@ void RecompOptionsPane::BackUpSaves() {
                           ec);
     if (!ec) ++copied;
   }
+  if (!copied) std::filesystem::remove(dst, ec);
   status_ = copied ? std::string("Saves backed up to save_backups\\") + stamp
                    : std::string("No saves found to back up.");
   status_until_ms_ = NowMs() + 4000;
   REXLOG_INFO("RECOMP SETTINGS: {}", status_);
+  RefreshBackups();
+  return copied ? std::string(stamp) : std::string();
+}
+
+void RecompOptionsPane::RefreshBackups() {
+  backups_.clear();
+  std::error_code ec;
+  for (const auto& e : std::filesystem::directory_iterator(user_data_root_ / "save_backups", ec)) {
+    if (e.is_directory()) backups_.push_back(e.path().filename().string());
+  }
+  std::sort(backups_.rbegin(), backups_.rend());  // timestamps: newest first
+  backup_index_ = std::clamp(backup_index_, 0, std::max(0, int(backups_.size()) - 1));
+}
+
+void RecompOptionsPane::RestoreBackup(const std::string& name) {
+  const auto src = user_data_root_ / "save_backups" / name;
+  std::error_code ec;
+  if (!std::filesystem::is_directory(src, ec)) {
+    status_ = "That backup no longer exists.";
+    status_until_ms_ = NowMs() + 4000;
+    RefreshBackups();
+    return;
+  }
+  // Keep what is there now, so a restore can itself be undone.
+  BackUpSaves("_before-restore");
+  int restored = 0;
+  for (const auto& e : std::filesystem::directory_iterator(src, ec)) {
+    if (!e.is_directory()) continue;
+    std::error_code cec;
+    std::filesystem::copy(e.path(), user_data_root_ / e.path().filename(),
+                          std::filesystem::copy_options::recursive |
+                              std::filesystem::copy_options::overwrite_existing,
+                          cec);
+    if (cec) {
+      REXLOG_WARN("RECOMP SETTINGS: restore of {} failed: {}", e.path().string(), cec.message());
+    } else {
+      ++restored;
+    }
+  }
+  status_ = restored ? "Restored " + name + ". Load it from the title screen."
+                     : std::string("Nothing was restored.");
+  status_until_ms_ = NowMs() + 6000;
+  REXLOG_INFO("RECOMP SETTINGS: {}", status_);
+}
+
+// Windowed mode: put the window back where it was last time, apply Window Size, and
+// remember moves/resizes the player makes (saved after the window settles for 1 s).
+void RecompOptionsPane::UpdateWindowGeometry(int64_t now) {
+  HWND h = window_ ? static_cast<HWND>(window_->GetNativeWindowHandle()) : nullptr;
+  if (!h) return;
+  if (window_->IsFullscreen() || IsIconic(h) || IsZoomed(h)) {
+    geometry_ready_at_ms_ = now + 500;  // let the window settle after leaving fullscreen
+    return;
+  }
+  if (now < geometry_ready_at_ms_) return;
+  if (!geometry_restored_) {
+    geometry_restored_ = true;
+    ApplyWindowGeometry(true);
+    return;
+  }
+  if (pending_size_) {
+    pending_size_ = false;
+    ApplyWindowGeometry(false);
+    return;
+  }
+  RECT wr, cr;
+  if (!GetWindowRect(h, &wr) || !GetClientRect(h, &cr)) return;
+  const int x = wr.left, y = wr.top, w = cr.right - cr.left, hh = cr.bottom - cr.top;
+  if (w <= 0 || hh <= 0) return;
+  if (x != seen_x_ || y != seen_y_ || w != seen_w_ || hh != seen_h_) {
+    seen_x_ = x, seen_y_ = y, seen_w_ = w, seen_h_ = hh;
+    seen_at_ms_ = now;
+    return;
+  }
+  auto& s = settings_;
+  if (now - seen_at_ms_ >= 1000 &&
+      (s.window_x != x || s.window_y != y || s.window_width != w || s.window_height != hh)) {
+    s.window_x = x, s.window_y = y, s.window_width = w, s.window_height = hh;
+    s.Save(settings_path_);
+  }
+}
+
+void RecompOptionsPane::ApplyWindowGeometry(bool with_position) {
+  HWND h = window_ ? static_cast<HWND>(window_->GetNativeWindowHandle()) : nullptr;
+  if (!h) return;
+  const auto& s = settings_;
+  RECT wr;
+  GetWindowRect(h, &wr);
+  SIZE outer{wr.right - wr.left, wr.bottom - wr.top};
+  const bool sized = s.window_width > 0 && s.window_height > 0;
+  if (sized) outer = OuterSizeFor(h, s.window_width, s.window_height);
+  int x = wr.left + ((wr.right - wr.left) - outer.cx) / 2;  // keep the centre
+  int y = wr.top + ((wr.bottom - wr.top) - outer.cy) / 2;
+  bool placed = false;
+  if (with_position && s.window_x != INT_MIN && s.window_y != INT_MIN) {
+    // Only if the saved spot is still on a connected monitor.
+    RECT saved{s.window_x, s.window_y, s.window_x + outer.cx, s.window_y + outer.cy};
+    if (MonitorFromRect(&saved, MONITOR_DEFAULTTONULL)) {
+      x = s.window_x, y = s.window_y;
+      placed = true;
+    }
+  }
+  if (!placed) {
+    const RECT work = WorkAreaFor(h);
+    x = std::clamp(x, int(work.left), std::max(int(work.left), int(work.right) - int(outer.cx)));
+    y = std::clamp(y, int(work.top), std::max(int(work.top), int(work.bottom) - int(outer.cy)));
+  }
+  if (!sized && !placed) return;
+  SetWindowPos(h, nullptr, x, y, outer.cx, outer.cy,
+               SWP_NOZORDER | SWP_NOACTIVATE | (sized ? 0 : SWP_NOSIZE));
 }
 
 // Logs the game's frame rate and the host present rate every 5 s (used by test runs; the
@@ -474,6 +657,7 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
   if (g_block_until_release && !pad_.any_held && !focused_) g_block_until_release = false;
   UpdateBackgroundMute();
   LogFrameRate();
+  UpdateWindowGeometry(NowMs());
 
   if (!pane_visible_()) {
     pane_since_ms_ = 0;
@@ -487,6 +671,7 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
   if (!pane_since_ms_) {
     pane_since_ms_ = now;
     SyncFromRuntime();
+    RefreshBackups();
   }
 
   // ---- rows for the current category -------------------------------------------------
@@ -535,6 +720,42 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
       const char* aspects[] = {"Auto", "16:9", "21:9", "32:9"};
       step_row("Aspect Ratio", aspects[s.aspect_mode], s.aspect_mode, 0, 3, 1,
                [&s](int v) { s.aspect_mode = v; });
+      {
+        // Window Size: presets that fit this monitor; a dragged size shows as-is.
+        std::vector<SizePreset> fit;
+        HWND h = window_ ? static_cast<HWND>(window_->GetNativeWindowHandle()) : nullptr;
+        const RECT work = h ? WorkAreaFor(h) : RECT{0, 0, 1 << 15, 1 << 15};
+        for (const auto& p : kWindowPresets) {
+          const SIZE o = h ? OuterSizeFor(h, p.w, p.h) : SIZE{p.w, p.h};
+          if (o.cx <= work.right - work.left && o.cy <= work.bottom - work.top) fit.push_back(p);
+        }
+        if (fit.empty()) fit.push_back(kWindowPresets[0]);
+        const int cur_w = s.window_width, cur_h = s.window_height;
+        const int64_t cur_key = int64_t(cur_w) * 100000 + cur_h;
+        auto key = [](const SizePreset& p) { return int64_t(p.w) * 100000 + p.h; };
+        int lower = -1, higher = -1;
+        for (int i = 0; i < int(fit.size()); ++i) {
+          if (key(fit[i]) < cur_key) lower = i;
+          if (key(fit[i]) > cur_key && higher < 0) higher = i;
+        }
+        if (cur_w > 0) std::snprintf(buf, sizeof(buf), "%d x %d", cur_w, cur_h);
+        else std::snprintf(buf, sizeof(buf), "Default");
+        rows.push_back({"Window Size", Kind::kStepper, buf, lower >= 0, higher >= 0, nullptr,
+                        nullptr, false, [this, fit, lower, higher](int dir, bool) {
+                          const int i = dir < 0 ? lower : dir > 0 ? higher : -1;
+                          if (i < 0) return false;
+                          settings_.window_width = fit[i].w;
+                          settings_.window_height = fit[i].h;
+                          pending_size_ = true;
+                          return true;
+                        }});
+        // Only meaningful in a window: greyed out and skipped while fullscreen.
+        if (s.fullscreen) {
+          rows.back().disabled = true;
+          rows.back().can_dec = rows.back().can_inc = false;
+          rows.back().change = nullptr;
+        }
+      }
       break;
     }
     case 1: {  // Graphics
@@ -583,6 +804,8 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
       break;
     }
     case 4: {  // System
+      pair_row("Pause in Background", "On", "Off", s.pause_in_background,
+               [&s](bool a) { s.pause_in_background = a; });
       action_row("Open Save Folder", [this] {
         ShellExecuteW(nullptr, L"open", user_data_root_.wstring().c_str(), nullptr, nullptr,
                       SW_SHOWNORMAL);
@@ -592,11 +815,41 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
         BackUpSaves();
         return false;
       });
+      {
+        // Restore Backup: Left/Right picks a backup, A twice restores it.
+        const int n = int(backups_.size());
+        rows.push_back({"Restore Backup", Kind::kStepper, n ? BackupLabel(backups_[backup_index_]) : "None",
+                        backup_index_ > 0, backup_index_ < n - 1, nullptr, nullptr, false,
+                        [this, n](int dir, bool accept) {
+                          if (dir) {
+                            backup_index_ = std::clamp(backup_index_ + dir, 0, std::max(0, n - 1));
+                            restore_armed_until_ms_ = 0;
+                            return false;
+                          }
+                          if (!accept || !n) return false;
+                          const std::string name = backups_[backup_index_];
+                          if (NowMs() < restore_armed_until_ms_) {
+                            restore_armed_until_ms_ = 0;
+                            RestoreBackup(name);
+                          } else {
+                            restore_armed_until_ms_ = NowMs() + 4000;
+                            status_ = "Press A again to restore " + name +
+                                      " (current saves are backed up first).";
+                            status_until_ms_ = restore_armed_until_ms_;
+                          }
+                          return false;
+                        }});
+      }
       break;
     }
   }
   action_row("Restore Defaults", [this] {
+    const RecompSettings old = settings_;
     settings_ = RecompSettings{};
+    settings_.window_width = old.window_width;  // geometry is remembered, not a preference
+    settings_.window_height = old.window_height;
+    settings_.window_x = old.window_x;
+    settings_.window_y = old.window_y;
     return true;
   });
 
@@ -614,8 +867,10 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
     const int n = int(rows.size());
     row_ = std::clamp(row_, 0, n - 1);
     const int old_row = row_, old_category = category_;
-    if (pad_.up) row_ = (row_ + n - 1) % n;
-    if (pad_.down) row_ = (row_ + 1) % n;
+    // Up/Down skip disabled rows (row 0, Category, is never disabled).
+    if (pad_.up) do row_ = (row_ + n - 1) % n; while (rows[row_].disabled);
+    if (pad_.down) do row_ = (row_ + 1) % n; while (rows[row_].disabled);
+    if (rows[row_].disabled) row_ = 0;
     const int dir = pad_.right ? 1 : (pad_.left ? -1 : 0);
     if ((dir || pad_.accept) && rows[row_].change) changed = rows[row_].change(dir, pad_.accept);
     // The game's own cursor sound for row moves and value changes.
@@ -664,7 +919,7 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
       dl->AddQuadFilled(ImVec2(cx, y - m), ImVec2(cx + m, y), ImVec2(cx, y + m),
                         ImVec2(cx - m, y), kRedMarker);
     }
-    text_at(X(kLabelX), y, on ? kWhite : kGrey, r.label, false, px);
+    text_at(X(kLabelX), y, r.disabled ? kDisabled : on ? kWhite : kGrey, r.label, false, px);
     if (r.kind == Kind::kPair) {
       ImVec2 sa = font->CalcTextSizeA(px, FLT_MAX, 0.0f, r.a);
       ImVec2 sb = font->CalcTextSizeA(px, FLT_MAX, 0.0f, r.b);
@@ -686,7 +941,7 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
       const float room = X(kArrowRightX) - X(kArrowLeftX) - t * 3.0f;
       const float w = font->CalcTextSizeA(px, FLT_MAX, 0.0f, r.value.c_str()).x;
       const float vpx = w > room ? std::max(px * room / w, px * 0.5f) : px;
-      text_at(X(kValueX), y, kWhite, r.value.c_str(), true, vpx);
+      text_at(X(kValueX), y, r.disabled ? kDisabled : kWhite, r.value.c_str(), true, vpx);
     }
   }
 

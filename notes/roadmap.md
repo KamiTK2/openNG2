@@ -14,12 +14,12 @@ Hard = reverse-engineering + game patches.
 
 ## Phase B: Easy settings
 - [x] Display mode, VSync, internal resolution 1x-3x (restart), master volume
-- [x] Monitor selection   - (reverted by user: Windowed / Borderless / Exclusive; keep Windowed / Fullscreen)   - [ ] window size presets, remember position
+- [x] Monitor selection   - (reverted by user: Windowed / Borderless / Exclusive; keep Windowed / Fullscreen)   - [x] window size presets (windowed only), remember position/size
 - (dropped: gamma / brightness: the game's own Screen Settings already has brightness/contrast)
 - (removed by user: FPS counter row; the game always runs at 60. Frame rate is still logged every 5 s)
-- [x] Mute in background   - [ ] pause in background
-- [x] Save management: open save folder, back up saves   - [ ] restore backup, import console save
-- [x] Controller: stick deadzone, invert camera X/Y, vibration strength (SDK input filter)   - [ ] camera sensitivity, remapping
+- [x] Mute in background   - [x] pause in background (XN_SYS_UI on focus loss, findings #41)
+- [x] Save management: open save folder, back up saves   - [x] restore backup   - [ ] import console save
+- [x] Controller: stick deadzone, invert camera X/Y, vibration strength (SDK input filter)   - (dropped: camera sensitivity, the game's Camera Settings has it)   - [ ] remapping
 
 ## Phase C: Medium
 - [x] Anti-aliasing: FXAA / FXAA Extreme (restart)   - [ ] CAS sharpening / FSR

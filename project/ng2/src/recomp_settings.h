@@ -10,10 +10,13 @@
 //   style (Category stepper + rows) and handles navigation.
 
 #include <atomic>
+#include <climits>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include <rex/ui/imgui_dialog.h>
 
@@ -49,6 +52,12 @@ struct RecompSettings {
   bool fullscreen = true;
   bool vsync = true;
   int monitor = 0;  // 0 = default, 1.. = display index (applied live)
+  // Windowed client size in physical pixels (0 = app default) and window position; the
+  // size is picked by Window Size or by dragging, both are remembered across launches.
+  int window_width = 0;
+  int window_height = 0;
+  int window_x = INT_MIN;  // INT_MIN = never saved
+  int window_y = INT_MIN;
   // Graphics
   int resolution_scale = 1;  // 1..3 (restart)
   int anti_aliasing = 0;     // 0 off, 1 FXAA, 2 FXAA extreme (restart)
@@ -66,6 +75,8 @@ struct RecompSettings {
   bool invert_camera_y = false;
   int stick_deadzone = 0;  // extra radial deadzone, percent 0..30
   int vibration = 100;     // percent 0..100
+  // System
+  bool pause_in_background = false;  // sends XN_SYS_UI (like the Guide button) on focus loss
   // Cheats (cvars ng2_cheat_*; apply after a restart, nothing is written to the game save)
   bool cheat_difficulties = false;
   bool cheat_costumes = false;
@@ -107,7 +118,11 @@ class RecompOptionsPane : public rex::ui::ImGuiDialog {
   void ApplyAndSave();
   void LogFrameRate();
   void UpdateBackgroundMute();
-  void BackUpSaves();
+  std::string BackUpSaves(const char* suffix = "");
+  void RefreshBackups();
+  void RestoreBackup(const std::string& name);
+  void UpdateWindowGeometry(int64_t now);
+  void ApplyWindowGeometry(bool with_position);
 
   rex::ui::Window* window_;
   std::filesystem::path settings_path_;
@@ -125,6 +140,20 @@ class RecompOptionsPane : public rex::ui::ImGuiDialog {
   double applied_aspect_ = -1.0;  // ng2_aspect_ratio last set by Aspect Ratio
   std::string status_;
   int64_t status_until_ms_ = 0;
+  // Window geometry tracking (windowed mode only).
+  bool geometry_restored_ = false;
+  bool pending_size_ = false;
+  int64_t geometry_ready_at_ms_ = 0;
+  int seen_x_ = INT_MIN, seen_y_ = INT_MIN, seen_w_ = 0, seen_h_ = 0;
+  int64_t seen_at_ms_ = 0;
+  // Save backups (newest first) for Restore Backup.
+  std::vector<std::string> backups_;
+  int backup_index_ = 0;
+  int64_t restore_armed_until_ms_ = 0;
+  // Pause in Background runs on its own thread: the game may stop presenting while
+  // paused, and OnDraw only runs when the game presents.
+  std::thread focus_thread_;
+  std::atomic<bool> focus_thread_quit_{false};
 };
 
 }  // namespace ng2
