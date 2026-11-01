@@ -23,6 +23,7 @@
 #include <rex/input/input_filter.h>
 #include <rex/logging.h>
 #include <rex/system/kernel_state.h>
+#include <rex/ui/presenter.h>
 #include <rex/ui/window.h>
 
 #pragma comment(lib, "xinput.lib")
@@ -71,6 +72,31 @@ double AspectForMode(int mode, float width, float height) {
 }
 const char* AaCvarValue(int aa) { return aa == 2 ? "fxaa_extreme" : aa == 1 ? "fxaa" : "none"; }
 int AaFromCvar(const std::string& v) { return v == "fxaa_extreme" ? 2 : v == "fxaa" ? 1 : 0; }
+const char* UpscalerCvarValue(int u) { return u == 2 ? "cas" : u == 1 ? "fsr" : "bilinear"; }
+int UpscalerFromCvar(std::string v) {
+  if (v.size() >= 2 && v.front() == '"' && v.back() == '"') v = v.substr(1, v.size() - 2);
+  return v == "cas" ? 2 : v == "fsr" ? 1 : 0;
+}
+// Sharpness 0..10 -> FSR RCAS reduction in stops (0 = sharpest, 2 = off-ish; AMD default
+// 0.2 = level 9) and CAS additional sharpness (0..1).
+double FsrSharpnessReduction(int level) { return (10 - std::clamp(level, 0, 10)) * 0.2; }
+double CasAdditionalSharpness(int level) { return std::clamp(level, 0, 10) / 10.0; }
+
+// Push the upscaler settings into the running presenter (UI thread), so they apply live.
+void ApplyUpscalerLive(rex::ui::ImGuiDrawer* drawer, const RecompSettings& s) {
+  rex::ui::Presenter* presenter = drawer ? drawer->presenter() : nullptr;
+  if (!presenter) return;
+  using Config = rex::ui::Presenter::GuestOutputPaintConfig;
+  Config config = presenter->GetGuestOutputPaintConfigFromUIThread();
+  config.SetEffect(s.upscaler == 2   ? Config::Effect::kCas
+                   : s.upscaler == 1 ? Config::Effect::kFsr
+                                     : Config::Effect::kBilinear);
+  config.SetFsrSharpnessReduction(float(FsrSharpnessReduction(s.sharpness)));
+  config.SetCasAdditionalSharpness(float(CasAdditionalSharpness(s.sharpness)));
+  presenter->SetGuestOutputPaintConfigFromUIThread(config);
+  REXLOG_INFO("RECOMP SETTINGS: upscaling {} sharpness {}", UpscalerCvarValue(s.upscaler),
+              s.sharpness);
+}
 
 int MonitorCount() {
   int n = 0;
@@ -293,6 +319,8 @@ bool RecompSettings::Load(const std::filesystem::path& path) {
     else if (k == "monitor") monitor = ParseInt(v, monitor, 0, 16);
     else if (k == "resolution_scale") resolution_scale = ParseInt(v, resolution_scale, 1, 3);
     else if (k == "swap_post_effect") anti_aliasing = AaFromCvar(v);
+    else if (k == "present_effect") upscaler = UpscalerFromCvar(v);
+    else if (k == "ng2_sharpness") sharpness = ParseInt(v, sharpness, 0, 10);
     else if (k == "ng2_aspect_mode") aspect_mode = ParseInt(v, aspect_mode, 0, 3);
     else if (k == "ng2_framerate_cap") {
       int cap = ParseInt(v, framerate_cap, 30, 120);
@@ -332,6 +360,10 @@ bool RecompSettings::Save(const std::filesystem::path& path) const {
       << "monitor = " << monitor << "\n"
       << "resolution_scale = " << resolution_scale << "\n"
       << "swap_post_effect = \"" << AaCvarValue(anti_aliasing) << "\"\n"
+      << "present_effect = \"" << UpscalerCvarValue(upscaler) << "\"\n"
+      << "ng2_sharpness = " << sharpness << "\n"
+      << "present_fsr_sharpness_reduction = " << FsrSharpnessReduction(sharpness) << "\n"
+      << "present_cas_additional_sharpness = " << CasAdditionalSharpness(sharpness) << "\n"
       << "ng2_aspect_mode = " << aspect_mode << "\n"
       << "ng2_framerate_cap = " << framerate_cap << "\n"
       << "frame_generation = " << b(framerate_cap == 120) << "\n"
@@ -372,7 +404,8 @@ void RecompSettings::ApplyStartup(const std::filesystem::path& path) {
   rex::audio::SetOutputGain(s.master_volume / 100.0f);
   PublishInputSettings(s);
   PublishCheats(s);
-  REXLOG_INFO("RECOMP SETTINGS loaded from {}", path.string());
+  REXLOG_INFO("RECOMP SETTINGS loaded from {} (present_effect {})", path.string(),
+              rex::cvar::GetFlagByName("present_effect"));
 }
 
 // ---- Options > Recomp Settings pane ---------------------------------------------------
@@ -428,11 +461,20 @@ RecompOptionsPane::RecompOptionsPane(rex::ui::ImGuiDrawer* drawer, rex::ui::Wind
       pane_visible_(std::move(pane_visible)),
       ingame_row_selected_(std::move(ingame_row_selected)) {
   settings_.Load(settings_path_);
-  // Restart-only settings: what this session actually runs with.
+  // Show what this session actually runs with (may come from the command line).
   settings_.resolution_scale =
       std::clamp(std::atoi(rex::cvar::GetFlagByName("resolution_scale").c_str()), 1, 3);
   settings_.monitor = std::clamp(std::atoi(rex::cvar::GetFlagByName("monitor").c_str()), 0, 16);
   settings_.anti_aliasing = AaFromCvar(rex::cvar::GetFlagByName("swap_post_effect"));
+  // Upscaling is live, but show what is running (it may come from the command line).
+  settings_.upscaler = UpscalerFromCvar(rex::cvar::GetFlagByName("present_effect"));
+  {
+    const std::string r = rex::cvar::GetFlagByName("present_fsr_sharpness_reduction");
+    if (!r.empty()) {
+      settings_.sharpness =
+          std::clamp(int(std::lround(10.0 - std::atof(r.c_str()) / 0.2)), 0, 10);
+    }
+  }
   startup_ = settings_;
   applied_monitor_ = settings_.monitor;
   RefreshBackups();
@@ -480,6 +522,12 @@ void RecompOptionsPane::ApplyAndSave() {
     applied_monitor_ = settings_.monitor;
   }
   rex::cvar::SetFlagByName("swap_post_effect", AaCvarValue(settings_.anti_aliasing));
+  rex::cvar::SetFlagByName("present_effect", UpscalerCvarValue(settings_.upscaler));
+  rex::cvar::SetFlagByName("present_fsr_sharpness_reduction",
+                           std::to_string(FsrSharpnessReduction(settings_.sharpness)));
+  rex::cvar::SetFlagByName("present_cas_additional_sharpness",
+                           std::to_string(CasAdditionalSharpness(settings_.sharpness)));
+  ApplyUpscalerLive(imgui_drawer(), settings_);
   rex::cvar::SetFlagByName("frame_generation", settings_.framerate_cap == 120 ? "true" : "false");
   rex::cvar::SetFlagByName("present_half_rate", settings_.framerate_cap == 30 ? "true" : "false");
   if (!muted_for_background_) rex::audio::SetOutputGain(settings_.master_volume / 100.0f);
@@ -796,6 +844,16 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
       const char* aa[] = {"Off", "FXAA", "FXAA Extreme"};
       step_row("Anti-Aliasing", aa[s.anti_aliasing], s.anti_aliasing, 0, 2, 1,
                [&s](int v) { s.anti_aliasing = v; });
+      const char* upscalers[] = {"Bilinear", "FSR 1.0", "CAS"};
+      step_row("Upscaling", upscalers[s.upscaler], s.upscaler, 0, 2, 1,
+               [&s](int v) { s.upscaler = v; });
+      std::snprintf(buf, sizeof(buf), "%d", s.sharpness);
+      step_row("Sharpness", buf, s.sharpness, 0, 10, 1, [&s](int v) { s.sharpness = v; });
+      if (s.upscaler == 0) {  // Bilinear has no sharpening pass
+        rows.back().disabled = true;
+        rows.back().can_dec = rows.back().can_inc = false;
+        rows.back().change = nullptr;
+      }
       {
         const int caps[] = {30, 60, 120};
         const char* cap_names[] = {"30 FPS", "60 FPS", "120 FPS (Interpolation)"};
@@ -999,9 +1057,9 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
   // Footer: restart note / status message (below the rows, like the game's play time).
   const float note_px = vp.h * 0.026f;
   float fy = Y(int(rows.size())) + px * 0.2f;
-  const bool needs_restart = s.resolution_scale != startup_.resolution_scale ||
-                             s.anti_aliasing != startup_.anti_aliasing ||
-                             s.cheat_difficulties != startup_.cheat_difficulties ||
+  // Internal Resolution and Anti-Aliasing apply live (SDK cvar callbacks; a resolution
+  // change rebuilds the GPU context with a brief hitch).
+  const bool needs_restart = s.cheat_difficulties != startup_.cheat_difficulties ||
                              s.cheat_costumes != startup_.cheat_costumes ||
                              s.skip_intro != startup_.skip_intro;
   if (needs_restart) {

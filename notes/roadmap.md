@@ -13,16 +13,17 @@ Hard = reverse-engineering + game patches.
 - [x] In-game menu entry (Back in gameplay): NINJA CINEMA row -> Recomp Settings, opens a full-screen panel (findings #42)
 
 ## Phase B: Easy settings
-- [x] Display mode, VSync, internal resolution 1x-3x (restart), master volume
+- [x] Display mode, VSync, internal resolution 1x-3x (live), master volume
 - [x] Monitor selection   - (reverted by user: Windowed / Borderless / Exclusive; keep Windowed / Fullscreen)   - [x] window size presets (windowed only), remember position/size
 - (dropped: gamma / brightness: the game's own Screen Settings already has brightness/contrast)
 - (removed by user: FPS counter row; the game always runs at 60. Frame rate is still logged every 5 s)
 - [x] Mute in background   - [x] pause in background (XN_SYS_UI on focus loss, findings #41)
 - [x] Save management: open save folder, back up saves   - [x] restore backup   - (dropped by user: import console save; the Cheats cover unlocks)
-- [x] Controller: stick deadzone, invert camera X/Y, vibration strength (SDK input filter)   - (dropped: camera sensitivity, the game's Camera Settings has it)   - [ ] remapping
+- [x] Controller: stick deadzone, invert camera X/Y, vibration strength (SDK input filter)   - (dropped: camera sensitivity, the game's Camera Settings has it)   - (dropped by user: remapping, the game has its own button config)
 
 ## Phase C: Medium
-- [x] Anti-aliasing: FXAA / FXAA Extreme (restart)   - [ ] CAS sharpening / FSR
+- [x] Anti-aliasing: FXAA / FXAA Extreme (live)   - [x] Upscaling: FSR 1.0 / CAS + Sharpness (live; helps only at 1x on large displays, findings #49)
+- [x] Internal resolution and anti-aliasing apply live, no restart (GPU context rebuild, findings #50)
 - [x] Framerate Cap 30 / 60 / 120 (Interpolation), default 60 (30 = display cap: NG2 is frame-locked, findings #30)
 - [ ] Keyboard & mouse: full rebinding, mouse camera + sensitivity
 - [ ] Audio: speaker setup (stereo/5.1), Music / SFX / Voice volumes if the mixer exposes them
