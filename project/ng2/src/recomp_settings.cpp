@@ -28,6 +28,8 @@
 #pragma comment(lib, "xinput.lib")
 #pragma comment(lib, "shell32.lib")
 
+bool Ng2IngameRecompRowSelected();  // ng2_hooks.cpp
+
 namespace ng2 {
 namespace {
 
@@ -190,6 +192,14 @@ bool RecompSettingsBlocksGameInput() {
 void InstallRecompInputFilters() {
   rex::input::SetStateFilter([](uint32_t, rex::input::X_INPUT_STATE* st) {
     auto& g = st->gamepad;
+    // In-game menu, cursor on Recomp Settings (the old NINJA CINEMA row): Left/Right/A would
+    // change the hidden NINJA CINEMA value; A opens our panel instead (read directly by
+    // PadInput), so the game sees none of them.
+    if (Ng2IngameRecompRowSelected()) {
+      g.buttons = uint16_t(uint16_t(g.buttons) & ~(XINPUT_GAMEPAD_DPAD_LEFT |
+                                                   XINPUT_GAMEPAD_DPAD_RIGHT | XINPUT_GAMEPAD_A));
+      g.thumb_lx = int16_t(0);
+    }
     const int dz = g_deadzone_pct.load();
     if (dz > 0) {
       ApplyDeadzone(g.thumb_lx, g.thumb_ly, dz / 100.0f);
@@ -362,17 +372,18 @@ void RecompSettings::ApplyStartup(const std::filesystem::path& path) {
 
 namespace {
 
-// Layout of the game's Options right-hand pane, as fractions of the 16:9 frame
-// (measured from the Game Settings pane).
-constexpr float kLabelX = 0.357f;
-constexpr float kFirstRowY = 0.200f;
-constexpr float kRowStep = 0.061f;
-constexpr float kPairLeftX = 0.641f;
-constexpr float kPairSlashX = 0.716f;
-constexpr float kPairRightX = 0.786f;
-constexpr float kArrowLeftX = 0.646f;
-constexpr float kValueX = 0.714f;
-constexpr float kArrowRightX = 0.785f;
+// Row layout as fractions of the 16:9 frame.
+struct Layout {
+  float label_x, first_row_y, row_step;
+  float pair_left_x, pair_slash_x, pair_right_x;
+  float arrow_left_x, value_x, arrow_right_x;
+};
+// Main menu: the Options right-hand pane (measured from the Game Settings pane).
+constexpr Layout kPaneLayout = {0.357f, 0.200f, 0.061f, 0.641f, 0.716f,
+                                0.786f, 0.646f, 0.714f, 0.785f};
+// In-game menu: full-screen panel with the in-game Options list's spacing.
+constexpr Layout kOverlayLayout = {0.089f, 0.257f, 0.057f, 0.425f, 0.500f,
+                                   0.575f, 0.430f, 0.500f, 0.570f};
 
 const ImU32 kWhite = IM_COL32(238, 234, 228, 255);
 const ImU32 kGrey = IM_COL32(176, 170, 164, 255);
@@ -401,12 +412,14 @@ struct RowDef {
 RecompOptionsPane::RecompOptionsPane(rex::ui::ImGuiDrawer* drawer, rex::ui::Window* window,
                                      std::filesystem::path settings_path,
                                      std::filesystem::path user_data_root,
-                                     std::function<bool()> pane_visible)
+                                     std::function<bool()> pane_visible,
+                                     std::function<bool()> ingame_row_selected)
     : ImGuiDialog(drawer),
       window_(window),
       settings_path_(std::move(settings_path)),
       user_data_root_(std::move(user_data_root)),
-      pane_visible_(std::move(pane_visible)) {
+      pane_visible_(std::move(pane_visible)),
+      ingame_row_selected_(std::move(ingame_row_selected)) {
   settings_.Load(settings_path_);
   // Restart-only settings: what this session actually runs with.
   settings_.resolution_scale =
@@ -659,7 +672,17 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
   LogFrameRate();
   UpdateWindowGeometry(NowMs());
 
-  if (!pane_visible_()) {
+  // In-game menu: A on Recomp Settings opens the full-screen panel.
+  if (!overlay_open_ && ingame_row_selected_ && ingame_row_selected_() && pad_.accept) {
+    overlay_open_ = true;
+    focused_ = true;
+    g_pane_focused = true;
+    row_ = 0;
+    pane_since_ms_ = 0;
+    pad_.accept = false;  // this press only opens the panel
+    Ng2QueueSystemSound(kSoundCursor);
+  }
+  if (!overlay_open_ && !pane_visible_()) {
     pane_since_ms_ = 0;
     if (focused_) {
       focused_ = false;
@@ -879,17 +902,23 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
       focused_ = false;
       g_pane_focused = false;
       g_block_until_release = true;  // don't let this B reach the game
+      if (overlay_open_) {
+        overlay_open_ = false;  // back to the in-game list
+        Ng2QueueSystemSound(kSoundCursor);
+      }
     }
   }
   if (changed) ApplyAndSave();
+  if (!overlay_open_ && !pane_visible_()) return;
 
   // ---- drawing -----------------------------------------------------------------------
+  const Layout& L = overlay_open_ ? kOverlayLayout : kPaneLayout;
   const Viewport vp = GameViewport(io);
   ImDrawList* dl = ImGui::GetForegroundDrawList();
   ImFont* font = g_serif_font ? g_serif_font : ImGui::GetFont();
   const float px = vp.h * 0.036f;
   auto X = [&](float fx) { return vp.x + vp.w * fx; };
-  auto Y = [&](int row) { return vp.y + vp.h * (kFirstRowY + kRowStep * row); };
+  auto Y = [&](int row) { return vp.y + vp.h * (L.first_row_y + L.row_step * row); };
   auto text_at = [&](float x, float y, ImU32 col, const char* t, bool centered, float size) {
     ImVec2 sz = font->CalcTextSizeA(size, FLT_MAX, 0.0f, t);
     float tx = centered ? x - sz.x * 0.5f : x;
@@ -908,6 +937,18 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
     }
   };
 
+  if (overlay_open_) {
+    // Full-screen panel over the in-game menu, titled like the game's screens.
+    dl->AddRectFilled(ImVec2(0.0f, 0.0f), io.DisplaySize, IM_COL32(10, 5, 12, 238));
+    text_at(X(0.127f), vp.y + vp.h * 0.100f, kWhite, "RECOMP SETTINGS", false, vp.h * 0.05f);
+    dl->AddLine(ImVec2(X(0.127f), vp.y + vp.h * 0.135f), ImVec2(X(0.930f), vp.y + vp.h * 0.135f),
+                IM_COL32(150, 140, 150, 160), std::max(1.0f, vp.h * 0.002f));
+    const float hx = X(0.865f), hy = vp.y + vp.h * 0.853f;
+    dl->AddCircleFilled(ImVec2(hx, hy), px * 0.45f, IM_COL32(176, 22, 18, 255));
+    text_at(hx, hy, kWhite, "B", true, px * 0.62f);
+    text_at(hx + px * 0.75f, hy, kWhite, "Back", false, px);
+  }
+
   // The row list can change after input (category switch), so rebuild-free drawing uses
   // the category that was current when the rows were built; a switch shows next frame.
   for (int i = 0; i < int(rows.size()); ++i) {
@@ -915,33 +956,33 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
     const float y = Y(i);
     const bool on = focused_ && row_ == i;
     if (on) {
-      const float m = px * 0.18f, cx = X(kLabelX) - px * 0.55f;
+      const float m = px * 0.18f, cx = X(L.label_x) - px * 0.55f;
       dl->AddQuadFilled(ImVec2(cx, y - m), ImVec2(cx + m, y), ImVec2(cx, y + m),
                         ImVec2(cx - m, y), kRedMarker);
     }
-    text_at(X(kLabelX), y, r.disabled ? kDisabled : on ? kWhite : kGrey, r.label, false, px);
+    text_at(X(L.label_x), y, r.disabled ? kDisabled : on ? kWhite : kGrey, r.label, false, px);
     if (r.kind == Kind::kPair) {
       ImVec2 sa = font->CalcTextSizeA(px, FLT_MAX, 0.0f, r.a);
       ImVec2 sb = font->CalcTextSizeA(px, FLT_MAX, 0.0f, r.b);
-      if (r.a_selected) brush(X(kPairLeftX), y, sa.x);
-      else brush(X(kPairRightX), y, sb.x);
-      text_at(X(kPairLeftX), y, r.a_selected ? kWhite : kGrey, r.a, true, px);
-      text_at(X(kPairSlashX), y, kGrey, "/", true, px);
-      text_at(X(kPairRightX), y, r.a_selected ? kGrey : kWhite, r.b, true, px);
+      if (r.a_selected) brush(X(L.pair_left_x), y, sa.x);
+      else brush(X(L.pair_right_x), y, sb.x);
+      text_at(X(L.pair_left_x), y, r.a_selected ? kWhite : kGrey, r.a, true, px);
+      text_at(X(L.pair_slash_x), y, kGrey, "/", true, px);
+      text_at(X(L.pair_right_x), y, r.a_selected ? kGrey : kWhite, r.b, true, px);
     } else if (r.kind == Kind::kStepper) {
       const float t = px * 0.30f;
-      dl->AddTriangleFilled(ImVec2(X(kArrowLeftX) - t, y), ImVec2(X(kArrowLeftX) + t * 0.8f, y - t),
-                            ImVec2(X(kArrowLeftX) + t * 0.8f, y + t),
+      dl->AddTriangleFilled(ImVec2(X(L.arrow_left_x) - t, y), ImVec2(X(L.arrow_left_x) + t * 0.8f, y - t),
+                            ImVec2(X(L.arrow_left_x) + t * 0.8f, y + t),
                             r.can_dec ? kWhite : kDisabled);
-      dl->AddTriangleFilled(ImVec2(X(kArrowRightX) + t, y),
-                            ImVec2(X(kArrowRightX) - t * 0.8f, y - t),
-                            ImVec2(X(kArrowRightX) - t * 0.8f, y + t),
+      dl->AddTriangleFilled(ImVec2(X(L.arrow_right_x) + t, y),
+                            ImVec2(X(L.arrow_right_x) - t * 0.8f, y - t),
+                            ImVec2(X(L.arrow_right_x) - t * 0.8f, y + t),
                             r.can_inc ? kWhite : kDisabled);
       // Shrink long values (e.g. "120 FPS (Interpolation)") to fit between the arrows.
-      const float room = X(kArrowRightX) - X(kArrowLeftX) - t * 3.0f;
+      const float room = X(L.arrow_right_x) - X(L.arrow_left_x) - t * 3.0f;
       const float w = font->CalcTextSizeA(px, FLT_MAX, 0.0f, r.value.c_str()).x;
       const float vpx = w > room ? std::max(px * room / w, px * 0.5f) : px;
-      text_at(X(kValueX), y, r.disabled ? kDisabled : kWhite, r.value.c_str(), true, vpx);
+      text_at(X(L.value_x), y, r.disabled ? kDisabled : kWhite, r.value.c_str(), true, vpx);
     }
   }
 
@@ -953,11 +994,11 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
                              s.cheat_difficulties != startup_.cheat_difficulties ||
                              s.cheat_costumes != startup_.cheat_costumes;
   if (needs_restart) {
-    text_at(X(kLabelX), fy, kGrey, "Some changes apply the next time the game starts.", false,
+    text_at(X(L.label_x), fy, kGrey, "Some changes apply the next time the game starts.", false,
             note_px);
     fy += note_px * 1.5f;
   }
-  if (now < status_until_ms_) text_at(X(kLabelX), fy, kWhite, status_.c_str(), false, note_px);
+  if (now < status_until_ms_) text_at(X(L.label_x), fy, kWhite, status_.c_str(), false, note_px);
 }
 
 }  // namespace ng2

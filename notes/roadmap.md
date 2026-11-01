@@ -10,7 +10,7 @@ Hard = reverse-engineering + game patches.
 - [x] Settings live inline in the Options right-hand pane, game-style rows (no popup panel):
       A enters the pane, Up/Down rows, Left/Right values, B back to the list
 - (dropped by user: copyright text page)
-- [ ] Pause menu entry (follow-up)
+- [x] In-game menu entry (Back in gameplay): NINJA CINEMA row -> Recomp Settings, opens a full-screen panel (findings #42)
 
 ## Phase B: Easy settings
 - [x] Display mode, VSync, internal resolution 1x-3x (restart), master volume

@@ -103,7 +103,8 @@ class RecompOptionsPane : public rex::ui::ImGuiDialog {
  public:
   RecompOptionsPane(rex::ui::ImGuiDrawer* drawer, rex::ui::Window* window,
                     std::filesystem::path settings_path, std::filesystem::path user_data_root,
-                    std::function<bool()> pane_visible);
+                    std::function<bool()> pane_visible,
+                    std::function<bool()> ingame_row_selected);
   ~RecompOptionsPane() override;
 
   // Draw only when the guest presents, so the host presents exactly once per game
@@ -128,6 +129,9 @@ class RecompOptionsPane : public rex::ui::ImGuiDialog {
   std::filesystem::path settings_path_;
   std::filesystem::path user_data_root_;
   std::function<bool()> pane_visible_;
+  // In-game menu: true while its cursor is on Recomp Settings; A opens the full-screen panel.
+  std::function<bool()> ingame_row_selected_;
+  bool overlay_open_ = false;
   RecompSettings settings_;
   RecompSettings startup_;  // values the running session started with (restart checks)
   PadInput pad_;

@@ -18,6 +18,7 @@
 
 void Ng2InstallDataPatches();  // ng2_hooks.cpp
 bool Ng2RecompPaneVisible();   // ng2_hooks.cpp
+bool Ng2IngameRecompRowSelected();  // ng2_hooks.cpp
 
 class Ng2App : public rex::ReXApp {
  public:
@@ -60,10 +61,11 @@ class Ng2App : public rex::ReXApp {
   void OnConfigureFonts(ImFontAtlas* atlas) override { ng2::LoadRecompSettingsFonts(atlas); }
 
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
-    // Options > Recomp Settings: settings rows drawn inline in the game's pane.
+    // Options > Recomp Settings: settings rows drawn inline in the game's pane; from the
+    // in-game menu's Recomp Settings row they open as a full-screen panel.
     recomp_pane_ = std::make_unique<ng2::RecompOptionsPane>(
         drawer, window(), RecompSettingsPath(), user_data_root(),
-        [] { return Ng2RecompPaneVisible(); });
+        [] { return Ng2RecompPaneVisible(); }, [] { return Ng2IngameRecompRowSelected(); });
   }
 
   void OnShutdown() override { recomp_pane_.reset(); }

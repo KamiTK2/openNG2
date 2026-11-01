@@ -45,6 +45,9 @@ struct DataPatch {
   uint64_t offset;               // file offset of the patched region
   std::u16string original;       // expected UTF-16 text at offset (NUL-terminated on disk)
   std::u16string replacement;    // new text; the rest of the original's slot is zeroed
+  // Bytes available for the replacement incl. its NUL (0 = the original's length + NUL). Only
+  // larger when the padding up to the next string is verified to be zero.
+  size_t slot_bytes = 0;
 };
 
 const std::vector<DataPatch>& DataPatches() {
@@ -52,6 +55,9 @@ const std::vector<DataPatch>& DataPatches() {
       // Options menu, left column: "Copyright Information" -> "Recomp Settings".
       // (The copyright screen's own title at 0x484C0 is left alone.)
       {"other.ng2", 0x46E00, u"Copyright Information", u"Recomp Settings"},
+      // In-game Options list (string pack 4, id 0x40017): "NINJA CINEMA" -> "Recomp Settings".
+      // The slot runs to the next string at 0x52010 (32 bytes; zero padding is checked).
+      {"other.ng2", 0x51FF0, u"NINJA CINEMA", u"Recomp Settings", 32},
   };
   return patches;
 }
@@ -79,7 +85,7 @@ void OnFileRead(const std::string& path, uint64_t file_offset, uint32_t guest_bu
   for (const auto& p : DataPatches()) {
     if (!EndsWithNoCase(path, p.file_suffix)) continue;
     // Slot = original text + NUL terminator.
-    const size_t slot = (p.original.size() + 1) * 2;
+    const size_t slot = p.slot_bytes ? p.slot_bytes : (p.original.size() + 1) * 2;
     const uint64_t lo = std::max<uint64_t>(file_offset, p.offset);
     const uint64_t hi = std::min<uint64_t>(file_offset + length, p.offset + slot);
     if (lo >= hi) continue;
@@ -286,8 +292,7 @@ void Ng2QueueSystemSound(uint32_t id) {
   g_sound_queued_ms.store(NowMs());
 }
 
-extern "C" REX_FUNC(sub_836B1AB8) {
-  __imp__sub_836B1AB8(ctx, base);
+void Ng2DrainSystemSounds(PPCContext& ctx, uint8_t* base) {
   uint32_t ids[kSoundQueueSize];
   int n = 0;
   {
@@ -309,6 +314,11 @@ extern "C" REX_FUNC(sub_836B1AB8) {
     REXLOG_DEBUG("NG2 recomp pane: played system sound {}", ids[i]);
   }
   ctx = saved;
+}
+
+extern "C" REX_FUNC(sub_836B1AB8) {
+  __imp__sub_836B1AB8(ctx, base);
+  Ng2DrainSystemSounds(ctx, base);
 }
 
 // ---- Ultrawide: keep 2D (HUD, menus) at 16:9 ---------------------------------------------
@@ -334,10 +344,13 @@ BucketStat g_bucket_stats[kBucketCount];
 int64_t g_bucket_log_ms = 0;
 }  // namespace
 
+void Ng2IngameMenuFrame(bool drawn);
+void Ng2DrainSystemSounds(PPCContext& ctx, uint8_t* base);
 extern "C" REX_FUNC(__imp__sub_8366B0D8);
 extern "C" REX_FUNC(sub_8366B0D8) {
   g_item_bucket.clear();
   g_hud_active = false;
+  bool ingame_menu_drawn = false;
   const uint32_t parity = GuestLoadU32(kBuckets + 1456) ^ 1;
   const uint32_t heads = kBuckets + parity * 728;
   for (int i = 0; i < kBucketCount; ++i) {
@@ -350,6 +363,9 @@ extern "C" REX_FUNC(sub_8366B0D8) {
       if (i >= 57 && i <= 59 && GuestLoadU32(GuestLoadU32(item) + 4) != 0x836E1498) {
         g_hud_active = true;
       }
+      if (i >= 70 && i <= 72 && GuestLoadU32(GuestLoadU32(item) + 4) != 0x836E1498) {
+        ingame_menu_drawn = true;
+      }
       if (REXCVAR_GET(ng2_bucket_dump)) {
         static std::unordered_map<uint64_t, int> seen_methods;
         const uint32_t method = GuestLoadU32(GuestLoadU32(item) + 4);
@@ -359,6 +375,10 @@ extern "C" REX_FUNC(sub_8366B0D8) {
       }
     }
   }
+  Ng2IngameMenuFrame(ingame_menu_drawn);
+  // Menu sounds requested by the Recomp Settings panel opened from the in-game menu (the
+  // main Options update, which plays them otherwise, doesn't run in gameplay).
+  if (ingame_menu_drawn) Ng2DrainSystemSounds(ctx, base);
   __imp__sub_8366B0D8(ctx, base);
   g_draw_bucket = -1;
   if (REXCVAR_GET(ng2_bucket_dump) && NowMs() - g_bucket_log_ms >= 1000) {
@@ -652,3 +672,54 @@ extern "C" REX_FUNC(sub_823E0CC0) {
   }
 }
 
+
+// ---- In-game Options > Recomp Settings ----------------------------------------------------------
+// The in-game menu ("In-Game Manual and Options", opened with Back in gameplay) is built by
+// sub_836722A8 (vtable 0x82280D34 slot 0) each time it opens: 12 row objects, pointers at
+// menu +8..+52, cursor (row index) at menu +20160. Row 8 (object at menu +15424) is
+// NINJA CINEMA (label id 0x40017), renamed by the data patch above (findings #42).
+// Row objects (sub_8366FCA0): selected choice at +16, label text pointer at +228, choice text
+// pointers at +1076 + i * 256, choice count at +1904. The menu draws in 2D buckets 70-72.
+namespace {
+constexpr uint32_t kIngameCursor = 20160;
+constexpr uint32_t kIngameRecompRow = 8;
+std::atomic<uint32_t> g_ingame_menu{0};
+std::atomic<int64_t> g_ingame_visible_ms{0};
+}  // namespace
+
+extern "C" REX_FUNC(__imp__sub_836722A8);
+extern "C" REX_FUNC(sub_836722A8) {
+  const uint32_t menu = ctx.r3.u32;
+  __imp__sub_836722A8(ctx, base);
+  g_ingame_menu = menu;
+  // Blank the row's On / Off (the old NINJA CINEMA value): point every choice at the label's
+  // NUL terminator. Left/Right never reach the game on this row (input filter), so the value
+  // itself is never changed.
+  auto* mem = REX_KERNEL_STATE()->memory();
+  const uint32_t row = GuestLoadU32(menu + 8 + 4 * kIngameRecompRow);
+  const uint32_t label = row ? GuestLoadU32(row + 228) : 0;
+  if (label) {
+    uint32_t end = label;
+    while (end < label + 256 &&
+           rex::memory::load_and_swap<uint16_t>(mem->TranslateVirtual(end)) != 0) {
+      end += 2;
+    }
+    const uint32_t count = GuestLoadU32(row + 1904);
+    for (uint32_t i = 0; i < count && i < 4; ++i) {
+      rex::memory::store_and_swap<uint32_t>(mem->TranslateVirtual(row + 1076 + i * 256), end);
+    }
+  }
+  REXLOG_INFO("NG2 in-game menu built: {:08X}", menu);
+}
+
+// Called once per game frame from the 2D render pass with whether buckets 70-72 hold items.
+void Ng2IngameMenuFrame(bool drawn) {
+  if (drawn && g_ingame_menu.load()) g_ingame_visible_ms = NowMs();
+}
+
+// True while the in-game menu is on screen with its cursor on Recomp Settings.
+bool Ng2IngameRecompRowSelected() {
+  const uint32_t menu = g_ingame_menu.load();
+  if (!menu || NowMs() - g_ingame_visible_ms.load() > 150) return false;
+  return GuestLoadU32(menu + kIngameCursor) == kIngameRecompRow;
+}
