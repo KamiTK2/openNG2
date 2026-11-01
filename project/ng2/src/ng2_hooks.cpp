@@ -260,9 +260,11 @@ extern "C" REX_FUNC(sub_82347700) {
   __imp__sub_82347700(ctx, base);
 }
 
+void Ng2SkipCutsceneFrame();
 void Ng2OnPresent() {
   ng2::RecompCountGameFrame();
   ApplyAspectOverride();
+  Ng2SkipCutsceneFrame();
 }
 
 // ---- Game system sounds from the RECOMP SETTINGS pane ------------------------------------
@@ -771,4 +773,49 @@ extern "C" REX_FUNC(sub_836602D0) {
     return;
   }
   __imp__sub_836602D0(ctx, base);
+}
+
+// ---- Skip Any Cutscene (Recomp Settings > System) ------------------------------------------------
+// Story cutscenes are movies started by the event-script command sub_8365E760, which waits (fiber
+// yields) until the movie scene reports done (0x84C55810) and, every frame, lets the player skip:
+// if the script's skip argument is non-zero and that many frames have passed, the skip buttons
+// are held in the game's pad state ([0x83C07FF8 + pad * 68] & 0x110, pad = byte 0x84C3DA3E) and
+// the cutscene was seen before (byte 0x84C3EC4F + id, id = u16 0x84C3F0B4), it starts a 30-frame
+// fade-out ([0x84C55818] = 30). ng2_skip_any_cutscene does the same skip without the seen and
+// skip-argument checks.
+// Real-time cutscenes run in the event-script loop sub_83655B98: while the event's skip state
+// (u16 0x84A69AEA) is 1, holding the same buttons skips it if id < 384 and the seen byte
+// [0x84C559E0] + 104 + id is set. That skip is a whole sequence inside the coroutine, so for these
+// the hook sets the seen byte when the button is pressed (the event then ends and would be
+// marked seen anyway) and the game skips it itself (findings #48).
+REXCVAR_DEFINE_BOOL(ng2_skip_any_cutscene, true, "NG2", "Let any cutscene be skipped");
+void Ng2SkipCutsceneFrame() {
+  if (!REXCVAR_GET(ng2_skip_any_cutscene)) return;
+  constexpr uint32_t kMovieState = 0x84C5580C;   // > 0 while the movie scene runs
+  constexpr uint32_t kMovieDone = 0x84C55810;    // set when the movie has ended
+  constexpr uint32_t kFadeOut = 0x84C55818;      // fade-out frames; reaching 1 stops the movie
+  constexpr uint32_t kMovieFrames = 0x84C55828;  // frames since the movie started
+  auto* mem = REX_KERNEL_STATE()->memory();
+  const uint32_t pad = *mem->TranslateVirtual<uint8_t*>(0x84C3DA3E);
+  if (pad >= 4 || !(GuestLoadU32(0x83C07FF8 + pad * 68) & 0x110)) return;  // skip buttons
+  // Real-time cutscene (event script) in its skippable state: mark it seen.
+  const uint16_t event_skip = rex::memory::load_and_swap<uint16_t>(
+      mem->TranslateVirtual(0x84A69AEA));
+  const uint16_t id = rex::memory::load_and_swap<uint16_t>(mem->TranslateVirtual(0x84C3F0B4));
+  if (event_skip == 1 && id < 384) {
+    if (const uint32_t table = GuestLoadU32(0x84C559E0)) {
+      uint8_t* seen = mem->TranslateVirtual<uint8_t*>(table + 104 + id);
+      if (!*seen) {
+        *seen = 1;
+        REXLOG_INFO("NG2 skip cutscene: event {} made skippable", id);
+      }
+    }
+  }
+  // Movie cutscene: start the game's own 30-frame fade-out.
+  if (int32_t(GuestLoadU32(kMovieState)) <= 0 || GuestLoadU32(kMovieDone) ||
+      GuestLoadU32(kFadeOut) || GuestLoadU32(kMovieFrames) < 15) {
+    return;
+  }
+  rex::memory::store_and_swap<uint32_t>(mem->TranslateVirtual(kFadeOut), 30);
+  REXLOG_INFO("NG2 skip cutscene: movie {} skipped", GuestLoadU32(0x84A69C74));
 }

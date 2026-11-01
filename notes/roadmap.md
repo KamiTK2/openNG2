@@ -33,7 +33,7 @@ Hard = reverse-engineering + game patches.
       - [x] HUD pinned to the screen edges by render bucket (`ng2_hud_anchor`, default on); boss bar still to check
 - [ ] Aspect ratio selector + FOV slider (shares work with ultrawide)
 - [ ] Quality toggles: 16x anisotropic, disable motion blur / DoF / film grain, shadow resolution
-- [ ] Skip seen cutscenes / reduce artificial load waits
+- [x] Skip any cutscene (System > Skip Any Cutscene, default On): movies and real-time scenes, seen or not (findings #48)   - [ ] reduce artificial load waits
 - [ ] Frame rate above 60 (interpolation or timing patches; speed-up risk, do last)
       - [x] Built-in frame generation 60->120: Graphics > Framerate Cap = 120 FPS (Interpolation); user: "feels great"
 

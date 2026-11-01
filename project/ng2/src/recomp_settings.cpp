@@ -106,6 +106,7 @@ void PublishCheats(const RecompSettings& s) {
   rex::cvar::SetFlagByName("ng2_cheat_difficulties", s.cheat_difficulties ? "true" : "false");
   rex::cvar::SetFlagByName("ng2_cheat_costumes", s.cheat_costumes ? "true" : "false");
   rex::cvar::SetFlagByName("ng2_skip_intro", s.skip_intro ? "true" : "false");
+  rex::cvar::SetFlagByName("ng2_skip_any_cutscene", s.skip_any_cutscene ? "true" : "false");
 }
 
 void PublishInputSettings(const RecompSettings& s) {
@@ -312,6 +313,8 @@ bool RecompSettings::Load(const std::filesystem::path& path) {
     else if (k == "ng2_cheat_difficulties") cheat_difficulties = ParseBool(v, cheat_difficulties);
     else if (k == "ng2_cheat_costumes") cheat_costumes = ParseBool(v, cheat_costumes);
     else if (k == "ng2_skip_intro") skip_intro = ParseBool(v, skip_intro);
+    else if (k == "ng2_skip_any_cutscene")
+      skip_any_cutscene = ParseBool(v, skip_any_cutscene);
   }
   return true;
 }
@@ -349,7 +352,8 @@ bool RecompSettings::Save(const std::filesystem::path& path) const {
   out
       << "ng2_cheat_difficulties = " << b(cheat_difficulties) << "\n"
       << "ng2_cheat_costumes = " << b(cheat_costumes) << "\n"
-      << "ng2_skip_intro = " << b(skip_intro) << "\n";
+      << "ng2_skip_intro = " << b(skip_intro) << "\n"
+      << "ng2_skip_any_cutscene = " << b(skip_any_cutscene) << "\n";
   return bool(out);
 }
 
@@ -831,6 +835,8 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
     }
     case 4: {  // System
       pair_row("Skip Intro", "On", "Off", s.skip_intro, [&s](bool a) { s.skip_intro = a; });
+      pair_row("Skip Any Cutscene", "On", "Off", s.skip_any_cutscene,
+               [&s](bool a) { s.skip_any_cutscene = a; });
       pair_row("Pause in Background", "On", "Off", s.pause_in_background,
                [&s](bool a) { s.pause_in_background = a; });
       action_row("Open Save Folder", [this] {
