@@ -1,3 +1,169 @@
+diff --git a/include/rex/input/input_filter.h b/include/rex/input/input_filter.h
+new file mode 100644
+index 0000000..8943925
+--- /dev/null
++++ b/include/rex/input/input_filter.h
+@@ -0,0 +1,21 @@
++#pragma once
++// NG2 ADDITION: optional host-side filters on controller state and vibration, so the app
++// can implement deadzones, camera inversion and vibration strength without touching
++// game code.
++
++#include <cstdint>
++#include <functional>
++
++#include <rex/input/input.h>
++
++namespace rex::input {
++
++// Called on the merged pad state for a user before it is returned to the game.
++using StateFilter = std::function<void(uint32_t user_index, X_INPUT_STATE* state)>;
++// Called on a vibration request before it reaches the pads (edit in place).
++using VibrationFilter = std::function<void(uint32_t user_index, X_INPUT_VIBRATION* vibration)>;
++
++void SetStateFilter(StateFilter filter);
++void SetVibrationFilter(VibrationFilter filter);
++
++}  // namespace rex::input
+diff --git a/include/rex/kernel/file_read_hook.h b/include/rex/kernel/file_read_hook.h
+new file mode 100644
+index 0000000..0b03c29
+--- /dev/null
++++ b/include/rex/kernel/file_read_hook.h
+@@ -0,0 +1,19 @@
++#pragma once
++// NG2 ADDITION: optional hook called after every successful guest NtReadFile, so the
++// host app can patch file data in guest memory as it is read (e.g. replace strings in
++// a data archive) without modifying game files on disk.
++
++#include <cstdint>
++#include <functional>
++#include <string>
++
++namespace rex::kernel {
++
++// path: guest file path; file_offset: offset of the first byte read;
++// guest_buffer: guest address the data was read into; length: bytes read.
++using FileReadHook = std::function<void(const std::string& path, uint64_t file_offset,
++                                        uint32_t guest_buffer, uint32_t length)>;
++
++void SetFileReadHook(FileReadHook hook);
++
++}  // namespace rex::kernel
+diff --git a/include/rex/ui/d3d12/d3d12_frame_interpolator.h b/include/rex/ui/d3d12/d3d12_frame_interpolator.h
+new file mode 100644
+index 0000000..5124869
+--- /dev/null
++++ b/include/rex/ui/d3d12/d3d12_frame_interpolator.h
+@@ -0,0 +1,108 @@
++/**
++ * @file        ui/d3d12/d3d12_frame_interpolator.h
++ * @brief       NG2 ADDITION: vendor-neutral frame generation for the D3D12 presenter.
++ *
++ * Generates a frame halfway between the two most recent guest frames using only the
++ * final images (no game motion vectors):
++ *  - a luma pyramid per frame (analysis base ~960 px wide, 5 levels);
++ *  - dense per-pixel optical flow in both directions, coarse to fine: at each level every
++ *    pixel picks the best of a few candidates (upsampled coarser flow, its neighbours,
++ *    zero, last frame's flow; a small full search at the coarsest level) by zero-mean
++ *    patch difference, refines it with Lucas-Kanade iterations, then the field is
++ *    smoothed edge-aware (weighted by luma similarity and match quality);
++ *  - synthesis at full resolution: both frames are warped to the midpoint and blended
++ *    by forward-backward consistency (occlusion), then softly mixed with the zero-motion
++ *    blend (static HUD) and the newer frame (nothing explains the change). Every choice
++ *    is a soft weight, so there are no seams between pixels that chose differently.
++ * Compute shaders are compiled at runtime with d3dcompiler_47.dll (ships with Windows).
++ */
++
++#pragma once
++
++#include <array>
++#include <cstdint>
++
++#include <rex/platform.h>
++#include <rex/ui/d3d12/d3d12_api.h>
++
++namespace rex::ui::d3d12 {
++
++class D3D12Provider;
++class D3D12SubmissionTracker;
++
++class D3D12FrameInterpolator {
++ public:
++  D3D12FrameInterpolator(const D3D12Provider& provider, D3D12SubmissionTracker& paint_tracker);
++  ~D3D12FrameInterpolator();
++
++  // Compiles the shaders and creates the pipelines. False if unavailable.
++  bool Initialize();
++
++  // Copies a new guest frame (in D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) into the
++  // history and builds its luma pyramid. Records commands on the paint command list.
++  bool PushFrame(ID3D12GraphicsCommandList* command_list, ID3D12Resource* guest_frame,
++                 uint64_t paint_submission);
++  // Generates the frame halfway between the previous and the current pushed frames.
++  bool Interpolate(ID3D12GraphicsCommandList* command_list, uint64_t paint_submission);
++
++  bool HasPrevious() const { return frame_count_ >= 2; }
++  // The textures are in PIXEL_SHADER_RESOURCE | NON_PIXEL_SHADER_RESOURCE, the guest
++  // output format, and the guest output size.
++  ID3D12Resource* current() const { return history_[current_].Get(); }
++  ID3D12Resource* interpolated() const { return interpolated_.Get(); }
++
++  // Forget the history (frame generation turned off, or a discontinuity).
++  void Reset() {
++    frame_count_ = 0;
++    prior_valid_ = false;
++  }
++
++  // NG2 DIAG: 0 off, 1 generated left | real right, 2 real left | generated right.
++  void set_debug_split(uint32_t split) { debug_split_ = split; }
++
++ private:
++  static constexpr uint32_t kLevels = 5;
++  enum Pass { kPassLuma, kPassDown, kPassRefine, kPassSmooth, kPassSynth, kPassCount };
++  // Per dispatch: t0..t3, u0, u1 (unused), written into a ring of the shader-visible heap.
++  static constexpr uint32_t kTableSize = 6;
++  static constexpr uint32_t kHeapDescriptors = 32768;
++  static constexpr uint32_t kConstantCount = 16;
++
++  struct Binding {
++    ID3D12Resource* srv[4] = {};
++    ID3D12Resource* uav = nullptr;
++    D3D12_RESOURCE_STATES uav_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++  };
++
++  bool EnsureTextures(uint32_t width, uint32_t height);
++  void ReleaseTextures();
++  void Run(ID3D12GraphicsCommandList* command_list, Pass pass, const Binding& binding,
++           uint32_t thread_width, uint32_t thread_height, const uint32_t* constants);
++
++  const D3D12Provider& provider_;
++  D3D12SubmissionTracker& paint_tracker_;
++  bool initialized_ = false;
++
++  Microsoft::WRL::ComPtr<ID3D12RootSignature> root_signature_;
++  std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, kPassCount> pipelines_;
++  Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap_;
++  uint32_t heap_next_ = 0;
++
++  uint32_t width_ = 0, height_ = 0;
++  std::array<uint32_t, kLevels> level_width_{}, level_height_{};
++  std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 2> history_;
++  // [frame slot][level] luma.
++  std::array<std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kLevels>, 2> pyramid_;
++  // [direction: 0 = previous->current, 1 = current->previous][level] flow (xy, cost).
++  std::array<std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kLevels>, 2> flow_;
++  std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kLevels> flow_scratch_;
++  Microsoft::WRL::ComPtr<ID3D12Resource> interpolated_;
++  uint64_t last_usage_ = 0;
++
++  uint32_t current_ = 0;
++  uint32_t frame_count_ = 0;
++  bool prior_valid_ = false;  // flow_[*][0] holds the previous pair's flow
++  uint32_t debug_split_ = 0;
++};
++
++}  // namespace rex::ui::d3d12
 diff --git a/include/rex/ui/d3d12/d3d12_presenter.h b/include/rex/ui/d3d12/d3d12_presenter.h
 index 83d09f7..8928d1d 100644
 --- a/include/rex/ui/d3d12/d3d12_presenter.h
@@ -211,6 +377,51 @@ index 20a2cd8..4edf38e 100644
        additional_amount -= len;
      } else {
        auto buffer = driver->frames_queued_.front();
+diff --git a/src/codegen/codegen_context.cpp b/src/codegen/codegen_context.cpp
+index b956713..b9a1827 100644
+--- a/src/codegen/codegen_context.cpp
++++ b/src/codegen/codegen_context.cpp
+@@ -69,6 +69,18 @@ Result<CodegenContext> CodegenContext::Create(const std::filesystem::path& confi
+   ctx.binary_ = BinaryView::fromModule(*module);
+   ctx.resolver_ = runtime.export_resolver();
+ 
++  // NG2 DIAG: dump the loaded (and, with a sibling .xexp, patched) image and stop.
++  if (const char* dump_path = std::getenv("NG2_DUMP_IMAGE")) {
++    auto* mem = runtime.kernel_state()->memory();
++    if (FILE* f = std::fopen(dump_path, "wb")) {
++      std::fwrite(mem->TranslateVirtual(ctx.binary_.baseAddress()), 1, ctx.binary_.imageSize(), f);
++      std::fclose(f);
++    }
++    std::fprintf(stderr, "NG2 DIAG: dumped image base %08X size %X\n", ctx.binary_.baseAddress(),
++                 uint32_t(ctx.binary_.imageSize()));
++    std::exit(0);
++  }
++
+   REXCODEGEN_TRACE("Loaded XEX: base=0x{:08X}, size=0x{:X}, entry=0x{:08X}",
+                    ctx.binary_.baseAddress(), ctx.binary_.imageSize(), ctx.binary_.entryPoint());
+ 
+diff --git a/src/codegen/project_recompiler.cpp b/src/codegen/project_recompiler.cpp
+index 240bcb0..7553e43 100644
+--- a/src/codegen/project_recompiler.cpp
++++ b/src/codegen/project_recompiler.cpp
+@@ -308,6 +308,17 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
+   {
+     auto execMod = runtime->kernel_state()->GetExecutableModule();
+     auto bv = BinaryView::fromModule(*execMod->xex_module());
++    // NG2 DIAG: dump the loaded (and, with a sibling .xexp, patched) image and stop.
++    if (const char* dump_path = std::getenv("NG2_DUMP_IMAGE")) {
++      auto* mem = runtime->kernel_state()->memory();
++      if (FILE* f = std::fopen(dump_path, "wb")) {
++        std::fwrite(mem->TranslateVirtual(bv.baseAddress()), 1, bv.imageSize(), f);
++        std::fclose(f);
++      }
++      std::fprintf(stderr, "NG2 DIAG: dumped image base %08X size %X\n", bv.baseAddress(),
++                   uint32_t(bv.imageSize()));
++      std::exit(0);
++    }
+ 
+     auto entry_display = make_display_name(targeted[0].config.filePath);
+     RecompilerConfig cfg = std::move(targeted[0].config);
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
 index a744375..a5179c5 100644
 --- a/src/graphics/command_processor.cpp
@@ -757,643 +968,6 @@ index 5bd3dc5..a8d5edc 100644
          d3d12/d3d12_presenter.cpp
          d3d12/d3d12_provider.cpp
          d3d12/d3d12_submission_tracker.cpp
-diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
-index 306118e..803e78d 100644
---- a/src/ui/d3d12/d3d12_presenter.cpp
-+++ b/src/ui/d3d12/d3d12_presenter.cpp
-@@ -10,7 +10,9 @@
-  */
- 
- #include <algorithm>
-+#include <chrono>
- #include <climits>
-+#include <cstring>
- #include <cmath>
- #include <memory>
- #include <utility>
-@@ -30,6 +32,20 @@
- #include <ffx_api/ffx_upscale.h>
- #endif
- 
-+REXCVAR_DECLARE(bool, frame_generation);  // NG2 ADDITION (presenter.cpp)
-+REXCVAR_DECLARE(int32_t, frame_generation_debug);  // NG2 DIAG (presenter.cpp)
-+// NG2 ADDITION: host-side vsync. The guest `vsync` cvar is the emulated vblank, which
-+// paces the game's simulation and must stay on for NG2 (off = the game runs too fast).
-+REXCVAR_DEFINE_BOOL(present_vsync, false, "UI/Presenter",
-+                    "Sync window presents to the display refresh (no tearing). Off presents "
-+                    "immediately, allowing tearing / variable refresh rate");
-+// NG2 ADDITION: display-side 30 fps cap. NG2's simulation is frame-locked to the guest
-+// vblank, so lowering the guest frame rate would slow the game down; instead every other
-+// new guest frame is simply not presented (ignored while frame generation is on).
-+REXCVAR_DEFINE_BOOL(present_half_rate, false, "UI/Presenter",
-+                    "Present only every other guest frame (e.g. 60 -> 30 fps); the game "
-+                    "itself keeps running at full rate");
-+
- REXCVAR_DEFINE_BOOL(d3d12_allow_variable_refresh_rate_and_tearing, true, "UI/D3D12",
-                     "Allow variable refresh rate and tearing");
- 
-@@ -52,6 +68,7 @@ namespace shaders {
- }  // namespace shaders
- 
- D3D12Presenter::~D3D12Presenter() {
-+  StopDelayedPaint();  // NG2 ADDITION: the frame generation timer paints through us.
-   // Await completion of the usage of everything before destroying anything.
-   // From most likely the latest to most likely the earliest to be signaled, so
-   // just one sleep will likely be needed.
-@@ -601,6 +618,123 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
-     // (and multiple threads can't paint the main target at the same time).
-   }
- 
-+  // NG2 ADDITION: half-rate presentation (see present_half_rate).
-+  if (guest_output_resource && REXCVAR_GET(present_half_rate) && !REXCVAR_GET(frame_generation) &&
-+      LastConsumedGuestOutputIsNew()) {
-+    static uint32_t half_rate_counter = 0;
-+    if (++half_rate_counter & 1) {
-+      command_list->Close();
-+      ID3D12CommandList* execute_command_list = command_list;
-+      provider_.GetDirectQueue()->ExecuteCommandLists(1, &execute_command_list);
-+      paint_context_.paint_submission_tracker.NextSubmission();
-+      return PaintResult::kNotPresented;
-+    }
-+  }
-+
-+  // NG2 ADDITION: frame generation. On a new guest frame, show a generated frame halfway
-+  // between it and the previous one now, and the real frame half a guest frame later.
-+  // (A pacing buffer that delayed both to a smoothed schedule was tried and reverted: the
-+  // user found it felt worse, findings #29.)
-+  if (guest_output_resource && REXCVAR_GET(frame_generation) && !frame_interpolator_failed_) {
-+    if (!frame_interpolator_) {
-+      frame_interpolator_ = std::make_unique<D3D12FrameInterpolator>(
-+          provider_, paint_context_.paint_submission_tracker);
-+      if (!frame_interpolator_->Initialize()) {
-+        frame_interpolator_.reset();
-+        frame_interpolator_failed_ = true;
-+      }
-+    }
-+    if (frame_interpolator_) {
-+      // NG2 DIAG: per-paint cadence. G = generated frame shown on a new guest frame,
-+      // R = real frame after a generated one, N = new guest frame shown without
-+      // generation (unsteady timing), F = push failed, r = repeat without a new frame.
-+      static char diag_seq[64];
-+      static uint32_t diag_len = 0, diag_g = 0, diag_n = 0, diag_f = 0, diag_r = 0, diag_x = 0;
-+      static auto diag_last = std::chrono::steady_clock::now();
-+      char diag_c = 'r';
-+      if (LastConsumedGuestOutputIsNew() || !frame_interpolator_->HasPrevious()) {
-+        auto now = std::chrono::steady_clock::now();
-+        double interval_us =
-+            std::chrono::duration<double, std::micro>(now - frame_gen_last_new_frame_).count();
-+        frame_gen_last_new_frame_ = now;
-+        bool steady = interval_us > 4000.0 && interval_us < 40000.0;
-+        if (steady) frame_gen_interval_us_ += (interval_us - frame_gen_interval_us_) * 0.1;
-+        frame_gen_showing_generated_ = false;
-+        {
-+          int32_t dbg = REXCVAR_GET(frame_generation_debug);
-+          frame_interpolator_->set_debug_split(dbg == 2 ? 1u : dbg == 3 ? 2u : 0u);
-+        }
-+        if (!frame_interpolator_->PushFrame(command_list, guest_output_resource.Get(),
-+                                            current_paint_submission)) {
-+          frame_interpolator_->Reset();
-+          diag_c = 'F';
-+          ++diag_f;
-+        } else if (steady && frame_interpolator_->HasPrevious() &&
-+                   frame_interpolator_->Interpolate(command_list, current_paint_submission)) {
-+          guest_output_resource = frame_interpolator_->interpolated();
-+          frame_gen_showing_generated_ = true;
-+          RequestPaintAfterDelay(
-+              std::chrono::microseconds(int64_t(frame_gen_interval_us_ * 0.5)));
-+          diag_c = 'G';
-+          ++diag_g;
-+        } else {
-+          guest_output_resource = frame_interpolator_->current();
-+          diag_c = 'N';
-+          ++diag_n;
-+          if (!steady) ++diag_x;
-+        }
-+      } else {
-+        // The real frame after a generated one (or a UI-only repaint).
-+        bool debug_generated = REXCVAR_GET(frame_generation_debug) >= 1 &&
-+                               frame_gen_showing_generated_;
-+        guest_output_resource = debug_generated ? frame_interpolator_->interpolated()
-+                                                : frame_interpolator_->current();
-+        diag_c = frame_gen_showing_generated_ ? 'R' : 'r';
-+        ++diag_r;
-+      }
-+      if (diag_len < sizeof(diag_seq) - 1) diag_seq[diag_len++] = diag_c;
-+      // NG2 DIAG: paint-to-paint intervals. gr = generated -> real (ideal half a guest
-+      // frame), rg = real -> next generated (ideal the other half).
-+      static auto diag_prev_paint = std::chrono::steady_clock::now();
-+      static char diag_prev_c = 0;
-+      static double gr_sum = 0, gr_sq = 0, gr_max = 0, rg_sum = 0, rg_sq = 0, rg_max = 0;
-+      static uint32_t gr_n = 0, rg_n = 0;
-+      {
-+        auto t = std::chrono::steady_clock::now();
-+        double dt = std::chrono::duration<double, std::milli>(t - diag_prev_paint).count();
-+        diag_prev_paint = t;
-+        if (diag_prev_c == 'G' && diag_c == 'R') {
-+          gr_sum += dt; gr_sq += dt * dt; gr_max = std::max(gr_max, dt); ++gr_n;
-+        } else if (diag_prev_c == 'R' && diag_c == 'G') {
-+          rg_sum += dt; rg_sq += dt * dt; rg_max = std::max(rg_max, dt); ++rg_n;
-+        }
-+        diag_prev_c = diag_c;
-+      }
-+      auto now = std::chrono::steady_clock::now();
-+      if (now - diag_last >= std::chrono::seconds(5)) {
-+        diag_seq[diag_len] = 0;
-+        REXLOG_INFO("NG2DIAG framegen 5s: generated {} new-ungenerated {} (unsteady {}) "
-+                    "push-fail {} repeats {} interval {:.0f}us seq {}",
-+                    diag_g, diag_n, diag_x, diag_f, diag_r, frame_gen_interval_us_, diag_seq);
-+        auto sd = [](double sum, double sq, uint32_t n) {
-+          if (!n) return 0.0;
-+          double m = sum / n;
-+          return std::sqrt(std::max(sq / n - m * m, 0.0));
-+        };
-+        REXLOG_INFO("NG2DIAG framegen pacing ms: gen->real avg {:.2f} sd {:.2f} max {:.2f} | "
-+                    "real->gen avg {:.2f} sd {:.2f} max {:.2f}",
-+                    gr_n ? gr_sum / gr_n : 0.0, sd(gr_sum, gr_sq, gr_n), gr_max,
-+                    rg_n ? rg_sum / rg_n : 0.0, sd(rg_sum, rg_sq, rg_n), rg_max);
-+        gr_sum = gr_sq = gr_max = rg_sum = rg_sq = rg_max = 0;
-+        gr_n = rg_n = 0;
-+        diag_len = diag_g = diag_n = diag_f = diag_r = diag_x = 0;
-+        diag_last = now;
-+      }
-+    }
-+  } else if (frame_interpolator_) {
-+    frame_interpolator_->Reset();
-+  }
-+
-   if (guest_output_resource) {
-     GuestOutputPaintFlow guest_output_flow = GetGuestOutputPaintFlow(
-         guest_output_properties, paint_context_.swap_chain_width, paint_context_.swap_chain_height,
-@@ -1155,9 +1289,12 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
-   // fullscreen is ever used in, the allow tearing flag must not be passed in
-   // fullscreen, but DXGI fullscreen is largely unneeded with the flip
-   // presentation model used in Direct3D 12).
-+  const bool present_vsync = REXCVAR_GET(present_vsync);  // NG2 ADDITION
-   HRESULT present_result = paint_context_.swap_chain->Present(
--      0, DXGI_PRESENT_RESTART |
--             (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
-+      present_vsync ? 1 : 0,
-+      DXGI_PRESENT_RESTART |
-+          (!present_vsync && paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING
-+                                                                      : 0));
-   // Even if presentation has failed, work might have been enqueued anyway
-   // internally before the failure according to Jesse Natalie from the DirectX
-   // Discord server.
-diff --git a/src/ui/imgui_drawer.cpp b/src/ui/imgui_drawer.cpp
-index f270f3c..069b05f 100644
---- a/src/ui/imgui_drawer.cpp
-+++ b/src/ui/imgui_drawer.cpp
-@@ -436,7 +436,15 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
-   // it now if needed.
-   DetachIfLastDialogRemoved();
- 
--  if (!dialogs_.empty()) {
-+  // NG2 ADDITION: only dialogs that want it force continuous repaint.
-+  bool wants_continuous_paint = false;
-+  for (ImGuiDialog* dialog : dialogs_) {
-+    if (dialog->WantsContinuousPaint()) {
-+      wants_continuous_paint = true;
-+      break;
-+    }
-+  }
-+  if (wants_continuous_paint) {
-     // Repaint (and handle input) continuously if still active. In detached mode
-     // there is no presenter; the app drives repaint via its own present loop.
-     if (presenter_) {
-diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
-index 7360ed9..fb4f4ce 100644
---- a/src/ui/presenter.cpp
-+++ b/src/ui/presenter.cpp
-@@ -11,6 +11,7 @@
- 
- #include <algorithm>
- #include <atomic>
-+#include <chrono>
- #include <cctype>
- #include <utility>
- 
-@@ -21,11 +22,34 @@
- #include <rex/ui/presenter.h>
- #include <rex/ui/window.h>
- 
-+// NG2 DIAG: paint source counters, read by the app's fps logger.
-+std::atomic<uint64_t> ng2diag_guest_refreshes{0};
-+std::atomic<uint64_t> ng2diag_ui_paint_requests{0};
-+std::atomic<uint64_t> ng2diag_window_paint_requests{0};
-+namespace rex::ui {
-+extern std::atomic<uint64_t> ng2diag_sdl_paints;
-+}
-+using rex::ui::ng2diag_sdl_paints;
-+
- #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
- #include <ffx_api/ffx_api.h>
- #include <ffx_api/ffx_upscale.h>
- #endif
- 
-+// NG2 ADDITION: vendor-neutral frame generation (D3D12 presenter).
-+REXCVAR_DEFINE_BOOL(frame_generation, false, "UI/Presenter",
-+                    "Show a generated frame between guest frames (doubles the displayed frame "
-+                    "rate; adds about half a guest frame of latency)");
-+
-+// NG2 DIAG: 1 = show only generated frames (the real-frame paint repeats the generated
-+// one), to inspect interpolation output in screenshots.
-+REXCVAR_DEFINE_INT32(frame_generation_debug, 0, "UI/Presenter",
-+                     "Frame generation debug view: 0 off, 1 generated frames only, 2 split generated|real, 3 split real|generated");
-+
-+// NG2 ADDITION: see RefreshGuestOutput.
-+REXCVAR_DEFINE_DOUBLE(present_aspect_ratio, 0.0, "UI/Presenter",
-+                      "Display the guest image at this aspect ratio (0 = the guest's own)");
-+
- REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
-                     "Allow presentation from non-UI thread");
- 
-@@ -287,6 +311,8 @@ Presenter::~Presenter() {
-   // it if needed.
-   assert_false(is_executing_ui_drawers_);
- 
-+  StopDelayedPaint();  // NG2 ADDITION
-+
- #if REX_PLATFORM_WIN32
-   if (dxgi_ui_tick_thread_.joinable()) {
-     {
-@@ -556,6 +582,12 @@ bool Presenter::RefreshGuestOutput(
-   writable_properties.frontbuffer_height = frontbuffer_height;
-   writable_properties.display_aspect_ratio_x = display_aspect_ratio_x;
-   writable_properties.display_aspect_ratio_y = display_aspect_ratio_y;
-+  // NG2 ADDITION: present the guest image at another aspect ratio (anamorphic
-+  // ultrawide: the game renders a wider view squeezed into its 16:9 frame).
-+  if (double aspect = REXCVAR_GET(present_aspect_ratio); aspect > 0.0) {
-+    writable_properties.display_aspect_ratio_x = uint32_t(aspect * 10000.0 + 0.5);
-+    writable_properties.display_aspect_ratio_y = 10000;
-+  }
-   writable_properties.is_8bpc = false;
-   bool is_active = writable_properties.IsActive();
-   if (is_active) {
-@@ -615,6 +647,23 @@ bool Presenter::RefreshGuestOutput(
- 
-   // Trigger the presentation on the host.
-   PaintResult paint_result = PaintResult::kNotPresented;
-+  ng2diag_guest_refreshes.fetch_add(1, std::memory_order_relaxed);  // NG2 DIAG
-+  {
-+    static uint64_t last_ms = 0;
-+    uint64_t now_ms = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
-+                                   std::chrono::steady_clock::now().time_since_epoch())
-+                                   .count());
-+    if (now_ms - last_ms >= 5000) {
-+      static uint64_t lg = 0, lu = 0, lw = 0, ls = 0;
-+      uint64_t g = ng2diag_guest_refreshes, u = ng2diag_ui_paint_requests,
-+               w = ng2diag_window_paint_requests, sp = ng2diag_sdl_paints;
-+      double secs = last_ms ? double(now_ms - last_ms) / 1000.0 : 1.0;
-+      REXLOG_INFO("NG2DIAG paint/s: guest refresh {:.1f}, ui requests {:.1f}, window requests "
-+                  "{:.1f}, sdl paints {:.1f}",
-+                  (g - lg) / secs, (u - lu) / secs, (w - lw) / secs, (sp - ls) / secs);
-+      lg = g; lu = u; lw = w; ls = sp; last_ms = now_ms;
-+    }
-+  }
-   {
-     std::lock_guard<std::mutex> paint_mode_mutex_lock(paint_mode_mutex_);
-     switch (paint_mode_) {
-@@ -767,6 +816,7 @@ void Presenter::RemoveUIDrawerFromUIThread(UIDrawer* drawer) {
- }
- 
- void Presenter::RequestUIPaintFromUIThread() {
-+  ng2diag_ui_paint_requests.fetch_add(1, std::memory_order_relaxed);  // NG2 DIAG
-   if (is_in_ui_thread_paint_) {
-     // The paint request will be done once in the end of PaintFromUIThread
-     // according to the actual state at the moment that happens. It's common for
-@@ -840,6 +890,8 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
-         (old_acquired_and_ready & ~uint32_t(3)) | (old_acquired_and_ready >> 2);
-   }
-   uint32_t mailbox_index = desired_acquired_and_ready & 3;
-+  // NG2 ADDITION: a different acquired index means a new guest image.
-+  guest_output_last_consume_new_ = (old_acquired_and_ready & 3) != mailbox_index;
-   // Give the current acquired image to the caller, or UINT32_MAX if it's
-   // inactive.
-   const GuestOutputProperties& properties = guest_output_properties_[mailbox_index];
-@@ -850,6 +902,97 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
-   return std::move(consumer_lock);
- }
- 
-+// NG2 ADDITION (frame generation).
-+void Presenter::RequestPaintAfterDelay(std::chrono::microseconds delay) {
-+  {
-+    std::scoped_lock<std::mutex> lock(delayed_paint_mutex_);
-+    if (delayed_paint_shutdown_) return;
-+    delayed_paint_deadline_ = std::chrono::steady_clock::now() + delay;
-+    delayed_paint_pending_ = true;
-+    if (!delayed_paint_thread_.joinable()) {
-+      delayed_paint_thread_ = std::thread([this] { DelayedPaintThread(); });
-+    }
-+  }
-+  delayed_paint_condition_.notify_all();
-+}
-+
-+void Presenter::StopDelayedPaint() {
-+  {
-+    std::scoped_lock<std::mutex> lock(delayed_paint_mutex_);
-+    delayed_paint_shutdown_ = true;
-+  }
-+  delayed_paint_condition_.notify_all();
-+  if (delayed_paint_thread_.joinable()) delayed_paint_thread_.join();
-+}
-+
-+void Presenter::DelayedPaintThread() {
-+  std::unique_lock<std::mutex> lock(delayed_paint_mutex_);
-+  while (!delayed_paint_shutdown_) {
-+    if (!delayed_paint_pending_) {
-+      delayed_paint_condition_.wait(lock);
-+      continue;
-+    }
-+    // Sleep until shortly before the deadline (OS wake-ups run ~0.5 ms late), then spin.
-+    auto early = delayed_paint_deadline_ - std::chrono::microseconds(700);
-+    if (std::chrono::steady_clock::now() < early &&
-+        delayed_paint_condition_.wait_until(lock, early) != std::cv_status::timeout) {
-+      continue;  // re-check: shutdown or a new deadline
-+    }
-+    if (!delayed_paint_pending_ || delayed_paint_shutdown_) continue;
-+    if (std::chrono::steady_clock::now() < delayed_paint_deadline_) {
-+      lock.unlock();
-+      std::this_thread::yield();
-+      lock.lock();
-+      continue;
-+    }
-+    delayed_paint_pending_ = false;
-+    {
-+      // NG2 DIAG: how late the delayed paint fires.
-+      static double late_sum = 0.0, late_max = 0.0;
-+      static uint32_t late_n = 0, late_over1ms = 0;
-+      static auto late_last = std::chrono::steady_clock::now();
-+      auto now = std::chrono::steady_clock::now();
-+      double late_us =
-+          std::chrono::duration<double, std::micro>(now - delayed_paint_deadline_).count();
-+      late_sum += late_us;
-+      late_max = std::max(late_max, late_us);
-+      ++late_n;
-+      if (late_us > 1000.0) ++late_over1ms;
-+      if (now - late_last >= std::chrono::seconds(5)) {
-+        REXLOG_INFO("NG2DIAG delayed paint lateness: avg {:.0f}us max {:.0f}us, >1ms {}/{}",
-+                    late_sum / late_n, late_max, late_over1ms, late_n);
-+        late_sum = late_max = 0.0;
-+        late_n = late_over1ms = 0;
-+        late_last = now;
-+      }
-+    }
-+    lock.unlock();
-+    // Same as the end of RefreshGuestOutput.
-+    PaintResult paint_result = PaintResult::kNotPresented;
-+    {
-+      std::lock_guard<std::mutex> paint_mode_mutex_lock(paint_mode_mutex_);
-+      switch (paint_mode_) {
-+        case PaintMode::kNone:
-+          break;
-+        case PaintMode::kUIThreadOnRequest:
-+          RequestPaintOrConnectionRecoveryViaWindow(true);
-+          break;
-+        case PaintMode::kGuestOutputThreadImmediately:
-+          if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable) {
-+            paint_result = PaintAndPresent(false);
-+            if (surface_paint_connection_state_ ==
-+                SurfacePaintConnectionState::kConnectedOutdated) {
-+              RequestPaintOrConnectionRecoveryViaWindow(true);
-+            }
-+          }
-+          break;
-+      }
-+    }
-+    (void)paint_result;  // GPU loss is handled by the next guest refresh
-+    lock.lock();
-+  }
-+}
-+
- Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
-     const GuestOutputProperties& properties, uint32_t host_rt_width, uint32_t host_rt_height,
-     uint32_t max_rt_width, uint32_t max_rt_height, const GuestOutputPaintConfig& config) const {
-@@ -1421,6 +1564,7 @@ bool Presenter::RequestPaintOrConnectionRecoveryViaWindow(bool force_ui_thread_p
-   if (force_ui_thread_paint_tick) {
-     ForceUIThreadPaintTick();
-   }
-+  ng2diag_window_paint_requests.fetch_add(1, std::memory_order_relaxed);  // NG2 DIAG
-   window_->RequestPaint();
-   return true;
- }
-diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
-index 2251429..887ed79 100644
---- a/src/ui/window_sdl.cpp
-+++ b/src/ui/window_sdl.cpp
-@@ -291,6 +291,36 @@ uint32_t WindowSDL::GetLatestDpiImpl() const {
-   return uint32_t(scale * float(GetMediumDpi()) + 0.5f);
- }
- 
-+// NG2 ADDITION: live version of the startup `monitor` placement above.
-+void WindowSDL::MoveToMonitor(int32_t monitor_index) {
-+  if (!sdl_window_) {
-+    return;
-+  }
-+  SDL_DisplayID display = SDL_GetPrimaryDisplay();
-+  if (monitor_index > 0) {
-+    int display_count = 0;
-+    SDL_DisplayID* displays = SDL_GetDisplays(&display_count);
-+    if (displays) {
-+      if (monitor_index <= display_count) {
-+        display = displays[monitor_index - 1];
-+      }
-+      SDL_free(displays);
-+    }
-+  }
-+  if (!display || SDL_GetDisplayForWindow(sdl_window_) == display) {
-+    return;
-+  }
-+  const bool fullscreen = IsFullscreen();
-+  if (fullscreen) {
-+    SDL_SetWindowFullscreen(sdl_window_, false);
-+  }
-+  SDL_SetWindowPosition(sdl_window_, SDL_WINDOWPOS_CENTERED_DISPLAY(display),
-+                        SDL_WINDOWPOS_CENTERED_DISPLAY(display));
-+  if (fullscreen) {
-+    SDL_SetWindowFullscreen(sdl_window_, true);
-+  }
-+}
-+
- void WindowSDL::ApplyNewFullscreen() {
-   if (!sdl_window_) {
-     return;
-@@ -434,7 +464,10 @@ void WindowSDL::RequestPaintImpl() {
-   SDL_PushEvent(&event);
- }
- 
-+extern std::atomic<uint64_t> ng2diag_sdl_paints;  // NG2 DIAG
-+std::atomic<uint64_t> ng2diag_sdl_paints{0};
- void WindowSDL::HandlePaintEvent() {
-+  ng2diag_sdl_paints.fetch_add(1, std::memory_order_relaxed);  // NG2 DIAG
-   paint_pending_.store(false, std::memory_order_release);
-   OnPaint();
- }
-diff --git a/include/rex/input/input_filter.h b/include/rex/input/input_filter.h
-new file mode 100644
-index 0000000..8943925
---- /dev/null
-+++ b/include/rex/input/input_filter.h
-@@ -0,0 +1,21 @@
-+#pragma once
-+// NG2 ADDITION: optional host-side filters on controller state and vibration, so the app
-+// can implement deadzones, camera inversion and vibration strength without touching
-+// game code.
-+
-+#include <cstdint>
-+#include <functional>
-+
-+#include <rex/input/input.h>
-+
-+namespace rex::input {
-+
-+// Called on the merged pad state for a user before it is returned to the game.
-+using StateFilter = std::function<void(uint32_t user_index, X_INPUT_STATE* state)>;
-+// Called on a vibration request before it reaches the pads (edit in place).
-+using VibrationFilter = std::function<void(uint32_t user_index, X_INPUT_VIBRATION* vibration)>;
-+
-+void SetStateFilter(StateFilter filter);
-+void SetVibrationFilter(VibrationFilter filter);
-+
-+}  // namespace rex::input
-diff --git a/include/rex/kernel/file_read_hook.h b/include/rex/kernel/file_read_hook.h
-new file mode 100644
-index 0000000..0b03c29
---- /dev/null
-+++ b/include/rex/kernel/file_read_hook.h
-@@ -0,0 +1,19 @@
-+#pragma once
-+// NG2 ADDITION: optional hook called after every successful guest NtReadFile, so the
-+// host app can patch file data in guest memory as it is read (e.g. replace strings in
-+// a data archive) without modifying game files on disk.
-+
-+#include <cstdint>
-+#include <functional>
-+#include <string>
-+
-+namespace rex::kernel {
-+
-+// path: guest file path; file_offset: offset of the first byte read;
-+// guest_buffer: guest address the data was read into; length: bytes read.
-+using FileReadHook = std::function<void(const std::string& path, uint64_t file_offset,
-+                                        uint32_t guest_buffer, uint32_t length)>;
-+
-+void SetFileReadHook(FileReadHook hook);
-+
-+}  // namespace rex::kernel
-diff --git a/include/rex/ui/d3d12/d3d12_frame_interpolator.h b/include/rex/ui/d3d12/d3d12_frame_interpolator.h
-new file mode 100644
-index 0000000..5124869
---- /dev/null
-+++ b/include/rex/ui/d3d12/d3d12_frame_interpolator.h
-@@ -0,0 +1,108 @@
-+/**
-+ * @file        ui/d3d12/d3d12_frame_interpolator.h
-+ * @brief       NG2 ADDITION: vendor-neutral frame generation for the D3D12 presenter.
-+ *
-+ * Generates a frame halfway between the two most recent guest frames using only the
-+ * final images (no game motion vectors):
-+ *  - a luma pyramid per frame (analysis base ~960 px wide, 5 levels);
-+ *  - dense per-pixel optical flow in both directions, coarse to fine: at each level every
-+ *    pixel picks the best of a few candidates (upsampled coarser flow, its neighbours,
-+ *    zero, last frame's flow; a small full search at the coarsest level) by zero-mean
-+ *    patch difference, refines it with Lucas-Kanade iterations, then the field is
-+ *    smoothed edge-aware (weighted by luma similarity and match quality);
-+ *  - synthesis at full resolution: both frames are warped to the midpoint and blended
-+ *    by forward-backward consistency (occlusion), then softly mixed with the zero-motion
-+ *    blend (static HUD) and the newer frame (nothing explains the change). Every choice
-+ *    is a soft weight, so there are no seams between pixels that chose differently.
-+ * Compute shaders are compiled at runtime with d3dcompiler_47.dll (ships with Windows).
-+ */
-+
-+#pragma once
-+
-+#include <array>
-+#include <cstdint>
-+
-+#include <rex/platform.h>
-+#include <rex/ui/d3d12/d3d12_api.h>
-+
-+namespace rex::ui::d3d12 {
-+
-+class D3D12Provider;
-+class D3D12SubmissionTracker;
-+
-+class D3D12FrameInterpolator {
-+ public:
-+  D3D12FrameInterpolator(const D3D12Provider& provider, D3D12SubmissionTracker& paint_tracker);
-+  ~D3D12FrameInterpolator();
-+
-+  // Compiles the shaders and creates the pipelines. False if unavailable.
-+  bool Initialize();
-+
-+  // Copies a new guest frame (in D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) into the
-+  // history and builds its luma pyramid. Records commands on the paint command list.
-+  bool PushFrame(ID3D12GraphicsCommandList* command_list, ID3D12Resource* guest_frame,
-+                 uint64_t paint_submission);
-+  // Generates the frame halfway between the previous and the current pushed frames.
-+  bool Interpolate(ID3D12GraphicsCommandList* command_list, uint64_t paint_submission);
-+
-+  bool HasPrevious() const { return frame_count_ >= 2; }
-+  // The textures are in PIXEL_SHADER_RESOURCE | NON_PIXEL_SHADER_RESOURCE, the guest
-+  // output format, and the guest output size.
-+  ID3D12Resource* current() const { return history_[current_].Get(); }
-+  ID3D12Resource* interpolated() const { return interpolated_.Get(); }
-+
-+  // Forget the history (frame generation turned off, or a discontinuity).
-+  void Reset() {
-+    frame_count_ = 0;
-+    prior_valid_ = false;
-+  }
-+
-+  // NG2 DIAG: 0 off, 1 generated left | real right, 2 real left | generated right.
-+  void set_debug_split(uint32_t split) { debug_split_ = split; }
-+
-+ private:
-+  static constexpr uint32_t kLevels = 5;
-+  enum Pass { kPassLuma, kPassDown, kPassRefine, kPassSmooth, kPassSynth, kPassCount };
-+  // Per dispatch: t0..t3, u0, u1 (unused), written into a ring of the shader-visible heap.
-+  static constexpr uint32_t kTableSize = 6;
-+  static constexpr uint32_t kHeapDescriptors = 32768;
-+  static constexpr uint32_t kConstantCount = 16;
-+
-+  struct Binding {
-+    ID3D12Resource* srv[4] = {};
-+    ID3D12Resource* uav = nullptr;
-+    D3D12_RESOURCE_STATES uav_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-+  };
-+
-+  bool EnsureTextures(uint32_t width, uint32_t height);
-+  void ReleaseTextures();
-+  void Run(ID3D12GraphicsCommandList* command_list, Pass pass, const Binding& binding,
-+           uint32_t thread_width, uint32_t thread_height, const uint32_t* constants);
-+
-+  const D3D12Provider& provider_;
-+  D3D12SubmissionTracker& paint_tracker_;
-+  bool initialized_ = false;
-+
-+  Microsoft::WRL::ComPtr<ID3D12RootSignature> root_signature_;
-+  std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, kPassCount> pipelines_;
-+  Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap_;
-+  uint32_t heap_next_ = 0;
-+
-+  uint32_t width_ = 0, height_ = 0;
-+  std::array<uint32_t, kLevels> level_width_{}, level_height_{};
-+  std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 2> history_;
-+  // [frame slot][level] luma.
-+  std::array<std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kLevels>, 2> pyramid_;
-+  // [direction: 0 = previous->current, 1 = current->previous][level] flow (xy, cost).
-+  std::array<std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kLevels>, 2> flow_;
-+  std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kLevels> flow_scratch_;
-+  Microsoft::WRL::ComPtr<ID3D12Resource> interpolated_;
-+  uint64_t last_usage_ = 0;
-+
-+  uint32_t current_ = 0;
-+  uint32_t frame_count_ = 0;
-+  bool prior_valid_ = false;  // flow_[*][0] holds the previous pair's flow
-+  uint32_t debug_split_ = 0;
-+};
-+
-+}  // namespace rex::ui::d3d12
 diff --git a/src/ui/d3d12/d3d12_frame_interpolator.cpp b/src/ui/d3d12/d3d12_frame_interpolator.cpp
 new file mode 100644
 index 0000000..71c1819
@@ -2008,3 +1582,474 @@ index 0000000..71c1819
 +}
 +
 +}  // namespace rex::ui::d3d12
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+index 306118e..803e78d 100644
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -10,7 +10,9 @@
+  */
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <climits>
++#include <cstring>
+ #include <cmath>
+ #include <memory>
+ #include <utility>
+@@ -30,6 +32,20 @@
+ #include <ffx_api/ffx_upscale.h>
+ #endif
+ 
++REXCVAR_DECLARE(bool, frame_generation);  // NG2 ADDITION (presenter.cpp)
++REXCVAR_DECLARE(int32_t, frame_generation_debug);  // NG2 DIAG (presenter.cpp)
++// NG2 ADDITION: host-side vsync. The guest `vsync` cvar is the emulated vblank, which
++// paces the game's simulation and must stay on for NG2 (off = the game runs too fast).
++REXCVAR_DEFINE_BOOL(present_vsync, false, "UI/Presenter",
++                    "Sync window presents to the display refresh (no tearing). Off presents "
++                    "immediately, allowing tearing / variable refresh rate");
++// NG2 ADDITION: display-side 30 fps cap. NG2's simulation is frame-locked to the guest
++// vblank, so lowering the guest frame rate would slow the game down; instead every other
++// new guest frame is simply not presented (ignored while frame generation is on).
++REXCVAR_DEFINE_BOOL(present_half_rate, false, "UI/Presenter",
++                    "Present only every other guest frame (e.g. 60 -> 30 fps); the game "
++                    "itself keeps running at full rate");
++
+ REXCVAR_DEFINE_BOOL(d3d12_allow_variable_refresh_rate_and_tearing, true, "UI/D3D12",
+                     "Allow variable refresh rate and tearing");
+ 
+@@ -52,6 +68,7 @@ namespace shaders {
+ }  // namespace shaders
+ 
+ D3D12Presenter::~D3D12Presenter() {
++  StopDelayedPaint();  // NG2 ADDITION: the frame generation timer paints through us.
+   // Await completion of the usage of everything before destroying anything.
+   // From most likely the latest to most likely the earliest to be signaled, so
+   // just one sleep will likely be needed.
+@@ -601,6 +618,123 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+     // (and multiple threads can't paint the main target at the same time).
+   }
+ 
++  // NG2 ADDITION: half-rate presentation (see present_half_rate).
++  if (guest_output_resource && REXCVAR_GET(present_half_rate) && !REXCVAR_GET(frame_generation) &&
++      LastConsumedGuestOutputIsNew()) {
++    static uint32_t half_rate_counter = 0;
++    if (++half_rate_counter & 1) {
++      command_list->Close();
++      ID3D12CommandList* execute_command_list = command_list;
++      provider_.GetDirectQueue()->ExecuteCommandLists(1, &execute_command_list);
++      paint_context_.paint_submission_tracker.NextSubmission();
++      return PaintResult::kNotPresented;
++    }
++  }
++
++  // NG2 ADDITION: frame generation. On a new guest frame, show a generated frame halfway
++  // between it and the previous one now, and the real frame half a guest frame later.
++  // (A pacing buffer that delayed both to a smoothed schedule was tried and reverted: the
++  // user found it felt worse, findings #29.)
++  if (guest_output_resource && REXCVAR_GET(frame_generation) && !frame_interpolator_failed_) {
++    if (!frame_interpolator_) {
++      frame_interpolator_ = std::make_unique<D3D12FrameInterpolator>(
++          provider_, paint_context_.paint_submission_tracker);
++      if (!frame_interpolator_->Initialize()) {
++        frame_interpolator_.reset();
++        frame_interpolator_failed_ = true;
++      }
++    }
++    if (frame_interpolator_) {
++      // NG2 DIAG: per-paint cadence. G = generated frame shown on a new guest frame,
++      // R = real frame after a generated one, N = new guest frame shown without
++      // generation (unsteady timing), F = push failed, r = repeat without a new frame.
++      static char diag_seq[64];
++      static uint32_t diag_len = 0, diag_g = 0, diag_n = 0, diag_f = 0, diag_r = 0, diag_x = 0;
++      static auto diag_last = std::chrono::steady_clock::now();
++      char diag_c = 'r';
++      if (LastConsumedGuestOutputIsNew() || !frame_interpolator_->HasPrevious()) {
++        auto now = std::chrono::steady_clock::now();
++        double interval_us =
++            std::chrono::duration<double, std::micro>(now - frame_gen_last_new_frame_).count();
++        frame_gen_last_new_frame_ = now;
++        bool steady = interval_us > 4000.0 && interval_us < 40000.0;
++        if (steady) frame_gen_interval_us_ += (interval_us - frame_gen_interval_us_) * 0.1;
++        frame_gen_showing_generated_ = false;
++        {
++          int32_t dbg = REXCVAR_GET(frame_generation_debug);
++          frame_interpolator_->set_debug_split(dbg == 2 ? 1u : dbg == 3 ? 2u : 0u);
++        }
++        if (!frame_interpolator_->PushFrame(command_list, guest_output_resource.Get(),
++                                            current_paint_submission)) {
++          frame_interpolator_->Reset();
++          diag_c = 'F';
++          ++diag_f;
++        } else if (steady && frame_interpolator_->HasPrevious() &&
++                   frame_interpolator_->Interpolate(command_list, current_paint_submission)) {
++          guest_output_resource = frame_interpolator_->interpolated();
++          frame_gen_showing_generated_ = true;
++          RequestPaintAfterDelay(
++              std::chrono::microseconds(int64_t(frame_gen_interval_us_ * 0.5)));
++          diag_c = 'G';
++          ++diag_g;
++        } else {
++          guest_output_resource = frame_interpolator_->current();
++          diag_c = 'N';
++          ++diag_n;
++          if (!steady) ++diag_x;
++        }
++      } else {
++        // The real frame after a generated one (or a UI-only repaint).
++        bool debug_generated = REXCVAR_GET(frame_generation_debug) >= 1 &&
++                               frame_gen_showing_generated_;
++        guest_output_resource = debug_generated ? frame_interpolator_->interpolated()
++                                                : frame_interpolator_->current();
++        diag_c = frame_gen_showing_generated_ ? 'R' : 'r';
++        ++diag_r;
++      }
++      if (diag_len < sizeof(diag_seq) - 1) diag_seq[diag_len++] = diag_c;
++      // NG2 DIAG: paint-to-paint intervals. gr = generated -> real (ideal half a guest
++      // frame), rg = real -> next generated (ideal the other half).
++      static auto diag_prev_paint = std::chrono::steady_clock::now();
++      static char diag_prev_c = 0;
++      static double gr_sum = 0, gr_sq = 0, gr_max = 0, rg_sum = 0, rg_sq = 0, rg_max = 0;
++      static uint32_t gr_n = 0, rg_n = 0;
++      {
++        auto t = std::chrono::steady_clock::now();
++        double dt = std::chrono::duration<double, std::milli>(t - diag_prev_paint).count();
++        diag_prev_paint = t;
++        if (diag_prev_c == 'G' && diag_c == 'R') {
++          gr_sum += dt; gr_sq += dt * dt; gr_max = std::max(gr_max, dt); ++gr_n;
++        } else if (diag_prev_c == 'R' && diag_c == 'G') {
++          rg_sum += dt; rg_sq += dt * dt; rg_max = std::max(rg_max, dt); ++rg_n;
++        }
++        diag_prev_c = diag_c;
++      }
++      auto now = std::chrono::steady_clock::now();
++      if (now - diag_last >= std::chrono::seconds(5)) {
++        diag_seq[diag_len] = 0;
++        REXLOG_INFO("NG2DIAG framegen 5s: generated {} new-ungenerated {} (unsteady {}) "
++                    "push-fail {} repeats {} interval {:.0f}us seq {}",
++                    diag_g, diag_n, diag_x, diag_f, diag_r, frame_gen_interval_us_, diag_seq);
++        auto sd = [](double sum, double sq, uint32_t n) {
++          if (!n) return 0.0;
++          double m = sum / n;
++          return std::sqrt(std::max(sq / n - m * m, 0.0));
++        };
++        REXLOG_INFO("NG2DIAG framegen pacing ms: gen->real avg {:.2f} sd {:.2f} max {:.2f} | "
++                    "real->gen avg {:.2f} sd {:.2f} max {:.2f}",
++                    gr_n ? gr_sum / gr_n : 0.0, sd(gr_sum, gr_sq, gr_n), gr_max,
++                    rg_n ? rg_sum / rg_n : 0.0, sd(rg_sum, rg_sq, rg_n), rg_max);
++        gr_sum = gr_sq = gr_max = rg_sum = rg_sq = rg_max = 0;
++        gr_n = rg_n = 0;
++        diag_len = diag_g = diag_n = diag_f = diag_r = diag_x = 0;
++        diag_last = now;
++      }
++    }
++  } else if (frame_interpolator_) {
++    frame_interpolator_->Reset();
++  }
++
+   if (guest_output_resource) {
+     GuestOutputPaintFlow guest_output_flow = GetGuestOutputPaintFlow(
+         guest_output_properties, paint_context_.swap_chain_width, paint_context_.swap_chain_height,
+@@ -1155,9 +1289,12 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+   // fullscreen is ever used in, the allow tearing flag must not be passed in
+   // fullscreen, but DXGI fullscreen is largely unneeded with the flip
+   // presentation model used in Direct3D 12).
++  const bool present_vsync = REXCVAR_GET(present_vsync);  // NG2 ADDITION
+   HRESULT present_result = paint_context_.swap_chain->Present(
+-      0, DXGI_PRESENT_RESTART |
+-             (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
++      present_vsync ? 1 : 0,
++      DXGI_PRESENT_RESTART |
++          (!present_vsync && paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING
++                                                                      : 0));
+   // Even if presentation has failed, work might have been enqueued anyway
+   // internally before the failure according to Jesse Natalie from the DirectX
+   // Discord server.
+diff --git a/src/ui/imgui_drawer.cpp b/src/ui/imgui_drawer.cpp
+index f270f3c..069b05f 100644
+--- a/src/ui/imgui_drawer.cpp
++++ b/src/ui/imgui_drawer.cpp
+@@ -436,7 +436,15 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
+   // it now if needed.
+   DetachIfLastDialogRemoved();
+ 
+-  if (!dialogs_.empty()) {
++  // NG2 ADDITION: only dialogs that want it force continuous repaint.
++  bool wants_continuous_paint = false;
++  for (ImGuiDialog* dialog : dialogs_) {
++    if (dialog->WantsContinuousPaint()) {
++      wants_continuous_paint = true;
++      break;
++    }
++  }
++  if (wants_continuous_paint) {
+     // Repaint (and handle input) continuously if still active. In detached mode
+     // there is no presenter; the app drives repaint via its own present loop.
+     if (presenter_) {
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 7360ed9..fb4f4ce 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <chrono>
+ #include <cctype>
+ #include <utility>
+ 
+@@ -21,11 +22,34 @@
+ #include <rex/ui/presenter.h>
+ #include <rex/ui/window.h>
+ 
++// NG2 DIAG: paint source counters, read by the app's fps logger.
++std::atomic<uint64_t> ng2diag_guest_refreshes{0};
++std::atomic<uint64_t> ng2diag_ui_paint_requests{0};
++std::atomic<uint64_t> ng2diag_window_paint_requests{0};
++namespace rex::ui {
++extern std::atomic<uint64_t> ng2diag_sdl_paints;
++}
++using rex::ui::ng2diag_sdl_paints;
++
+ #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+ #include <ffx_api/ffx_api.h>
+ #include <ffx_api/ffx_upscale.h>
+ #endif
+ 
++// NG2 ADDITION: vendor-neutral frame generation (D3D12 presenter).
++REXCVAR_DEFINE_BOOL(frame_generation, false, "UI/Presenter",
++                    "Show a generated frame between guest frames (doubles the displayed frame "
++                    "rate; adds about half a guest frame of latency)");
++
++// NG2 DIAG: 1 = show only generated frames (the real-frame paint repeats the generated
++// one), to inspect interpolation output in screenshots.
++REXCVAR_DEFINE_INT32(frame_generation_debug, 0, "UI/Presenter",
++                     "Frame generation debug view: 0 off, 1 generated frames only, 2 split generated|real, 3 split real|generated");
++
++// NG2 ADDITION: see RefreshGuestOutput.
++REXCVAR_DEFINE_DOUBLE(present_aspect_ratio, 0.0, "UI/Presenter",
++                      "Display the guest image at this aspect ratio (0 = the guest's own)");
++
+ REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
+                     "Allow presentation from non-UI thread");
+ 
+@@ -287,6 +311,8 @@ Presenter::~Presenter() {
+   // it if needed.
+   assert_false(is_executing_ui_drawers_);
+ 
++  StopDelayedPaint();  // NG2 ADDITION
++
+ #if REX_PLATFORM_WIN32
+   if (dxgi_ui_tick_thread_.joinable()) {
+     {
+@@ -556,6 +582,12 @@ bool Presenter::RefreshGuestOutput(
+   writable_properties.frontbuffer_height = frontbuffer_height;
+   writable_properties.display_aspect_ratio_x = display_aspect_ratio_x;
+   writable_properties.display_aspect_ratio_y = display_aspect_ratio_y;
++  // NG2 ADDITION: present the guest image at another aspect ratio (anamorphic
++  // ultrawide: the game renders a wider view squeezed into its 16:9 frame).
++  if (double aspect = REXCVAR_GET(present_aspect_ratio); aspect > 0.0) {
++    writable_properties.display_aspect_ratio_x = uint32_t(aspect * 10000.0 + 0.5);
++    writable_properties.display_aspect_ratio_y = 10000;
++  }
+   writable_properties.is_8bpc = false;
+   bool is_active = writable_properties.IsActive();
+   if (is_active) {
+@@ -615,6 +647,23 @@ bool Presenter::RefreshGuestOutput(
+ 
+   // Trigger the presentation on the host.
+   PaintResult paint_result = PaintResult::kNotPresented;
++  ng2diag_guest_refreshes.fetch_add(1, std::memory_order_relaxed);  // NG2 DIAG
++  {
++    static uint64_t last_ms = 0;
++    uint64_t now_ms = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
++                                   std::chrono::steady_clock::now().time_since_epoch())
++                                   .count());
++    if (now_ms - last_ms >= 5000) {
++      static uint64_t lg = 0, lu = 0, lw = 0, ls = 0;
++      uint64_t g = ng2diag_guest_refreshes, u = ng2diag_ui_paint_requests,
++               w = ng2diag_window_paint_requests, sp = ng2diag_sdl_paints;
++      double secs = last_ms ? double(now_ms - last_ms) / 1000.0 : 1.0;
++      REXLOG_INFO("NG2DIAG paint/s: guest refresh {:.1f}, ui requests {:.1f}, window requests "
++                  "{:.1f}, sdl paints {:.1f}",
++                  (g - lg) / secs, (u - lu) / secs, (w - lw) / secs, (sp - ls) / secs);
++      lg = g; lu = u; lw = w; ls = sp; last_ms = now_ms;
++    }
++  }
+   {
+     std::lock_guard<std::mutex> paint_mode_mutex_lock(paint_mode_mutex_);
+     switch (paint_mode_) {
+@@ -767,6 +816,7 @@ void Presenter::RemoveUIDrawerFromUIThread(UIDrawer* drawer) {
+ }
+ 
+ void Presenter::RequestUIPaintFromUIThread() {
++  ng2diag_ui_paint_requests.fetch_add(1, std::memory_order_relaxed);  // NG2 DIAG
+   if (is_in_ui_thread_paint_) {
+     // The paint request will be done once in the end of PaintFromUIThread
+     // according to the actual state at the moment that happens. It's common for
+@@ -840,6 +890,8 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
+         (old_acquired_and_ready & ~uint32_t(3)) | (old_acquired_and_ready >> 2);
+   }
+   uint32_t mailbox_index = desired_acquired_and_ready & 3;
++  // NG2 ADDITION: a different acquired index means a new guest image.
++  guest_output_last_consume_new_ = (old_acquired_and_ready & 3) != mailbox_index;
+   // Give the current acquired image to the caller, or UINT32_MAX if it's
+   // inactive.
+   const GuestOutputProperties& properties = guest_output_properties_[mailbox_index];
+@@ -850,6 +902,97 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
+   return std::move(consumer_lock);
+ }
+ 
++// NG2 ADDITION (frame generation).
++void Presenter::RequestPaintAfterDelay(std::chrono::microseconds delay) {
++  {
++    std::scoped_lock<std::mutex> lock(delayed_paint_mutex_);
++    if (delayed_paint_shutdown_) return;
++    delayed_paint_deadline_ = std::chrono::steady_clock::now() + delay;
++    delayed_paint_pending_ = true;
++    if (!delayed_paint_thread_.joinable()) {
++      delayed_paint_thread_ = std::thread([this] { DelayedPaintThread(); });
++    }
++  }
++  delayed_paint_condition_.notify_all();
++}
++
++void Presenter::StopDelayedPaint() {
++  {
++    std::scoped_lock<std::mutex> lock(delayed_paint_mutex_);
++    delayed_paint_shutdown_ = true;
++  }
++  delayed_paint_condition_.notify_all();
++  if (delayed_paint_thread_.joinable()) delayed_paint_thread_.join();
++}
++
++void Presenter::DelayedPaintThread() {
++  std::unique_lock<std::mutex> lock(delayed_paint_mutex_);
++  while (!delayed_paint_shutdown_) {
++    if (!delayed_paint_pending_) {
++      delayed_paint_condition_.wait(lock);
++      continue;
++    }
++    // Sleep until shortly before the deadline (OS wake-ups run ~0.5 ms late), then spin.
++    auto early = delayed_paint_deadline_ - std::chrono::microseconds(700);
++    if (std::chrono::steady_clock::now() < early &&
++        delayed_paint_condition_.wait_until(lock, early) != std::cv_status::timeout) {
++      continue;  // re-check: shutdown or a new deadline
++    }
++    if (!delayed_paint_pending_ || delayed_paint_shutdown_) continue;
++    if (std::chrono::steady_clock::now() < delayed_paint_deadline_) {
++      lock.unlock();
++      std::this_thread::yield();
++      lock.lock();
++      continue;
++    }
++    delayed_paint_pending_ = false;
++    {
++      // NG2 DIAG: how late the delayed paint fires.
++      static double late_sum = 0.0, late_max = 0.0;
++      static uint32_t late_n = 0, late_over1ms = 0;
++      static auto late_last = std::chrono::steady_clock::now();
++      auto now = std::chrono::steady_clock::now();
++      double late_us =
++          std::chrono::duration<double, std::micro>(now - delayed_paint_deadline_).count();
++      late_sum += late_us;
++      late_max = std::max(late_max, late_us);
++      ++late_n;
++      if (late_us > 1000.0) ++late_over1ms;
++      if (now - late_last >= std::chrono::seconds(5)) {
++        REXLOG_INFO("NG2DIAG delayed paint lateness: avg {:.0f}us max {:.0f}us, >1ms {}/{}",
++                    late_sum / late_n, late_max, late_over1ms, late_n);
++        late_sum = late_max = 0.0;
++        late_n = late_over1ms = 0;
++        late_last = now;
++      }
++    }
++    lock.unlock();
++    // Same as the end of RefreshGuestOutput.
++    PaintResult paint_result = PaintResult::kNotPresented;
++    {
++      std::lock_guard<std::mutex> paint_mode_mutex_lock(paint_mode_mutex_);
++      switch (paint_mode_) {
++        case PaintMode::kNone:
++          break;
++        case PaintMode::kUIThreadOnRequest:
++          RequestPaintOrConnectionRecoveryViaWindow(true);
++          break;
++        case PaintMode::kGuestOutputThreadImmediately:
++          if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable) {
++            paint_result = PaintAndPresent(false);
++            if (surface_paint_connection_state_ ==
++                SurfacePaintConnectionState::kConnectedOutdated) {
++              RequestPaintOrConnectionRecoveryViaWindow(true);
++            }
++          }
++          break;
++      }
++    }
++    (void)paint_result;  // GPU loss is handled by the next guest refresh
++    lock.lock();
++  }
++}
++
+ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
+     const GuestOutputProperties& properties, uint32_t host_rt_width, uint32_t host_rt_height,
+     uint32_t max_rt_width, uint32_t max_rt_height, const GuestOutputPaintConfig& config) const {
+@@ -1421,6 +1564,7 @@ bool Presenter::RequestPaintOrConnectionRecoveryViaWindow(bool force_ui_thread_p
+   if (force_ui_thread_paint_tick) {
+     ForceUIThreadPaintTick();
+   }
++  ng2diag_window_paint_requests.fetch_add(1, std::memory_order_relaxed);  // NG2 DIAG
+   window_->RequestPaint();
+   return true;
+ }
+diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
+index 2251429..887ed79 100644
+--- a/src/ui/window_sdl.cpp
++++ b/src/ui/window_sdl.cpp
+@@ -291,6 +291,36 @@ uint32_t WindowSDL::GetLatestDpiImpl() const {
+   return uint32_t(scale * float(GetMediumDpi()) + 0.5f);
+ }
+ 
++// NG2 ADDITION: live version of the startup `monitor` placement above.
++void WindowSDL::MoveToMonitor(int32_t monitor_index) {
++  if (!sdl_window_) {
++    return;
++  }
++  SDL_DisplayID display = SDL_GetPrimaryDisplay();
++  if (monitor_index > 0) {
++    int display_count = 0;
++    SDL_DisplayID* displays = SDL_GetDisplays(&display_count);
++    if (displays) {
++      if (monitor_index <= display_count) {
++        display = displays[monitor_index - 1];
++      }
++      SDL_free(displays);
++    }
++  }
++  if (!display || SDL_GetDisplayForWindow(sdl_window_) == display) {
++    return;
++  }
++  const bool fullscreen = IsFullscreen();
++  if (fullscreen) {
++    SDL_SetWindowFullscreen(sdl_window_, false);
++  }
++  SDL_SetWindowPosition(sdl_window_, SDL_WINDOWPOS_CENTERED_DISPLAY(display),
++                        SDL_WINDOWPOS_CENTERED_DISPLAY(display));
++  if (fullscreen) {
++    SDL_SetWindowFullscreen(sdl_window_, true);
++  }
++}
++
+ void WindowSDL::ApplyNewFullscreen() {
+   if (!sdl_window_) {
+     return;
+@@ -434,7 +464,10 @@ void WindowSDL::RequestPaintImpl() {
+   SDL_PushEvent(&event);
+ }
+ 
++extern std::atomic<uint64_t> ng2diag_sdl_paints;  // NG2 DIAG
++std::atomic<uint64_t> ng2diag_sdl_paints{0};
+ void WindowSDL::HandlePaintEvent() {
++  ng2diag_sdl_paints.fetch_add(1, std::memory_order_relaxed);  // NG2 DIAG
+   paint_pending_.store(false, std::memory_order_release);
+   OnPaint();
+ }
