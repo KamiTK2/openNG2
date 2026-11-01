@@ -164,11 +164,11 @@ uint32_t GuestU32(uint32_t addr) {
   return _byteswap_ulong(v);
 }
 
-// NG2: audio engine barrier state (sub_8374EF40 / sub_8374F078). Engine pointer is
-// the global at 0x84C3BA94; per-CPU participation flags at +308..+328, participant
+// NG2: audio engine barrier state (sub_837746E0 / sub_83774818). Engine pointer is
+// the global at 0x84C55A9C; per-CPU participation flags at +308..+328, participant
 // count at +304, callback thread at +300, barrier slots (8 bytes) at +356 / +364.
 void LogAudioEngineState() {
-  uint32_t engine = GuestU32(0x84C3BA94);
+  uint32_t engine = GuestU32(0x84C55A9C);
   if (!engine) {
     REXLOG_WARN("[stacks] audio engine: null");
     return;
@@ -249,7 +249,7 @@ LONG WINAPI Filter(EXCEPTION_POINTERS* ep) {
 void DumpGuestMemory(const std::wstring& tag) {
   struct Range { uint32_t start, size; };
   const Range ranges[] = {
-      {0x82000000u, 0x03A80000u},  // XEX image incl. .data/.bss
+      {0x82000000u, 0x03A90000u},  // XEX image incl. .data/.bss
       {0x40000000u, 0x10000000u},  // guest virtual heap (first 256 MB)
       {0xA0000000u, 0x20000000u},  // physical memory (512 MB) via 64K-page view
   };

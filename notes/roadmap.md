@@ -39,7 +39,7 @@ Hard = reverse-engineering + game patches.
 
 ## Distribution: easy launcher (end goal, user 2026-11-01)
 Players supply their own game; we never ship game data or game-derived code. A launcher:
-- [ ] Optional title update (player-supplied .xexp): needed for Mission Mode (findings #43); means recompiling the patched XEX and re-finding every hook address
+- [ ] Require Title Update #2 (player-supplied TU_...G4 package, media 69F555CB): extract `default.xexp` next to default.xex; openNG2 is built from 0.0.2.4 only (findings #45/#46). Mission Mode works with it (user confirmed 2026-11-01)
 - [ ] Pick the player's DLC packages too (copied to game\dlc; installed by the game on first launch, findings #43)
 - [ ] Pick the dump (GOD package, extracted folder or default.xex); verify the SHA-256 /
       title ID / media ID (notes/findings.md target table) and extract (tools/god_extract.py).
