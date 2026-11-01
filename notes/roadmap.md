@@ -37,6 +37,18 @@ Hard = reverse-engineering + game patches.
 - [ ] Frame rate above 60 (interpolation or timing patches; speed-up risk, do last)
       - [x] Built-in frame generation 60->120: Graphics > Framerate Cap = 120 FPS (Interpolation); user: "feels great"
 
+## Distribution: easy launcher (end goal, user 2026-11-01)
+Players supply their own game; we never ship game data or game-derived code. A launcher:
+- [ ] Pick the dump (GOD package, extracted folder or default.xex); verify the SHA-256 /
+      title ID / media ID (notes/findings.md target table) and extract (tools/god_extract.py).
+- [ ] Get the toolchain without manual setup: fetch ReXGlue v0.10.0 + apply
+      patches/rexglue-sdk-v0.10.0.patch (or ship our prebuilt SDK runtime DLLs, which contain no
+      game code), plus a portable clang/LLVM, CMake and Ninja, so no Visual Studio install is needed.
+- [ ] Run codegen against the player's xex, build ng2.exe, copy runtime DLLs + ng2.toml.
+- [ ] Progress UI, logs, retry; later: updates and launching the game from the launcher.
+- Open questions: build time / disk (the recompiled C++ is ~560 MB, a full build takes minutes);
+  whether the Windows SDK headers/libs can be fetched portably.
+
 ## Cheats (user request 2026-11-01)
 - [x] Recomp Settings > Cheats: Unlock Difficulties, Unlock Costumes (apply after restart; nothing written to the save)
 
