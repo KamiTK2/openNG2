@@ -33,6 +33,8 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM,
 namespace fs = std::filesystem;
 using namespace launcher;
 
+constexpr char kVersion[] = "1.0";  // keep in sync with tools/make_release.py VERSION
+
 namespace {
 
 // ---- D3D11 -------------------------------------------------------------------------------------
@@ -535,7 +537,7 @@ void DrawUi() {
   ImGui::PopFont();
   ImGui::SameLine();
   ImGui::SetCursorPosY(ImGui::GetCursorPosY() + ImGui::GetFontSize() * 0.55f);
-  ImGui::TextColored(kDim, "Ninja Gaiden II for Windows - builder");
+  ImGui::TextColored(kDim, "Ninja Gaiden II for Windows - builder %s", kVersion);
   const bool build_view = g_pipeline.running() || g_pipeline.finished();
   if (build_view) {
     DrawBuildPage();
@@ -621,7 +623,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
                  LoadCursorW(nullptr, IDC_ARROW), nullptr, nullptr, L"openNG2Launcher", nullptr};
   RegisterClassExW(&wc);
   const float dpi = ImGui_ImplWin32_GetDpiScaleForMonitor(MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY));
-  g_hwnd = CreateWindowExW(WS_EX_ACCEPTFILES, wc.lpszClassName, L"openNG2 - Ninja Gaiden II builder",
+  g_hwnd = CreateWindowExW(WS_EX_ACCEPTFILES, wc.lpszClassName, L"openNG2 1.0 - Ninja Gaiden II builder",
                            WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, int(940 * dpi), int(900 * dpi), nullptr,
                            nullptr, inst, nullptr);
   const BOOL dark = TRUE;

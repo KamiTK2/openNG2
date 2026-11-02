@@ -16,6 +16,9 @@ the player's own game files, and installs ng2.exe (findings #67).
 import os
 import shutil
 import sys
+import zipfile
+
+VERSION = "1.0"
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.path.join(ROOT, "dist", "openNG2")
@@ -25,6 +28,85 @@ LAUNCHER = os.path.join(ROOT, "launcher", "out", "openNG2.exe")
 
 # Never ship anything game-derived.
 EXCLUDE_SRC = {"ng2_trace_all.cpp", "ng2_trace_all.h"}  # generated from the game's function list
+
+
+# Third-party notices for everything shipped in the release (SDK DLLs + codegen tool, launcher).
+# (library, licence file under the SDK's thirdparty/ folder, or None + an inline notice)
+THIRD_PARTY = [
+    ("SDL3", "sdl3/LICENSE.txt", None),
+    ("{fmt}", "fmt/LICENSE", None),
+    ("spdlog", "spdlog/LICENSE", None),
+    ("FFmpeg (libavcodec, libavutil; LGPL 2.1 build with a reduced codec list; source: "
+     "https://ffmpeg.org - rebuildable from the ReXGlue SDK source)", "FFmpeg/COPYING.LGPLv2.1", None),
+    ("libmspack (LGPL 2.1; source: https://github.com/kyz/libmspack)", "libmspack/libmspack/COPYING.LIB", None),
+    ("xxHash", "xxHash/LICENSE", None),
+    ("Dear ImGui", "imgui/LICENSE.txt", None),
+    ("toml++", "tomlplusplus/LICENSE", None),
+    ("utfcpp", "utfcpp/LICENSE", None),
+    ("Tracy", "tracy/LICENSE", None),
+    ("o1heap", "o1heap/LICENSE", None),
+    ("SIMDe", "simde/COPYING", None),
+    ("aes_128", "aes_128/LICENSE", None),
+    ("DES (crypto)", "crypto/des/LICENSE", None),
+    ("CLI11 (codegen tool)", "cli11/LICENSE", None),
+    ("Inja (codegen tool)", "inja/LICENSE", None),
+    ("glslang", "glslang/LICENSE.txt", None),
+    ("SPIRV-Tools", "spirv-tools/LICENSE", None),
+    ("SPIRV-Headers", "spirv-headers/LICENSE", None),
+    ("Vulkan-Headers", "vulkan-headers/LICENSE.md", None),
+    ("Vulkan-Loader", "vulkan-loader/LICENSE.txt", None),
+    ("Vulkan Memory Allocator", "vulkan-memory-allocator/LICENSE.txt", None),
+    ("stb", None, "stb (Sean Barrett): public domain / MIT, see https://github.com/nothings/stb"),
+    ("tiny-AES-c", None, "tiny-AES-c (kokke): The Unlicense, see https://github.com/kokke/tiny-AES-c"),
+    ("RenderDoc in-application API header", None,
+     "renderdoc_app.h, Copyright (c) Baldur Karlsson: The MIT License, see https://github.com/baldurk/renderdoc"),
+    ("disruptorplus", None, "disruptorplus (Lewis Baker): MIT License, see https://github.com/lewissbaker/disruptorplus"),
+    ("DirectX Shader Compiler", None,
+     "DirectX Shader Compiler (Microsoft): University of Illinois/NCSA Open Source License, "
+     "see https://github.com/microsoft/DirectXShaderCompiler"),
+    ("AMD FidelityFX FSR 1.0 and CAS (compiled shaders)", None,
+     "Copyright (c) 2021 Advanced Micro Devices, Inc. All rights reserved.\n\n"
+     "Permission is hereby granted, free of charge, to any person obtaining a copy of this software and "
+     "associated documentation files (the \"Software\"), to deal in the Software without restriction, including "
+     "without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell "
+     "copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the "
+     "following conditions:\n\nThe above copyright notice and this permission notice shall be included in all "
+     "copies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF "
+     "ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A "
+     "PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY "
+     "CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF "
+     "OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE."),
+]
+
+
+def write_notices(path):
+    sdk_src = os.path.join(ROOT, "tools", "rexglue-sdk")
+    parts = [
+        "openNG2 " + VERSION + " - third-party notices",
+        "=" * 60,
+        "",
+        "openNG2 includes software from the projects below. Ninja Gaiden II itself is not included;",
+        "it belongs to Koei Tecmo and is built from the player's own copy.",
+        "",
+    ]
+    def section(title, text):
+        parts.extend(["", "-" * 60, title, "-" * 60, "", text.strip(), ""])
+    section("ReXGlue SDK (includes code derived from the Xenia project)",
+            open(os.path.join(sdk_src, "LICENSE"), encoding="utf-8", errors="replace").read())
+    for name, rel, inline in THIRD_PARTY:
+        if rel:
+            f = os.path.join(sdk_src, "thirdparty", rel)
+            if not os.path.exists(f):
+                sys.exit("missing licence file: " + f)
+            section(name, open(f, encoding="utf-8", errors="replace").read())
+        else:
+            section(name, inline)
+    section("Build tools downloaded by the launcher (not included in this release)",
+            "LLVM (Apache 2.0 with LLVM exceptions), CMake (BSD 3-clause), Ninja (Apache 2.0), "
+            "xwin (MIT / Apache 2.0), and Microsoft's Visual C++ libraries and Windows SDK (downloaded "
+            "from Microsoft after the player accepts Microsoft's licence terms).")
+    with open(path, "w", encoding="utf-8", newline="\r\n") as f:
+        f.write("\n".join(parts) + "\n")
 
 
 def copy(src, dst):
@@ -47,8 +129,8 @@ def main():
     copy(LAUNCHER, os.path.join(OUT, "openNG2.exe"))
     with open(os.path.join(OUT, "README.txt"), "w", encoding="utf-8") as f:
         f.write(
-            "openNG2 - Ninja Gaiden II (Xbox 360) for Windows\n"
-            "================================================\n\n"
+            f"openNG2 {VERSION} - Ninja Gaiden II (Xbox 360) for Windows\n"
+            "====================================================\n\n"
             "Run openNG2.exe and add your own files:\n"
             "  Required: the game (Games on Demand package C1200E9B558D04454FA6 + its .data folder,\n"
             "            a disc image .iso, or an extracted game folder with default.xex)\n"
@@ -56,7 +138,10 @@ def main():
             "  Optional: the DLC packages (Mission Mode and the three costume packs)\n\n"
             "The launcher checks the files, downloads a compiler, rebuilds the game for Windows from\n"
             "your copy and gives you ng2.exe. No game files are included in this download.\n"
-            "Keep the payload folder next to openNG2.exe.\n")
+            "Keep the payload folder next to openNG2.exe.\n\n"
+            "Ninja Gaiden II belongs to Koei Tecmo; use only a copy you own.\n"
+            "Third-party licences: THIRD-PARTY-NOTICES.txt\n"
+            "Project page: https://github.com/KamiTK2/openNG2\n")
 
     # Project.
     proj_out = os.path.join(OUT, "payload", "project", "ng2")
@@ -99,8 +184,17 @@ def main():
                 continue
             copy(src, os.path.join(sdk_out, sub, name))
 
+    write_notices(os.path.join(OUT, "THIRD-PARTY-NOTICES.txt"))
     total = sum(os.path.getsize(os.path.join(b, f)) for b, _, fs in os.walk(OUT) for f in fs)
     print(f"release folder: {OUT} ({total / 1e6:.0f} MB)")
+    # Release archive: openNG2-<version>.zip with the folder inside.
+    zip_path = os.path.join(os.path.dirname(OUT), f"openNG2-{VERSION}.zip")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+        for base, _, files in os.walk(OUT):
+            for fn in files:
+                full = os.path.join(base, fn)
+                z.write(full, os.path.join("openNG2", os.path.relpath(full, OUT)))
+    print(f"release zip: {zip_path} ({os.path.getsize(zip_path) / 1e6:.0f} MB)")
 
 
 if __name__ == "__main__":
