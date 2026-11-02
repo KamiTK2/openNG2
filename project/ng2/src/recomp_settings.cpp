@@ -37,6 +37,9 @@
 
 bool Ng2IngameRecompRowSelected();  // ng2_hooks.cpp
 
+REXCVAR_DEFINE_BOOL(ng2_prompt_device_diag, false, "NG2",
+                    "Log what switches button prompts between controller and keyboard");
+
 namespace ng2 {
 namespace {
 
@@ -1867,12 +1870,36 @@ void UpdatePromptDevice(const ImGuiIO& io) {
           std::abs(int(g.sThumbLX)) > 12000 || std::abs(int(g.sThumbLY)) > 12000 ||
           std::abs(int(g.sThumbRX)) > 12000 || std::abs(int(g.sThumbRY)) > 12000;
   }
+  // Keyboard & mouse count only on a fresh key press or real mouse travel: a key that reads as
+  // held all the time (stuck VK, a key-holding tool, or a held modifier) or sub-pixel / warp
+  // mouse jitter must not keep flipping prompts back to keyboard while the pad is idle.
+  static bool key_was_down[256] = {};
+  static float mouse_travel = 0.0f;
   bool kbm = false;
-  if (OurWindowFocused()) {
-    kbm = io.MouseDelta.x != 0.0f || io.MouseDelta.y != 0.0f || io.MouseWheel != 0.0f;
-    for (int vk = 1; vk < 255 && !kbm; ++vk) {
-      if (vk >= 0x07 && vk <= 0x0F && vk != 0x08 && vk != 0x09 && vk != 0x0D) continue;
-      kbm = (GetAsyncKeyState(vk) & 0x8000) != 0;
+  int cause_vk = 0;
+  static bool keys_seeded = false;  // keys already down at the first focused frame don't count
+  const bool focused = OurWindowFocused();
+  for (int vk = 1; vk < 255; ++vk) {
+    if (vk >= 0x07 && vk <= 0x0F && vk != 0x08 && vk != 0x09 && vk != 0x0D) continue;
+    if (vk >= 0xC3 && vk <= 0xDA) continue;  // VK_GAMEPAD_*: the controller, not the keyboard
+    const bool down = focused && (GetAsyncKeyState(vk) & 0x8000) != 0;
+    if (!keys_seeded) {
+      if (down && REXCVAR_GET(ng2_prompt_device_diag))
+        REXLOG_INFO("NG2 prompt device: vk {:02X} already down at start", vk);
+    } else if (down && !key_was_down[vk] && !kbm) {
+      kbm = true;
+      cause_vk = vk;
+    }
+    key_was_down[vk] = down;
+  }
+  if (focused) keys_seeded = true;
+  bool cause_mouse = false;
+  if (focused && !kbm) {
+    const float d = std::abs(io.MouseDelta.x) + std::abs(io.MouseDelta.y);
+    mouse_travel = d > 0.0f ? mouse_travel + d : 0.0f;  // consecutive frames of motion
+    if (mouse_travel > 24.0f || io.MouseWheel != 0.0f) {
+      kbm = cause_mouse = true;
+      mouse_travel = 0.0f;
     }
   }
   static bool first = true;
@@ -1882,6 +1909,13 @@ void UpdatePromptDevice(const ImGuiIO& io) {
     bool any_pad = false;
     for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i) any_pad |= XInputGetState(i, &st) == ERROR_SUCCESS;
     g_prompts_keyboard = !any_pad;
+  }
+  if (REXCVAR_GET(ng2_prompt_device_diag) && ((pad && g_prompts_keyboard) || (!pad && kbm && !g_prompts_keyboard))) {
+    if (pad) REXLOG_INFO("NG2 prompt device: controller");
+    else if (cause_mouse)
+      REXLOG_INFO("NG2 prompt device: keyboard (mouse d={:.1f},{:.1f} wheel={:.1f})", io.MouseDelta.x,
+                  io.MouseDelta.y, io.MouseWheel);
+    else REXLOG_INFO("NG2 prompt device: keyboard (vk {:02X})", cause_vk);
   }
   if (pad) g_prompts_keyboard = false;
   else if (kbm) g_prompts_keyboard = true;
