@@ -51,6 +51,12 @@ name = "Ng2RecompPaneDraw"
 registers = ["r3"]
 return = true
 
+# Main loop (sub_822F34B0) busy-waits each frame until [0x84C53430] is 0 (the render thread
+# is done); yield the core inside that spin (findings #64).
+[[entrypoint.midasm_hook]]
+address = 0x822F3570
+name = "Ng2SpinYield"
+
 # D3D present (calls VdSwap once per game frame): counts frames for the FPS counter.
 [[entrypoint.midasm_hook]]
 address = 0x8376A9F8

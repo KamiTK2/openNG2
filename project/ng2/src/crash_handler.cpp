@@ -16,8 +16,10 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
 
 #pragma comment(lib, "dbghelp.lib")
@@ -543,6 +545,57 @@ void InstallCrashHandler() {
       FindClose(f);
       DeleteFileW((ExeDir() + name).c_str());
       DumpGuestMemory(name.substr(std::wstring(L"ng2_dumpmem_").size()));
+    }
+  }).detach();
+  // NG2 DIAG (cvar ng2_thread_cpu): every 5 s, CPU use per thread (% of one core), by name.
+  std::thread([] {
+    std::unordered_map<DWORD, uint64_t> last;
+    for (;;) {
+      Sleep(5000);
+      if (rex::cvar::GetFlagByName("ng2_thread_cpu") != "true") continue;
+      HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+      if (snap == INVALID_HANDLE_VALUE) continue;
+      struct Row { double pct; std::string name; DWORD tid; };
+      std::vector<Row> rows;
+      double total = 0;
+      std::unordered_map<DWORD, uint64_t> now;
+      THREADENTRY32 te{sizeof(te)};
+      const DWORD pid = GetCurrentProcessId();
+      for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+        if (te.th32OwnerProcessID != pid) continue;
+        HANDLE t = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, te.th32ThreadID);
+        if (!t) continue;
+        FILETIME c, e, k, u;
+        if (GetThreadTimes(t, &c, &e, &k, &u)) {
+          const uint64_t busy = ((uint64_t(k.dwHighDateTime) << 32) | k.dwLowDateTime) +
+                                ((uint64_t(u.dwHighDateTime) << 32) | u.dwLowDateTime);
+          now[te.th32ThreadID] = busy;
+          auto it = last.find(te.th32ThreadID);
+          if (it != last.end() && busy >= it->second) {
+            const double pct = double(busy - it->second) / 5e7 * 100.0;  // 100 ns units / 5 s
+            total += pct;
+            std::string name;
+            PWSTR desc = nullptr;
+            if (SUCCEEDED(GetThreadDescription(t, &desc)) && desc) {
+              for (PWSTR ch = desc; *ch; ++ch) name.push_back(*ch < 128 ? char(*ch) : '?');
+              LocalFree(desc);
+            }
+            if (pct >= 1.0) rows.push_back({pct, name, te.th32ThreadID});
+          }
+        }
+        CloseHandle(t);
+      }
+      CloseHandle(snap);
+      last = std::move(now);
+      std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.pct > b.pct; });
+      std::string line;
+      for (size_t i = 0; i < rows.size() && i < 14; ++i) {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), " [%.0f%% %s #%lu]", rows[i].pct,
+                      rows[i].name.empty() ? "?" : rows[i].name.c_str(), rows[i].tid);
+        line += buf;
+      }
+      REXLOG_INFO("NG2 thread CPU 5s: total {:.0f}% of one core;{}", total, line);
     }
   }).detach();
   // On-demand stack dump: create a file named "ng2_dumpstacks" next to ng2.exe and

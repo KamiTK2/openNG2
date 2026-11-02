@@ -291,6 +291,33 @@ extern "C" REX_FUNC(sub_82347700) {
 
 void Ng2SkipCutsceneFrame();
 bool Ng2InGameplay();  // defined with the 2D render pass below
+REXCVAR_DEFINE_BOOL(ng2_thread_cpu, false, "NG2", "NG2 DIAG: log CPU use per thread every 5 s");
+REXCVAR_DEFINE_BOOL(ng2_spin_yield, true, "NG2",
+                    "Let the game's busy-wait loops sleep briefly instead of spinning a core");
+// Busy waits (findings #64): NG2's main loop spins until the render thread finishes a frame,
+// and the render thread spins in the D3D runtime until the GPU frees command ring space, each
+// burning a whole core. A 100 us high-resolution sleep per iteration frees the core for the
+// command processor and the rest (weak CPUs) at a negligible latency cost.
+void Ng2SpinYield() {
+  if (!REXCVAR_GET(ng2_spin_yield)) return;
+  thread_local HANDLE timer = CreateWaitableTimerExW(
+      nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+  if (!timer) {
+    SwitchToThread();
+    return;
+  }
+  LARGE_INTEGER due;
+  due.QuadPart = -1000;  // 100 us, relative (100 ns units)
+  if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+    WaitForSingleObject(timer, INFINITE);
+  }
+}
+// The D3D runtime's wait-poll helper (r3 = wait state): returns 1 while still waiting.
+extern "C" REX_FUNC(__imp__sub_8375E538);
+extern "C" REX_FUNC(sub_8375E538) {
+  __imp__sub_8375E538(ctx, base);
+  if (ctx.r3.u32 == 1) Ng2SpinYield();
+}
 REXCVAR_DEFINE_BOOL(ng2_fast_loading, true, "NG2",
                     "Run loading screens unthrottled (guest vblank off while loading)");
 void Ng2OnPresent() {
