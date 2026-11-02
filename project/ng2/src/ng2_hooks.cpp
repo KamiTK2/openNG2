@@ -81,8 +81,14 @@ bool EndsWithNoCase(const std::string& s, const char* suffix) {
   return true;
 }
 
+// Fast Loading: time of the last read from a game archive (*.ng2; music streams excluded).
+std::atomic<int64_t> g_last_archive_read_ms{0};
+std::atomic<bool> g_loading_screen{false};  // loading screen sprites (bucket 86), no HUD
+std::atomic<bool> g_chapter_screen{false};  // chapter title screen text (bucket 85)
+
 void OnFileRead(const std::string& path, uint64_t file_offset, uint32_t guest_buffer,
                 uint32_t length) {
+  if (EndsWithNoCase(path, ".ng2")) g_last_archive_read_ms = int64_t(GetTickCount64());
   for (const auto& p : DataPatches()) {
     if (!EndsWithNoCase(path, p.file_suffix)) continue;
     // Slot = original text + NUL terminator.
@@ -284,9 +290,40 @@ extern "C" REX_FUNC(sub_82347700) {
 }
 
 void Ng2SkipCutsceneFrame();
+bool Ng2InGameplay();  // defined with the 2D render pass below
+REXCVAR_DEFINE_BOOL(ng2_fast_loading, true, "NG2",
+                    "Run loading screens unthrottled (guest vblank off while loading)");
 void Ng2OnPresent() {
   ng2::RecompCountGameFrame();
   ApplyAspectOverride();
+  {
+    // Fast Loading (findings #57): NG2 loads a fixed amount of work per frame while its
+    // loading screen animates, and the death / retry load also waits ~10 s with no reads at
+    // all, so loads take a set number of 60 Hz frames. While the loading icon (2D bucket 86:
+    // petals -> shuriken, NOW LOADING) is up without the HUD, the guest vblank runs
+    // unthrottled (cvar vsync off: 1 ms vblanks) and the load finishes in a fraction of the time.
+    // Latched: on when the icon appears, off when the chapter screen ([Proceed]) or the HUD
+    // appears, or 15 s after the icon went away (the fade after the icon is a wait too).
+    const int64_t now = int64_t(GetTickCount64());
+    static bool latched = false;
+    static int64_t icon_seen_ms = 0;
+    if (REXCVAR_GET(ng2_fast_loading) && g_loading_screen.load()) {
+      latched = true;
+      icon_seen_ms = now;
+    }
+    if (latched && !g_loading_screen.load() &&
+        (g_chapter_screen.load() || Ng2InGameplay() || now - icon_seen_ms > 15000 ||
+         !REXCVAR_GET(ng2_fast_loading))) {
+      latched = false;
+    }
+    const bool turbo = latched;
+    static bool applied = false;
+    if (turbo != applied) {
+      applied = turbo;
+      rex::cvar::SetFlagByName("vsync", turbo ? "false" : "true");
+      REXLOG_INFO("NG2 fast loading: {}", turbo ? "on" : "off");
+    }
+  }
   if (rex::cvar::GetFlagByName("ng2_aspect_cycle") == "true") {
     static bool was_down = false;
     const bool down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
@@ -407,6 +444,8 @@ extern "C" REX_FUNC(sub_8368E2D8) {
   g_hud_active = false;
   bool ingame_menu_drawn = false;
   bool menu_over_hud = false;  // pause / inventory (49-50) or in-game menu (70-72)
+  bool loading_screen = false;
+  bool chapter_screen = false;
   const uint32_t parity = GuestLoadU32(kBuckets + 1456) ^ 1;
   const uint32_t heads = kBuckets + parity * 728;
   for (int i = 0; i < kBucketCount; ++i) {
@@ -418,6 +457,12 @@ extern "C" REX_FUNC(sub_8368E2D8) {
       // real draw items in 57-59 mean the HUD is up.
       if (i >= 57 && i <= 59 && GuestLoadU32(GuestLoadU32(item) + 4) != 0x83705C98) {
         g_hud_active = true;
+      }
+      if (i == 86 && GuestLoadU32(GuestLoadU32(item) + 4) != 0x83705C98) {
+        loading_screen = true;  // loading-screen petals / NOW LOADING (skulldiag-1)
+      }
+      if (i == 85 && GuestLoadU32(GuestLoadU32(item) + 4) != 0x83705C98) {
+        chapter_screen = true;  // chapter title + [Proceed] (also save-slot text; see turbo)
       }
       if (i >= 70 && i <= 72 && GuestLoadU32(GuestLoadU32(item) + 4) != 0x83705C98) {
         ingame_menu_drawn = true;
@@ -436,6 +481,8 @@ extern "C" REX_FUNC(sub_8368E2D8) {
     }
   }
   g_in_gameplay.store(g_hud_active && !menu_over_hud, std::memory_order_relaxed);
+  g_loading_screen.store(loading_screen && !g_hud_active, std::memory_order_relaxed);
+  g_chapter_screen.store(chapter_screen, std::memory_order_relaxed);
   Ng2IngameMenuFrame(ingame_menu_drawn);
   // Menu sounds requested by the Recomp Settings panel opened from the in-game menu (the
   // main Options update, which plays them otherwise, doesn't run in gameplay).

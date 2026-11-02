@@ -136,6 +136,7 @@ void PublishCheats(const RecompSettings& s) {
   rex::cvar::SetFlagByName("ng2_cheat_costumes", s.cheat_costumes ? "true" : "false");
   rex::cvar::SetFlagByName("ng2_skip_intro", s.skip_intro ? "true" : "false");
   rex::cvar::SetFlagByName("ng2_skip_any_cutscene", s.skip_any_cutscene ? "true" : "false");
+  rex::cvar::SetFlagByName("ng2_fast_loading", s.fast_loading ? "true" : "false");
 }
 
 void PublishInputSettings(const RecompSettings& s) {
@@ -622,6 +623,7 @@ bool RecompSettings::Load(const std::filesystem::path& path) {
     else if (k == "ng2_skip_intro") skip_intro = ParseBool(v, skip_intro);
     else if (k == "ng2_skip_any_cutscene")
       skip_any_cutscene = ParseBool(v, skip_any_cutscene);
+    else if (k == "ng2_fast_loading") fast_loading = ParseBool(v, fast_loading);
     else if (k == "mnk_mode") mnk_enabled = ParseBool(v, mnk_enabled);
     else if (k == "mnk_mouse") mouse_camera = ParseBool(v, mouse_camera);
     else if (k == "ng2_mouse_sens") mouse_sens = ParseInt(v, mouse_sens, 1, 50);
@@ -684,6 +686,7 @@ bool RecompSettings::Save(const std::filesystem::path& path) const {
       << "ng2_cheat_costumes = " << b(cheat_costumes) << "\n"
       << "ng2_skip_intro = " << b(skip_intro) << "\n"
       << "ng2_skip_any_cutscene = " << b(skip_any_cutscene) << "\n"
+      << "ng2_fast_loading = " << b(fast_loading) << "\n"
       << "mnk_mode = " << b(mnk_enabled) << "\n"
       << "mnk_mouse = " << b(mouse_camera) << "\n"
       << "ng2_mouse_sens = " << mouse_sens << "\n"
@@ -1021,7 +1024,9 @@ void RecompOptionsPane::LogFrameRate() {
     last_frames = frames;
     last_ms = now;
     static int64_t last_log_ms = 0;
-    if (now - last_log_ms >= 5000) {
+    // Every 5 s; every 1 s with the load diagnostics on (diag_io_stats).
+    const int64_t log_every = rex::cvar::GetFlagByName("diag_io_stats") == "true" ? 1000 : 5000;
+    if (now - last_log_ms >= log_every) {
       last_log_ms = now;
       REXLOG_INFO("NG2 game fps {:.1f} (frames {}), host ui/present fps {:.1f}", fps, frames,
                   host_fps);
@@ -1263,6 +1268,7 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
       pair_row("Skip Intro", "On", "Off", s.skip_intro, [&s](bool a) { s.skip_intro = a; });
       pair_row("Skip Any Cutscene", "On", "Off", s.skip_any_cutscene,
                [&s](bool a) { s.skip_any_cutscene = a; });
+      pair_row("Fast Loading", "On", "Off", s.fast_loading, [&s](bool a) { s.fast_loading = a; });
       pair_row("Pause in Background", "On", "Off", s.pause_in_background,
                [&s](bool a) { s.pause_in_background = a; });
       action_row("Open Save Folder", [this] {

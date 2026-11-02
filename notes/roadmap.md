@@ -35,7 +35,7 @@ Hard = reverse-engineering + game patches.
       - [x] HUD pinned to the screen edges by render bucket (`ng2_hud_anchor`, default on); boss bar still to check
 - [x] Aspect ratio selector + FOV slider (Display > Field of View 70-150 %), mouse wheel camera zoom (findings #56)
 - [ ] Quality toggles: 16x anisotropic, disable motion blur / DoF / film grain, shadow resolution
-- [x] Skip any cutscene (System > Skip Any Cutscene, default On): movies and real-time scenes, seen or not (findings #48)   - [ ] reduce artificial load waits
+- [x] Skip any cutscene (System > Skip Any Cutscene, default On): movies and real-time scenes, seen or not (findings #48)   - [x] reduce artificial load waits: System > Fast Loading (loading screens run unthrottled, findings #57)
 - [ ] Frame rate above 60 (interpolation or timing patches; speed-up risk, do last)
       - [x] Built-in frame generation 60->120: Graphics > Framerate Cap = 120 FPS (Interpolation); user: "feels great"
 

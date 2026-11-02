@@ -1342,8 +1342,115 @@ index 3f9422d..2b3579c 100644
  void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
    has_focus_ = false;
    // Withdraw the request too, or an update queued before the focus loss grabs
+diff --git a/src/kernel/xboxkrnl/ng2_diag_stats.h b/src/kernel/xboxkrnl/ng2_diag_stats.h
+new file mode 100644
+index 0000000..6880031
+--- /dev/null
++++ b/src/kernel/xboxkrnl/ng2_diag_stats.h
+@@ -0,0 +1,101 @@
++#pragma once
++// NG2 DIAG: per-second load-time statistics (cvar diag_io_stats): file reads (count, bytes,
++// time), guest sleeps (KeDelayExecutionThread) and blocking waits, with the top threads by
++// time spent asleep / waiting. Used to find what loading screens spend their time on.
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <mutex>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++#include <rex/cvar.h>
++#include <rex/logging.h>
++#include <rex/system/xthread.h>
++
++REXCVAR_DECLARE(bool, diag_io_stats);
++
++namespace rex::kernel::ng2diag {
++
++inline std::atomic<uint64_t> g_reads{0}, g_read_bytes{0}, g_read_us{0};
++inline std::atomic<uint64_t> g_delays{0}, g_delay_us{0}, g_waits{0}, g_wait_us{0};
++inline std::mutex g_thread_mutex;
++inline std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> g_thread_us;  // delay, wait
++inline std::atomic<int64_t> g_last_ms{0};
++
++inline int64_t NowUs() {
++  return std::chrono::duration_cast<std::chrono::microseconds>(
++             std::chrono::steady_clock::now().time_since_epoch())
++      .count();
++}
++
++inline void MaybeLog() {
++  const int64_t now_ms = NowUs() / 1000;
++  int64_t last = g_last_ms.load();
++  if (now_ms - last < 1000 || !g_last_ms.compare_exchange_strong(last, now_ms)) return;
++  const uint64_t reads = g_reads.exchange(0), bytes = g_read_bytes.exchange(0),
++                 read_us = g_read_us.exchange(0), delays = g_delays.exchange(0),
++                 delay_us = g_delay_us.exchange(0), waits = g_waits.exchange(0),
++                 wait_us = g_wait_us.exchange(0);
++  std::vector<std::pair<std::string, std::pair<uint64_t, uint64_t>>> threads;
++  {
++    std::lock_guard lock(g_thread_mutex);
++    threads.assign(g_thread_us.begin(), g_thread_us.end());
++    g_thread_us.clear();
++  }
++  if (!reads && !delay_us && !wait_us) return;
++  std::sort(threads.begin(), threads.end(), [](auto& a, auto& b) {
++    return a.second.first + a.second.second > b.second.first + b.second.second;
++  });
++  std::string top;
++  for (size_t i = 0; i < threads.size() && i < 5; ++i) {
++    top += " | " + threads[i].first + " sleep " + std::to_string(threads[i].second.first / 1000) +
++           "ms wait " + std::to_string(threads[i].second.second / 1000) + "ms";
++  }
++  REXLOG_INFO("NG2DIAG io: reads {} ({} KB, {} ms) sleeps {} ({} ms) waits {} ({} ms){}", reads,
++              bytes / 1024, read_us / 1000, delays, delay_us / 1000, waits, wait_us / 1000, top);
++}
++
++inline void AddThread(bool sleep, uint64_t us) {
++  auto* t = rex::system::XThread::GetCurrentThread();
++  std::string name = t ? t->name() : "host";
++  if (name.empty() && t) name = "thread " + std::to_string(t->thread_id());
++  std::lock_guard lock(g_thread_mutex);
++  auto& e = g_thread_us[name];
++  (sleep ? e.first : e.second) += us;
++}
++
++// Times a scope: kind 0 = file read (bytes given at Done), 1 = sleep, 2 = wait.
++struct Timer {
++  int kind;
++  int64_t start;
++  bool on;
++  explicit Timer(int k) : kind(k), start(0), on(REXCVAR_GET(diag_io_stats)) {
++    if (on) start = NowUs();
++  }
++  void Done(uint64_t bytes = 0) {
++    if (!on) return;
++    on = false;
++    const uint64_t us = uint64_t(NowUs() - start);
++    if (kind == 0) {
++      g_reads.fetch_add(1);
++      g_read_bytes.fetch_add(bytes);
++      g_read_us.fetch_add(us);
++    } else if (kind == 1) {
++      g_delays.fetch_add(1);
++      g_delay_us.fetch_add(us);
++      AddThread(true, us);
++    } else {
++      g_waits.fetch_add(1);
++      g_wait_us.fetch_add(us);
++      AddThread(false, us);
++    }
++    MaybeLog();
++  }
++  ~Timer() { Done(); }
++};
++
++}  // namespace rex::kernel::ng2diag
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_io.cpp b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
-index 3f1a852..1bebf23 100644
+index 3f1a852..0588302 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_io.cpp
 +++ b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
 @@ -13,6 +13,7 @@
@@ -1354,7 +1461,16 @@ index 3f1a852..1bebf23 100644
  #include <rex/kernel/xboxkrnl/private.h>
  #include <rex/logging.h>
  #include <rex/memory.h>
-@@ -184,6 +185,19 @@ u32 NtOpenFile_entry(mapped_u32 handle_out, u32 desired_access,
+@@ -29,6 +30,8 @@
+ #include <rex/system/xtypes.h>
+ #include <rex/thread/mutex.h>
+ 
++#include "ng2_diag_stats.h"  // NG2 DIAG
++
+ namespace rex::kernel::xboxkrnl {
+ using namespace rex::system;
+ 
+@@ -184,6 +187,19 @@ u32 NtOpenFile_entry(mapped_u32 handle_out, u32 desired_access,
                              open_options);
  }
  
@@ -1374,16 +1490,18 @@ index 3f1a852..1bebf23 100644
  u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_ptr,
                       mapped_void apc_context, ppc_ptr_t<X_IO_STATUS_BLOCK> io_status_block,
                       mapped_void buffer, u32 buffer_length, mapped_u64 byte_offset_ptr) {
-@@ -213,9 +227,16 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
+@@ -213,9 +229,18 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
      if (true || file->is_synchronous()) {
        // Synchronous.
        uint32_t bytes_read = 0;
 +      // Effective file offset of this read (-1 = current position).
 +      const uint64_t read_offset = byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr)
 +                                                   : file->position();
++      ng2diag::Timer read_timer(0);  // NG2 DIAG (diag_io_stats)
        result = file->Read(buffer.guest_address(), buffer_length,
                            byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
                            &bytes_read, apc_context.guest_address());
++      read_timer.Done(bytes_read);
 +      if (XSUCCEEDED(result) && bytes_read && rex::kernel::FileReadHookStorage()) {
 +        rex::kernel::FileReadHookStorage()(file->path(), read_offset, buffer.guest_address(),
 +                                           bytes_read);
@@ -1391,6 +1509,62 @@ index 3f1a852..1bebf23 100644
        if (io_status_block) {
          io_status_block->status = result;
          io_status_block->information = bytes_read;
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+index 57fd161..dcd2f3f 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+@@ -39,6 +39,11 @@
+ #include <rex/thread/atomic.h>
+ #include <rex/thread/mutex.h>
+ 
++#include "ng2_diag_stats.h"  // NG2 DIAG
++
++REXCVAR_DEFINE_BOOL(diag_io_stats, false, "Kernel",
++                    "NG2 DIAG: log file reads, sleeps and waits once a second");
++
+ namespace rex::kernel::xboxkrnl {
+ using namespace rex::system;
+ using rex::runtime::current_ppc_context;
+@@ -374,6 +379,7 @@ u32 KeQueryPerformanceFrequency_entry() {
+ }
+ 
+ u32 KeDelayExecutionThread_entry(u32 processor_mode, u32 alertable, mapped_u64 interval_ptr) {
++  rex::kernel::ng2diag::Timer diag_timer(1);  // NG2 DIAG
+   XThread* thread = XThread::GetCurrentThread();
+ 
+   if (alertable) {
+@@ -819,6 +825,7 @@ u32 NtCancelTimer_entry(u32 timer_handle, mapped_u32 current_state_ptr) {
+ 
+ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason, uint32_t processor_mode,
+                                  uint32_t alertable, uint64_t* timeout_ptr) {
++  rex::kernel::ng2diag::Timer diag_timer(2);  // NG2 DIAG
+   auto object = XObject::GetNativeObject<XObject>(REX_KERNEL_STATE(), object_ptr);
+ 
+   if (!object) {
+@@ -852,6 +859,7 @@ u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 pro
+ 
+ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertable,
+                                   mapped_u64 timeout_ptr) {
++  rex::kernel::ng2diag::Timer diag_timer(2);  // NG2 DIAG
+   X_STATUS result = X_STATUS_SUCCESS;
+ 
+   auto object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(object_handle);
+@@ -871,6 +879,7 @@ u32 NtWaitForSingleObjectEx_entry(u32 object_handle, u32 wait_mode, u32 alertabl
+ u32 KeWaitForMultipleObjects_entry(u32 count, mapped_u32 objects_ptr, u32 wait_type,
+                                    u32 wait_reason, u32 processor_mode, u32 alertable,
+                                    mapped_u64 timeout_ptr, mapped_void wait_block_array_ptr) {
++  rex::kernel::ng2diag::Timer diag_timer(2);  // NG2 DIAG
+   assert_true(wait_type <= 1);
+ 
+   std::vector<object_ref<XObject>> objects;
+@@ -919,6 +928,7 @@ uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, rex::be<uint32_t>* handles
+ 
+ u32 NtWaitForMultipleObjectsEx_entry(u32 count, mapped_u32 handles, u32 wait_type, u32 wait_mode,
+                                      u32 alertable, mapped_u64 timeout_ptr) {
++  rex::kernel::ng2diag::Timer diag_timer(2);  // NG2 DIAG
+   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+   return xeNtWaitForMultipleObjectsEx(count, handles, wait_type, wait_mode, alertable,
+                                       timeout_ptr ? &timeout : nullptr);
 diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
 index 77bce25..c04b6c6 100644
 --- a/src/system/xthread.cpp

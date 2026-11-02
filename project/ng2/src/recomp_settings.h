@@ -120,6 +120,7 @@ struct RecompSettings {
   std::array<std::string, kBindCount> binds = DefaultBinds();
   // System
   bool skip_any_cutscene = true;  // cvar ng2_skip_any_cutscene (live)
+  bool fast_loading = true;  // cvar ng2_fast_loading: loading screens run unthrottled (live)
   bool skip_intro = false;  // skip the boot movie (cvar ng2_skip_intro; next launch)
   bool pause_in_background = false;  // sends XN_SYS_UI (like the Guide button) on focus loss
   // Cheats (cvars ng2_cheat_*; apply after a restart, nothing is written to the game save)
