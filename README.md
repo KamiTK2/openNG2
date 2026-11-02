@@ -71,8 +71,10 @@ launcher builds it from your own copy.
 
 ## Legal
 
-Use only a copy of Ninja Gaiden II that you own. This repository contains no game files, saves,
-recompiled code or built executables — do not share those either.
+openNG2's source code is under the [BSD 3-Clause licence](LICENSE); third-party software keeps
+its own licences (see `THIRD-PARTY-NOTICES.txt` in the release). Use only a copy of Ninja
+Gaiden II that you own. This repository contains no game files, saves, recompiled code or built
+executables — do not share those either.
 
 ---
 
