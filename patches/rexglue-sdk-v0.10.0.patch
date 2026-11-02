@@ -27,6 +27,49 @@ index da8e432..17c6cf4 100644
  
    // MicroEngine binary from PM4_ME_INIT
    std::vector<uint32_t> me_bin_;
+diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
+index 96d362b..8cc483a 100644
+--- a/include/rex/graphics/d3d12/command_processor.h
++++ b/include/rex/graphics/d3d12/command_processor.h
+@@ -219,6 +219,38 @@ class D3D12CommandProcessor : public CommandProcessor {
+                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
+   bool IssueCopy() override;
+ 
++  // NG2 DIAG (cvar diag_gpu_passes): GPU time per pass. Every N frames one whole frame is
++  // recorded into a single submission with a timestamp at its start, after every resolve and
++  // at the swap; when it completes, each segment (draws since the previous mark + the resolve
++  // ending it) is logged with its GPU time and what it rendered.
++  struct GpuProfSegment {
++    uint32_t draws = 0;
++    uint64_t vs = 0, ps = 0;         // first draw's shaders
++    uint32_t surface_info = 0;       // first draw's render targets
++    uint32_t color_info[4] = {};
++    uint32_t color_mask = 0;
++    uint32_t depth_info = 0;
++    float viewport_w = 0, viewport_h = 0;
++    bool resolve = false;            // ended by a resolve (else by the swap)
++    uint32_t copy_dest_base = 0, copy_dest_pitch = 0, copy_dest_info = 0, copy_control = 0;
++  };
++  void GpuProfOnDraw();
++  void GpuProfMark(bool resolve);
++  void GpuProfOnSwap();
++  void GpuProfPoll();
++  static constexpr uint32_t kGpuProfMaxMarks = 8192;
++  Microsoft::WRL::ComPtr<ID3D12QueryHeap> gpu_prof_heap_;
++  Microsoft::WRL::ComPtr<ID3D12Resource> gpu_prof_readback_;
++  bool gpu_prof_active_ = false;
++  bool gpu_prof_failed_ = false;
++  uint32_t gpu_prof_marks_ = 0;
++  uint32_t gpu_prof_frame_ = 0;
++  GpuProfSegment gpu_prof_cur_;
++  std::vector<GpuProfSegment> gpu_prof_segments_;
++  std::vector<GpuProfSegment> gpu_prof_pending_segments_;
++  uint64_t gpu_prof_pending_submission_ = 0;
++  uint32_t gpu_prof_pending_marks_ = 0;
++
+  private:
+   static constexpr uint32_t kQueueFrames = 3;
+ 
 diff --git a/include/rex/graphics/graphics_system.h b/include/rex/graphics/graphics_system.h
 index ac6b056..a7c79ee 100644
 --- a/include/rex/graphics/graphics_system.h
@@ -578,7 +621,7 @@ index 240bcb0..7553e43 100644
      auto entry_display = make_display_name(targeted[0].config.filePath);
      RecompilerConfig cfg = std::move(targeted[0].config);
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index a744375..da66e02 100644
+index a744375..466ccfe 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
 @@ -10,9 +10,13 @@
@@ -611,7 +654,7 @@ index a744375..da66e02 100644
  REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                      "Refresh page-valid state from GPU-written memory at frame end. "
                      "Disable for minor CPU overhead reduction, but may break memory coherency.")
-@@ -154,17 +167,52 @@ void CommandProcessor::Shutdown() {
+@@ -154,17 +167,71 @@ void CommandProcessor::Shutdown() {
    worker_thread_.reset();
  }
  
@@ -645,9 +688,28 @@ index a744375..da66e02 100644
 +void CommandProcessor::RequestContextReset() {
 +  CallInThread([this]() {
 +    REXGPU_INFO("NG2 context reset: rebuilding the GPU backend context");
++    // NG2 FIX: the bound shaders belong to the context being destroyed, and the game may not
++    // bind them again before its next draws: keep their microcode and load them into the new
++    // context (a draw with a freed shader crashed after quick successive resets).
++    std::vector<uint32_t> vs_ucode, ps_ucode;
++    if (active_vertex_shader_) vs_ucode = active_vertex_shader_->ucode_data();
++    if (active_pixel_shader_) ps_ucode = active_pixel_shader_->ucode_data();
++    // Shaders keep host-endian microcode; LoadShader takes (and hashes) guest big-endian.
++    for (uint32_t& w : vs_ucode) w = rex::byte_swap(w);
++    for (uint32_t& w : ps_ucode) w = rex::byte_swap(w);
++    active_vertex_shader_ = nullptr;
++    active_pixel_shader_ = nullptr;
 +    ShutdownContext();
 +    if (!SetupContext()) {
 +      rex::FatalError("Unable to rebuild command processor internal state");
++    }
++    if (!vs_ucode.empty()) {
++      active_vertex_shader_ = LoadShader(xenos::ShaderType::kVertex, 0, vs_ucode.data(),
++                                         uint32_t(vs_ucode.size()));
++    }
++    if (!ps_ucode.empty()) {
++      active_pixel_shader_ = LoadShader(xenos::ShaderType::kPixel, 0, ps_ucode.data(),
++                                        uint32_t(ps_ucode.size()));
 +    }
 +    std::filesystem::path root;
 +    uint32_t title_id;
@@ -666,7 +728,7 @@ index a744375..da66e02 100644
  void CommandProcessor::ClearCaches() {}
  
  void CommandProcessor::InvalidateGpuMemory() {}
-@@ -204,13 +252,25 @@ void CommandProcessor::WorkerThreadMain() {
+@@ -204,13 +271,25 @@ void CommandProcessor::WorkerThreadMain() {
    }
  
    while (worker_running_) {
@@ -696,7 +758,7 @@ index a744375..da66e02 100644
      if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
        SCOPE_profile_cpu_i("gpu", "rex::graphics::CommandProcessor::Stall");
        // We've run out of commands to execute.
-@@ -228,18 +288,36 @@ void CommandProcessor::WorkerThreadMain() {
+@@ -228,18 +307,36 @@ void CommandProcessor::WorkerThreadMain() {
  
          rex::thread::MaybeYield();
          loop_count++;
@@ -737,7 +799,7 @@ index a744375..da66e02 100644
  
      // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
      //     that many indices.
-@@ -312,9 +390,18 @@ bool CommandProcessor::SetupContext() {
+@@ -312,9 +409,18 @@ bool CommandProcessor::SetupContext() {
  void CommandProcessor::ShutdownContext() {}
  
  void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
@@ -757,7 +819,7 @@ index a744375..da66e02 100644
  }
  
  void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) {
-@@ -328,6 +415,14 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_s
+@@ -328,6 +434,14 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_s
  }
  
  void CommandProcessor::UpdateWritePointer(uint32_t value) {
@@ -772,7 +834,7 @@ index a744375..da66e02 100644
    write_ptr_index_ = value;
    write_ptr_index_event_->Set();
  }
-@@ -619,10 +714,24 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
+@@ -619,10 +733,24 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
    memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
    reader.set_read_offset(read_index * sizeof(uint32_t));
    reader.set_write_offset(write_index * sizeof(uint32_t));
@@ -797,7 +859,7 @@ index a744375..da66e02 100644
        assert_always();
        break;
      }
-@@ -633,9 +742,61 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
+@@ -633,9 +761,61 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
    return write_index;
  }
  
@@ -859,7 +921,7 @@ index a744375..da66e02 100644
    // Execute commands!
    memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
    reader.set_write_offset(count * sizeof(uint32_t));
-@@ -643,6 +804,15 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
+@@ -643,6 +823,15 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
      if (!ExecutePacket(&reader)) {
        // Return up a level if we encounter a bad packet.
        REXGPU_ERROR("**** INDIRECT RINGBUFFER: Failed to execute packet.");
@@ -875,7 +937,7 @@ index a744375..da66e02 100644
        assert_always();
        break;
      }
-@@ -960,6 +1130,14 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+@@ -960,6 +1149,14 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
  
    IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
  
@@ -890,7 +952,7 @@ index a744375..da66e02 100644
    ++counter_;
    return true;
  }
-@@ -971,6 +1149,20 @@ bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* re
+@@ -971,6 +1168,20 @@ bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* re
    uint32_t list_length = reader->ReadAndSwap<uint32_t>();
    assert_zero(list_length & ~0xFFFFF);
    list_length &= 0xFFFFF;
@@ -911,7 +973,7 @@ index a744375..da66e02 100644
    ExecuteIndirectBuffer(GpuToCpu(list_ptr), list_length);
    return true;
  }
-@@ -1102,6 +1294,13 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
+@@ -1102,6 +1313,13 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
  bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, uint32_t packet,
                                                      uint32_t count) {
    uint32_t write_addr = reader->ReadAndSwap<uint32_t>();
@@ -925,7 +987,7 @@ index a744375..da66e02 100644
    for (uint32_t i = 0; i < count - 1; i++) {
      uint32_t write_data = reader->ReadAndSwap<uint32_t>();
  
-@@ -1211,6 +1410,13 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
+@@ -1211,6 +1429,13 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
      // Write value.
      data_value = value;
    }
@@ -940,10 +1002,227 @@ index a744375..da66e02 100644
    address &= ~0x3;
    data_value = GpuSwap(data_value, endianness);
 diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
-index 19874a5..26d5462 100644
+index 19874a5..66cce03 100644
 --- a/src/graphics/d3d12/command_processor.cpp
 +++ b/src/graphics/d3d12/command_processor.cpp
-@@ -3092,6 +3092,13 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <unordered_map>
+ #include <cstdarg>
+ #include <cstring>
+ #include <sstream>
+@@ -47,6 +48,11 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
+                     "Submit command list when PM4 primary buffer ends")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_INT32(diag_gpu_passes, 0, "GPU/D3D12",
++                     "NG2 DIAG: log GPU time per pass of one frame every N frames (0 = off)");
++REXCVAR_DEFINE_BOOL(diag_gpu_passes_per_draw, false, "GPU/D3D12",
++                    "NG2 DIAG: with diag_gpu_passes, time every draw and total by shader pair");
++
+ namespace rex::graphics::d3d12 {
+ 
+ // Generated with `xb buildshaders`.
+@@ -1910,6 +1916,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+     REXGPU_ERROR("IssueSwap: BeginSubmission failed");
+     return;
+   }
++  GpuProfOnSwap();  // NG2 DIAG
+ 
+   // Obtain the actual swap source texture size (resolution-scaled if it's a
+   // resolve destination, or not otherwise).
+@@ -2256,8 +2263,166 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+   EndSubmission(true);
+ }
+ 
++// ---- NG2 DIAG: per-pass GPU timing (diag_gpu_passes) ------------------------------------
++void D3D12CommandProcessor::GpuProfOnDraw() {
++  if (!gpu_prof_marks_) {
++    if (!BeginSubmission(true)) return;
++    deferred_command_list_.D3DEndQuery(gpu_prof_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0);
++    gpu_prof_marks_ = 1;
++  }
++  {
++    // Also cut a segment where the render targets or viewport change (e.g. shadow map -> scene).
++    const RegisterFile& r = *register_file_;
++    const GpuProfSegment& c = gpu_prof_cur_;
++    if (c.draws && (REXCVAR_GET(diag_gpu_passes_per_draw) ||
++                    c.surface_info != r.values[XE_GPU_REG_RB_SURFACE_INFO] ||
++                    c.color_info[0] != r.values[XE_GPU_REG_RB_COLOR_INFO] ||
++                    c.depth_info != r.values[XE_GPU_REG_RB_DEPTH_INFO] ||
++                    c.viewport_w != std::fabs(r.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) * 2.0f ||
++                    c.viewport_h != std::fabs(r.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE)) * 2.0f)) {
++      GpuProfMark(false);
++      gpu_prof_segments_.back().resolve = false;
++    }
++  }
++  GpuProfSegment& seg = gpu_prof_cur_;
++  if (!seg.draws++) {
++    const RegisterFile& regs = *register_file_;
++    seg.vs = active_vertex_shader() ? active_vertex_shader()->ucode_data_hash() : 0;
++    seg.ps = active_pixel_shader() ? active_pixel_shader()->ucode_data_hash() : 0;
++    seg.surface_info = regs.values[XE_GPU_REG_RB_SURFACE_INFO];
++    seg.color_info[0] = regs.values[XE_GPU_REG_RB_COLOR_INFO];
++    seg.color_info[1] = regs.values[XE_GPU_REG_RB_COLOR1_INFO];
++    seg.color_info[2] = regs.values[XE_GPU_REG_RB_COLOR2_INFO];
++    seg.color_info[3] = regs.values[XE_GPU_REG_RB_COLOR3_INFO];
++    seg.color_mask = regs.values[XE_GPU_REG_RB_COLOR_MASK];
++    seg.depth_info = regs.values[XE_GPU_REG_RB_DEPTH_INFO];
++    seg.viewport_w = std::fabs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) * 2.0f;
++    seg.viewport_h = std::fabs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE)) * 2.0f;
++  }
++}
++
++void D3D12CommandProcessor::GpuProfMark(bool resolve) {
++  if (!gpu_prof_marks_ || gpu_prof_marks_ >= kGpuProfMaxMarks || !BeginSubmission(true)) return;
++  GpuProfSegment& seg = gpu_prof_cur_;
++  seg.resolve = resolve;
++  if (resolve) {
++    const RegisterFile& regs = *register_file_;
++    seg.copy_dest_base = regs.values[XE_GPU_REG_RB_COPY_DEST_BASE];
++    seg.copy_dest_pitch = regs.values[XE_GPU_REG_RB_COPY_DEST_PITCH];
++    seg.copy_dest_info = regs.values[XE_GPU_REG_RB_COPY_DEST_INFO];
++    seg.copy_control = regs.values[XE_GPU_REG_RB_COPY_CONTROL];
++    if (!seg.draws) {  // a resolve right after another: note the source surface anyway
++      seg.surface_info = regs.values[XE_GPU_REG_RB_SURFACE_INFO];
++      seg.color_info[0] = regs.values[XE_GPU_REG_RB_COLOR_INFO];
++      seg.depth_info = regs.values[XE_GPU_REG_RB_DEPTH_INFO];
++    }
++  }
++  deferred_command_list_.D3DEndQuery(gpu_prof_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
++                                     gpu_prof_marks_++);
++  gpu_prof_segments_.push_back(seg);
++  seg = GpuProfSegment();
++}
++
++void D3D12CommandProcessor::GpuProfOnSwap() {
++  GpuProfPoll();
++  if (gpu_prof_active_) {
++    GpuProfMark(false);
++    if (gpu_prof_marks_ > 1) {
++      deferred_command_list_.D3DResolveQueryData(gpu_prof_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
++                                                 0, gpu_prof_marks_, gpu_prof_readback_.Get(), 0);
++      gpu_prof_pending_submission_ = submission_current_;
++      gpu_prof_pending_marks_ = gpu_prof_marks_;
++      gpu_prof_pending_segments_ = std::move(gpu_prof_segments_);
++    }
++    gpu_prof_active_ = false;
++  }
++  gpu_prof_segments_.clear();
++  gpu_prof_marks_ = 0;
++  gpu_prof_cur_ = GpuProfSegment();
++  const int32_t every = REXCVAR_GET(diag_gpu_passes);
++  if (every <= 0 || gpu_prof_failed_ || gpu_prof_pending_marks_) return;
++  if (++gpu_prof_frame_ % uint32_t(every)) return;
++  if (!gpu_prof_heap_) {
++    ID3D12Device* device = GetD3D12Provider().GetDevice();
++    D3D12_QUERY_HEAP_DESC heap_desc = {};
++    heap_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
++    heap_desc.Count = kGpuProfMaxMarks;
++    D3D12_RESOURCE_DESC buffer_desc;
++    ui::d3d12::util::FillBufferResourceDesc(buffer_desc, kGpuProfMaxMarks * sizeof(uint64_t),
++                                            D3D12_RESOURCE_FLAG_NONE);
++    if (FAILED(device->CreateQueryHeap(&heap_desc, IID_PPV_ARGS(&gpu_prof_heap_))) ||
++        FAILED(device->CreateCommittedResource(
++            &ui::d3d12::util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &buffer_desc,
++            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&gpu_prof_readback_)))) {
++      REXGPU_ERROR("NG2 GPU passes: could not create the timestamp resources");
++      gpu_prof_failed_ = true;
++      return;
++    }
++  }
++  gpu_prof_active_ = true;  // the next frame (after this swap) is profiled
++}
++
++void D3D12CommandProcessor::GpuProfPoll() {
++  if (!gpu_prof_pending_marks_ || submission_completed_ < gpu_prof_pending_submission_) return;
++  const uint32_t n = gpu_prof_pending_marks_;
++  gpu_prof_pending_marks_ = 0;
++  UINT64 freq = 0;
++  GetD3D12Provider().GetDirectQueue()->GetTimestampFrequency(&freq);
++  void* mapping = nullptr;
++  D3D12_RANGE read_range = {0, n * sizeof(uint64_t)};
++  if (!freq || FAILED(gpu_prof_readback_->Map(0, &read_range, &mapping))) return;
++  std::vector<uint64_t> t(n);
++  std::memcpy(t.data(), mapping, n * sizeof(uint64_t));
++  D3D12_RANGE written_range = {0, 0};
++  gpu_prof_readback_->Unmap(0, &written_range);
++  auto ms = [&](uint64_t a, uint64_t b) { return b > a ? double(b - a) * 1000.0 / double(freq) : 0.0; };
++  uint32_t draws = 0;
++  for (const auto& seg : gpu_prof_pending_segments_) draws += seg.draws;
++  REXGPU_INFO("NG2 GPU passes: frame {:.3f} ms GPU, {} segments, {} draws", ms(t[0], t[n - 1]),
++              n - 1, draws);
++  if (REXCVAR_GET(diag_gpu_passes_per_draw)) {
++    // Totals per shader pair (+ target size), most expensive first.
++    struct Total { double ms = 0; uint32_t draws = 0; uint32_t pitch = 0; float vw = 0, vh = 0; };
++    std::unordered_map<std::string, Total> totals;
++    for (uint32_t i = 1; i < n && i - 1 < gpu_prof_pending_segments_.size(); ++i) {
++      const GpuProfSegment& seg = gpu_prof_pending_segments_[i - 1];
++      if (!seg.draws) continue;
++      Total& tot = totals[fmt::format("vs {:016X} ps {:016X}", seg.vs, seg.ps)];
++      tot.ms += ms(t[i - 1], t[i]);
++      tot.draws += seg.draws;
++      tot.pitch = seg.surface_info & 0x3FFF;
++      tot.vw = seg.viewport_w;
++      tot.vh = seg.viewport_h;
++    }
++    std::vector<std::pair<std::string, Total>> sorted(totals.begin(), totals.end());
++    std::sort(sorted.begin(), sorted.end(),
++              [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
++    for (size_t i = 0; i < sorted.size() && i < 25; ++i) {
++      REXGPU_INFO("NG2 GPU shaders {:2}: {:7.3f} ms draws {:4} {} pitch {} vp {:.0f}x{:.0f}", i + 1,
++                  sorted[i].second.ms, sorted[i].second.draws, sorted[i].first,
++                  sorted[i].second.pitch, sorted[i].second.vw, sorted[i].second.vh);
++    }
++    return;
++  }
++  for (uint32_t i = 1; i < n && i - 1 < gpu_prof_pending_segments_.size(); ++i) {
++    const GpuProfSegment& seg = gpu_prof_pending_segments_[i - 1];
++    // Surface pitch (pixels) / MSAA, color 0 EDRAM base + format, depth base + format.
++    const uint32_t pitch = seg.surface_info & 0x3FFF, msaa = (seg.surface_info >> 16) & 3;
++    REXGPU_INFO(
++        "NG2 GPU pass {:2}: {:7.3f} ms draws {:4} pitch {:4} msaa {} vp {:.0f}x{:.0f} "
++        "c0 {:08X} c1 {:08X} c2 {:08X} c3 {:08X} mask {:04X} z {:08X} vs {:016X} ps {:016X}{}",
++        i, ms(t[i - 1], t[i]), seg.draws, pitch, msaa, seg.viewport_w, seg.viewport_h,
++        seg.color_info[0], seg.color_info[1], seg.color_info[2], seg.color_info[3],
++        seg.color_mask & 0xFFFF, seg.depth_info, seg.vs, seg.ps,
++        seg.resolve ? fmt::format(" -> resolve dest {:08X} pitch {:08X} info {:08X} ctl {:08X}",
++                                  seg.copy_dest_base, seg.copy_dest_pitch, seg.copy_dest_info,
++                                  seg.copy_control)
++                    : std::string(" (target change / swap)"));
++  }
++}
++
+ void D3D12CommandProcessor::OnPrimaryBufferEnd() {
+-  if (REXCVAR_GET(d3d12_submit_on_primary_buffer_end) && submission_open_ &&
++  if (REXCVAR_GET(d3d12_submit_on_primary_buffer_end) && submission_open_ && !gpu_prof_active_ &&
+       CanEndSubmissionImmediately()) {
+     EndSubmission(false);
+   }
+@@ -2283,6 +2448,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+     // Special copy handling.
+     return IssueCopy();
+   }
++  if (gpu_prof_active_) GpuProfOnDraw();  // NG2 DIAG
+ 
+   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
+ 
+@@ -2880,8 +3046,10 @@ bool D3D12CommandProcessor::IssueCopy() {
+   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
+   if (readback_mode == ReadbackResolveMode::kDisabled) {
+     uint32_t written_address, written_length;
+-    return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+-                                         written_address, written_length);
++    const bool resolved = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
++                                                        written_address, written_length);
++    if (gpu_prof_active_) GpuProfMark(true);  // NG2 DIAG
++    return resolved;
+   }
+   return IssueCopy_ReadbackResolvePath();
+ }
+@@ -3092,6 +3260,13 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
    bool should_copy = (readback_mode == ReadbackResolveMode::kSome) ? is_cache_miss : true;
    if (should_copy && rb.buffers[read_index] && written_length <= rb.sizes[read_index] &&
        rb.mapped_data[read_index]) {
