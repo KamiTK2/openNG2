@@ -178,6 +178,12 @@ class RecompOptionsPane : public rex::ui::ImGuiDialog {
   void StartUpdateCheck();
   void DrawUpdateNotice(ImGuiIO& io, int64_t now);
   void OpenUpdater();
+  // Launcher finished building an update and waits for the game to close (issue #2).
+  void PollUpdateReady(int64_t now);
+  bool DrawUpdateReadyNotice(ImGuiIO& io, int64_t now);  // true when it drew (or owns the spot)
+  void RestartForUpdate();
+  void RestartAfterNextSave();
+  int64_t LatestSaveWriteStamp() const;
 
   rex::ui::Window* window_;
   std::filesystem::path settings_path_;
@@ -220,6 +226,16 @@ class RecompOptionsPane : public rex::ui::ImGuiDialog {
   std::shared_ptr<UpdateCheckState> update_;
   int64_t update_notice_until_ms_ = -1;  // 0 = hidden for good (gameplay was reached)
   std::string update_label_;  // row label storage for the current frame
+  // Update ready (launcher waiting): version, or empty when no launcher is waiting.
+  std::string ready_version_;
+  int64_t ready_poll_ms_ = 0;
+  bool ready_notice_hidden_ = false;      // LATER clicked (System > Update still offers it)
+  int64_t ready_toast_until_ms_ = -1;     // gameplay toast (-1 = not shown yet)
+  bool restart_after_save_ = false;
+  int64_t save_baseline_ = 0;             // newest save write when "after next save" was chosen
+  int64_t save_seen_ = 0;                 // newest save write seen since
+  int64_t save_changed_at_ms_ = 0;        // when save_seen_ last changed (waits for writes to settle)
+  bool restarting_ = false;
 };
 
 }  // namespace ng2

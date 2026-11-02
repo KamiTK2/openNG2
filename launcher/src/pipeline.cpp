@@ -508,12 +508,26 @@ bool Pipeline::Finish(const BuildRequest& r) {
   std::error_code ec;
   const fs::path out = r.install_dir / "build" / "out";
   // An update can be built while the old version is still being played; its files can only be
-  // replaced once it is closed.
+  // replaced once it is closed. Meanwhile the ready marker tells the running game, which offers
+  // Restart now / Restart after next save (GitHub issue #2).
+  const fs::path ready_marker = r.install_dir / openng2::kUpdateReadyFile;
+  const fs::path restart_request = r.install_dir / openng2::kUpdateRestartFile;
+  if (GameRunning(r.install_dir)) {
+    std::ofstream m(ready_marker, std::ios::trunc);
+    m << "version=" << openng2::kVersion << "\n" << "pid=" << GetCurrentProcessId() << "\n";
+  } else {
+    fs::remove(restart_request, ec);  // stale request from an earlier session
+  }
   while (GameRunning(r.install_dir)) {
-    if (Cancelled()) return false;
-    SetDetail(kStepFinish, "Close Ninja Gaiden II to finish installing the update...", -1.0f);
+    if (Cancelled()) {
+      fs::remove(ready_marker, ec);
+      return false;
+    }
+    SetDetail(kStepFinish, "Close Ninja Gaiden II to finish installing the update (it shows a restart notice)...",
+              -1.0f);
     Sleep(1000);
   }
+  fs::remove(ready_marker, ec);
   SetDetail(kStepFinish, "", -1.0f);
   for (const auto& e : fs::directory_iterator(out, ec)) {
     const fs::path& p = e.path();
@@ -542,6 +556,12 @@ bool Pipeline::Finish(const BuildRequest& r) {
     info << "version=" << openng2::kVersion << "\n" << "launcher=" << PathText(fs::path(self)) << "\n";
   }
   Log("Installed: " + PathText(exe_path_) + " (openNG2 " + openng2::kVersion + ")");
+  if (fs::exists(restart_request, ec)) {
+    // The game quit for this update: start the new version.
+    fs::remove(restart_request, ec);
+    Log("Restarting the game (it closed for the update).");
+    ShellExecuteW(nullptr, L"open", exe_path_.c_str(), nullptr, r.install_dir.c_str(), SW_SHOW);
+  }
   End(kStepFinish, StepState::kDone);
   return true;
 }

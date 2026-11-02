@@ -26,6 +26,15 @@ inline constexpr char kVersion[] = "dev";
 // which launcher built it (the game opens that launcher to update).
 inline constexpr char kInstallInfoFile[] = "openNG2-install.ini";
 
+// Update hand-over between the launcher and a running game (both next to ng2.exe):
+// - kUpdateReadyFile: written by the launcher while a rebuilt update waits for the game to
+//   close ("version=<v>" and "pid=<launcher process id>" lines); removed when it stops waiting.
+//   The game shows "update ready" with Restart now / Restart after next save.
+// - kUpdateRestartFile: written by the game just before it quits for the update; the launcher
+//   starts the new ng2.exe once it is installed, then removes the file.
+inline constexpr char kUpdateReadyFile[] = "openNG2-update-ready";
+inline constexpr char kUpdateRestartFile[] = "openNG2-update-restart";
+
 struct ReleaseInfo {
   bool ok = false;
   std::string error;      // when !ok

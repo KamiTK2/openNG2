@@ -907,6 +907,173 @@ void RecompOptionsPane::DrawUpdateNotice(ImGuiIO& io, int64_t now) {
   }
 }
 
+// ---- update ready (launcher waiting for the game to close; GitHub issue #2) -------------
+
+namespace {
+std::filesystem::path ExeDir() {
+  wchar_t exe[MAX_PATH * 2];
+  GetModuleFileNameW(nullptr, exe, DWORD(std::size(exe)));
+  return std::filesystem::path(exe).parent_path();
+}
+bool ProcessAlive(DWORD pid) {
+  if (!pid) return false;
+  HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (!h) return false;
+  DWORD code = 0;
+  const bool alive = GetExitCodeProcess(h, &code) && code == STILL_ACTIVE;
+  CloseHandle(h);
+  return alive;
+}
+}  // namespace
+
+// Newest write time of any profile's NG2 save data (<user data>/<xuid>/544307D5/...).
+int64_t RecompOptionsPane::LatestSaveWriteStamp() const {
+  std::error_code ec;
+  int64_t newest = 0;
+  for (const auto& profile : std::filesystem::directory_iterator(user_data_root_, ec)) {
+    const std::string name = profile.path().filename().string();
+    if (!profile.is_directory(ec) || name.size() != 16 || name == "0000000000000000") continue;
+    const auto title = profile.path() / "544307D5";
+    if (!std::filesystem::is_directory(title, ec)) continue;
+    for (auto it = std::filesystem::recursive_directory_iterator(title, ec);
+         !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+      if (!it->is_regular_file(ec)) continue;
+      const auto t = it->last_write_time(ec);
+      if (!ec) newest = std::max<int64_t>(newest, t.time_since_epoch().count());
+    }
+  }
+  return newest;
+}
+
+void RecompOptionsPane::PollUpdateReady(int64_t now) {
+  if (now - ready_poll_ms_ < 1000) return;
+  ready_poll_ms_ = now;
+  std::string version;
+  DWORD pid = 0;
+  {
+    std::ifstream f(ExeDir() / openng2::kUpdateReadyFile);
+    std::string line;
+    while (std::getline(f, line)) {
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+      if (line.rfind("version=", 0) == 0) version = line.substr(8);
+      if (line.rfind("pid=", 0) == 0) pid = DWORD(std::strtoul(line.c_str() + 4, nullptr, 10));
+    }
+  }
+  // Only while the launcher that wrote it is still waiting (a closed launcher installs nothing).
+  if (!version.empty() && !ProcessAlive(pid)) version.clear();
+  if (version != ready_version_) {
+    if (!version.empty()) REXLOG_INFO("UPDATE: openNG2 {} is built and ready (launcher pid {})", version, pid);
+    ready_version_ = version;
+    if (version.empty()) restart_after_save_ = false;
+  }
+  if (ready_version_.empty() || !restart_after_save_ || restarting_) return;
+  const int64_t stamp = LatestSaveWriteStamp();
+  if (stamp != save_seen_) {
+    save_seen_ = stamp;
+    save_changed_at_ms_ = now;
+  }
+  // A save was written after the choice: restart once its files have been quiet for 3 s.
+  if (save_seen_ > save_baseline_ && now - save_changed_at_ms_ >= 3000) {
+    REXLOG_INFO("UPDATE: save written, restarting for the update");
+    RestartForUpdate();
+  }
+}
+
+void RecompOptionsPane::RestartAfterNextSave() {
+  restart_after_save_ = true;
+  save_baseline_ = save_seen_ = LatestSaveWriteStamp();
+  save_changed_at_ms_ = NowMs();
+  REXLOG_INFO("UPDATE: will restart after the next save");
+}
+
+// Quits like the window's close button; the waiting launcher installs the update and starts
+// the new version because of the restart request file.
+void RecompOptionsPane::RestartForUpdate() {
+  if (restarting_) return;
+  restarting_ = true;
+  {
+    std::ofstream f(ExeDir() / openng2::kUpdateRestartFile, std::ios::trunc);
+    f << "version=" << ready_version_ << "\n";
+  }
+  REXLOG_INFO("UPDATE: closing the game to install openNG2 {}", ready_version_);
+  HWND h = window_ ? static_cast<HWND>(window_->GetNativeWindowHandle()) : nullptr;
+  if (h) PostMessageW(h, WM_CLOSE, 0, 0);
+}
+
+// Update ready notice: in menus with RESTART NOW / AFTER NEXT SAVE / LATER (mouse; keyboard and
+// controller use System > Update), and once as a short text-only toast in gameplay.
+bool RecompOptionsPane::DrawUpdateReadyNotice(ImGuiIO& io, int64_t now) {
+  if (ready_version_.empty()) return false;
+  const bool gameplay = Ng2InGameplay();
+  std::string text;
+  bool buttons = false;
+  if (restarting_) {
+    text = "Closing to install openNG2 " + ready_version_ + " - it restarts by itself";
+  } else if (gameplay) {
+    if (ready_toast_until_ms_ < 0) ready_toast_until_ms_ = now + 8000;
+    if (restart_after_save_ || now >= ready_toast_until_ms_) return true;
+    text = "openNG2 " + ready_version_ + " is ready - pause the game to restart and update";
+  } else if (restart_after_save_) {
+    text = "openNG2 " + ready_version_ + " installs after your next save";
+    buttons = true;  // RESTART NOW only
+  } else {
+    if (ready_notice_hidden_) return true;
+    text = "openNG2 " + ready_version_ + " is ready to install - restart the game?";
+    buttons = true;
+  }
+  struct Btn {
+    const char* label;
+    int id;
+  };
+  std::vector<Btn> btns;
+  if (buttons) {
+    btns.push_back({"RESTART NOW", 0});
+    if (!restart_after_save_) {
+      btns.push_back({"AFTER NEXT SAVE", 1});
+      btns.push_back({"LATER", 2});
+    }
+  }
+  ImFont* f = g_serif_font ? g_serif_font : ImGui::GetFont();
+  const float size = io.DisplaySize.y * 0.03f;
+  const float pad = size * 0.6f, vpad = size * 0.35f;
+  const ImVec2 ts = f->CalcTextSizeA(size, FLT_MAX, 0.0f, text.c_str());
+  std::vector<float> widths;
+  float buttons_w = 0.0f;
+  for (const auto& b : btns) {
+    widths.push_back(f->CalcTextSizeA(size, FLT_MAX, 0.0f, b.label).x + pad * 2.0f);
+    buttons_w += (buttons_w == 0.0f ? pad : vpad) + widths.back();
+  }
+  const ImVec2 at(io.DisplaySize.x - ts.x - buttons_w - size * 1.2f, io.DisplaySize.y - ts.y - size * 1.2f);
+  ImDrawList* dl = ImGui::GetForegroundDrawList();
+  const ImVec2 box0(at.x - pad, at.y - vpad);
+  const ImVec2 box1(at.x + ts.x + buttons_w + (btns.empty() ? pad : vpad), at.y + ts.y + vpad);
+  dl->AddRectFilled(box0, box1, IM_COL32(0, 0, 0, 185), size * 0.3f);
+  dl->AddRectFilled(box0, ImVec2(at.x - pad + size * 0.15f, box1.y), kRedMarker);
+  dl->AddText(f, size, at, kWhite, text.c_str());
+  float x = at.x + ts.x;
+  for (size_t i = 0; i < btns.size(); ++i) {
+    x += i == 0 ? pad : vpad;
+    const float w = widths[i];
+    const ImVec2 b0(x, at.y - vpad * 0.6f), b1(x + w, at.y + ts.y + vpad * 0.6f);
+    const ImVec2 m = io.MousePos;
+    const bool hover = m.x >= b0.x && m.x < b1.x && m.y >= b0.y && m.y < b1.y;
+    const bool primary = btns[i].id == 0;
+    dl->AddRectFilled(b0, b1,
+                      primary ? (hover ? IM_COL32(230, 40, 30, 255) : IM_COL32(170, 20, 14, 255))
+                              : (hover ? IM_COL32(95, 92, 88, 255) : IM_COL32(60, 58, 56, 255)),
+                      size * 0.2f);
+    dl->AddText(f, size, ImVec2(x + pad, at.y), kWhite, btns[i].label);
+    if (hover && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+      if (btns[i].id == 0) RestartForUpdate();
+      if (btns[i].id == 1) RestartAfterNextSave();
+      if (btns[i].id == 2) ready_notice_hidden_ = true;
+      break;
+    }
+    x += w;
+  }
+  return true;
+}
+
 RecompOptionsPane::RecompOptionsPane(rex::ui::ImGuiDrawer* drawer, rex::ui::Window* window,
                                      std::filesystem::path settings_path,
                                      std::filesystem::path user_data_root,
@@ -1251,7 +1418,8 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
     }
     if (start) StartUpdateCheck();
   }
-  DrawUpdateNotice(io, NowMs());
+  PollUpdateReady(NowMs());
+  if (!DrawUpdateReadyNotice(io, NowMs())) DrawUpdateNotice(io, NowMs());
 
   // In-game menu: A on Recomp Settings opens the full-screen panel.
   if (!overlay_open_ && ingame_row_selected_ && ingame_row_selected_() && pad_.accept) {
@@ -1505,7 +1673,23 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
           info = update_->info;
         }
         const bool newer = phase == 2 && info.ok && openng2::IsNewer(info.version, openng2::kVersion);
-        if (newer) {
+        if (!ready_version_.empty()) {
+          // The launcher has built the update and waits for the game to close.
+          update_label_ = "Restart Now to Install openNG2 " + ready_version_;
+          action_row(update_label_.c_str(), [this] {
+            RestartForUpdate();
+            return false;
+          });
+          action_row(restart_after_save_ ? "Restarting After the Next Save" : "Restart After the Next Save",
+                     [this] {
+                       RestartAfterNextSave();
+                       return false;
+                     });
+          if (restart_after_save_) {
+            rows.back().disabled = true;
+            rows.back().change = nullptr;
+          }
+        } else if (newer) {
           update_label_ = "Update to openNG2 " + info.version;
           action_row(update_label_.c_str(), [this] {
             OpenUpdater();
