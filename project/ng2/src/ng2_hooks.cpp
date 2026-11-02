@@ -862,6 +862,20 @@ extern "C" REX_FUNC(sub_823E1060) {
 }
 
 
+// Mission Mode (findings #66): when a mission is selected, sub_823E4720 sets the number of
+// selectable difficulties at [r31+48] from the mission's clear flags (high nibble of byte 7 of
+// its 8-byte record at [0x84C559E0] + 1016 + 8 * i: 0x10 -> 2, 0x20 -> 3, 0x40 / 0x80 -> 4,
+// none -> 1 = straight to costume selection); missions of table type 3 ([0x83B2E334 + 12 * i])
+// keep their fixed count. The hook runs right after the count is loaded into r11.
+void Ng2MissionDifficulties(PPCRegister& r11, PPCRegister& r31) {
+  if (!REXCVAR_GET(ng2_cheat_difficulties) || r11.u32 >= 4) return;
+  const uint32_t mission = GuestLoadU32(r31.u32 + 4);
+  if (mission >= 100 || GuestLoadU32(0x83B2E334 + mission * 12) == 3) return;
+  r11.u64 = 4;
+  auto* mem = REX_KERNEL_STATE()->memory();
+  rex::memory::store_and_swap<uint32_t>(mem->TranslateVirtual(r31.u32 + 48), 4u);
+}
+
 // ---- In-game Options > Recomp Settings ----------------------------------------------------------
 // The in-game menu ("In-Game Manual and Options", opened with Back in gameplay) is built by
 // sub_83695478 (vtable 0x822866C4 slot 0) each time it opens: 12 row objects, pointers at

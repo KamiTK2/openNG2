@@ -57,6 +57,13 @@ return = true
 address = 0x822F3570
 name = "Ng2SpinYield"
 
+# Mission Mode: number of selectable difficulties for the chosen mission, just loaded into r11
+# from [r31+48] in sub_823E4720; the difficulty cheat raises it to 4 (findings #66).
+[[entrypoint.midasm_hook]]
+address = 0x823E4A48
+name = "Ng2MissionDifficulties"
+registers = ["r11", "r31"]
+
 # D3D present (calls VdSwap once per game frame): counts frames for the FPS counter.
 [[entrypoint.midasm_hook]]
 address = 0x8376A9F8
