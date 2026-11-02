@@ -1733,7 +1733,7 @@ index 8f2fcb0..24aca99 100644
                                               uint32_t title_id, bool blocking) {
    if (!REXCVAR_GET(store_shaders)) {
 diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
-index ec0df7c..3cacac6 100644
+index ec0df7c..0e41cd5 100644
 --- a/src/graphics/shared_memory.cpp
 +++ b/src/graphics/shared_memory.cpp
 @@ -10,6 +10,7 @@
@@ -1769,7 +1769,7 @@ index ec0df7c..3cacac6 100644
        uint32_t page_first = range.first >> page_size_log2_;
        uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
        uint32_t block_first = page_first >> 6;
-@@ -453,7 +459,49 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+@@ -453,7 +459,80 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
          append_upload_range(range_start, page_last + 1 - range_start);
        }
      }
@@ -1787,6 +1787,31 @@ index ec0df7c..3cacac6 100644
 +      // sequentially): later draws' data, not other frames' buffers still being written.
 +      constexpr uint32_t kAheadBytes = 8u << 20;
 +      std::vector<std::pair<uint32_t, uint32_t>> ahead;
++      // Hot pages may have been released by the guest since they were uploaded (e.g. the
++      // intro movie buffers after the logos); released physical pages are NoAccess on the
++      // host, so copying them crashes (GitHub issue #4). Keep only readable pages.
++      memory::BaseHeap* physical_heap = memory_.GetPhysicalHeap();
++      const uint32_t page_size = uint32_t(1) << page_size_log2_;
++      auto add_readable = [&](uint32_t a, uint32_t b) {  // [a, b), page-aligned
++        if (physical_heap->QueryRangeAccess(a, b - 1) != rex::memory::PageAccess::kNoAccess) {
++          ahead.emplace_back(a, b - a);
++          return;
++        }
++        uint32_t run_start = a;
++        bool run_open = false;
++        for (uint32_t p = a; p < b; p += page_size) {
++          const bool readable = physical_heap->QueryRangeAccess(p, p + page_size - 1) !=
++                                rex::memory::PageAccess::kNoAccess;
++          if (readable && !run_open) {
++            run_start = p;
++            run_open = true;
++          } else if (!readable && run_open) {
++            ahead.emplace_back(run_start, p - run_start);
++            run_open = false;
++          }
++        }
++        if (run_open) ahead.emplace_back(run_start, b - run_start);
++      };
 +      for (const auto& req : merged_ranges) {
 +        const uint64_t lo = req.first, hi = std::min<uint64_t>(uint64_t(req.first) + req.second +
 +                                                                    kAheadBytes, kBufferSize);
@@ -1796,7 +1821,13 @@ index ec0df7c..3cacac6 100644
 +        for (; it != hot_merged_.end() && it->first < hi; ++it) {
 +          const uint64_t a = std::max<uint64_t>(it->first, lo);
 +          const uint64_t b = std::min<uint64_t>(uint64_t(it->first) + it->second, hi);
-+          if (a < b) ahead.emplace_back(uint32_t(a), uint32_t(b - a));
++          if (a < b) {
++            // Page-align (collect_invalid works on whole pages anyway).
++            const uint64_t pa = a & ~uint64_t(page_size - 1);
++            const uint64_t pb = std::min<uint64_t>((b + page_size - 1) & ~uint64_t(page_size - 1),
++                                                   kBufferSize);
++            add_readable(uint32_t(pa), uint32_t(pb));
++          }
 +        }
 +      }
 +      std::sort(ahead.begin(), ahead.end());
@@ -1819,7 +1850,7 @@ index ec0df7c..3cacac6 100644
  
    COUNT_profile_set("gpu/shared_memory/request_ranges_count", uint32_t(count));
    COUNT_profile_set("gpu/shared_memory/request_ranges_merged_count",
-@@ -468,6 +516,30 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+@@ -468,6 +547,30 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
    return UploadRanges(upload_ranges_);
  }
  
