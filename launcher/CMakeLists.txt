@@ -9,6 +9,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Static C/C++ runtime: the launcher runs on a fresh Windows install with nothing else present.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 
+# Re-configure when VERSION changes.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../VERSION")
 if(NOT OPENNG2_VERSION)  # -DOPENNG2_VERSION=... overrides (update tests)
     file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/../VERSION" OPENNG2_VERSION LIMIT_COUNT 1)
 endif()

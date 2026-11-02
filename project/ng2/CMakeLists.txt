@@ -32,6 +32,7 @@ rexglue_setup_target(ng2 GPU_PLUGINS xenos)
 # openNG2 version (update check). The launcher passes it; a source checkout reads ../../VERSION.
 if(NOT OPENNG2_VERSION)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../VERSION")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../../VERSION")
         file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/../../VERSION" OPENNG2_VERSION LIMIT_COUNT 1)
     else()
         set(OPENNG2_VERSION "dev")
