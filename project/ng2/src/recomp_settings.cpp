@@ -9,6 +9,7 @@
 #include <xinput.h>
 
 #include <algorithm>
+#include <cstring>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -597,7 +598,7 @@ bool RecompSettings::Load(const std::filesystem::path& path) {
     // `present_vsync` = host present sync. The old `vsync` key (guest vblank) is ignored.
     else if (k == "present_vsync") vsync = ParseBool(v, vsync);
     else if (k == "monitor") monitor = ParseInt(v, monitor, 0, 16);
-    else if (k == "resolution_scale") resolution_scale = ParseInt(v, resolution_scale, 1, 3);
+    else if (k == "resolution_scale") resolution_scale = ParseInt(v, resolution_scale, 1, 5);
     else if (k == "swap_post_effect") anti_aliasing = AaFromCvar(v);
     else if (k == "present_effect") upscaler = UpscalerFromCvar(v);
     else if (k == "ng2_sharpness") sharpness = ParseInt(v, sharpness, 0, 10);
@@ -783,7 +784,7 @@ RecompOptionsPane::RecompOptionsPane(rex::ui::ImGuiDrawer* drawer, rex::ui::Wind
   settings_.Load(settings_path_);
   // Show what this session actually runs with (may come from the command line).
   settings_.resolution_scale =
-      std::clamp(std::atoi(rex::cvar::GetFlagByName("resolution_scale").c_str()), 1, 3);
+      std::clamp(std::atoi(rex::cvar::GetFlagByName("resolution_scale").c_str()), 1, 5);
   settings_.monitor = std::clamp(std::atoi(rex::cvar::GetFlagByName("monitor").c_str()), 0, 16);
   settings_.anti_aliasing = AaFromCvar(rex::cvar::GetFlagByName("swap_post_effect"));
   // Upscaling is live, but show what is running (it may come from the command line).
@@ -1223,7 +1224,7 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
     case 1: {  // Graphics
       std::snprintf(buf, sizeof(buf), "%d x %d", kBaseWidth * s.resolution_scale,
                     kBaseHeight * s.resolution_scale);
-      step_row("Internal Resolution", buf, s.resolution_scale, 1, 3, 1,
+      step_row("Internal Resolution", buf, s.resolution_scale, 1, 5, 1,
                [&s](int v) { s.resolution_scale = v; });
       const char* aa[] = {"Off", "FXAA", "FXAA Extreme"};
       step_row("Anti-Aliasing", aa[s.anti_aliasing], s.anti_aliasing, 0, 2, 1,
@@ -1550,6 +1551,13 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
   if (needs_restart) {
     text_at(X(L.label_x), fy, kGrey, "Some changes apply the next time the game starts.", false,
             note_px);
+    fy += note_px * 1.5f;
+  }
+  // Hint for the row under the cursor.
+  if (focused_ && row_ >= 0 && row_ < int(rows.size()) &&
+      std::strcmp(rows[row_].label, "Internal Resolution") == 0) {
+    text_at(X(L.label_x), fy, kGrey,
+            "Render sizes above 1x may slow the game depending on your hardware.", false, note_px);
     fy += note_px * 1.5f;
   }
   if (now < status_until_ms_) text_at(X(L.label_x), fy, kWhite, status_.c_str(), false, note_px);
