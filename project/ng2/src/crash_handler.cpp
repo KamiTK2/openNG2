@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -281,6 +282,9 @@ bool Ng2InGameplay();  // ng2_hooks.cpp
 
 namespace {
 
+std::atomic<int> g_f9_presses{0};  // F9 marker count (watch can wait for it)
+bool g_watch_wait_f9 = false;
+
 constexpr int kWatchSlots = 512;
 std::atomic<uint64_t> g_watch_pc[kWatchSlots];
 std::atomic<uint32_t> g_watch_count[kWatchSlots];
@@ -348,8 +352,15 @@ void SetWatchRegs(const std::vector<uint32_t>& guest_addrs) {
 }
 
 void RunWatch(std::vector<uint32_t> addrs) {
-  REXLOG_WARN("[watch] armed for {} address(es), waiting for gameplay", addrs.size());
-  for (int i = 0; i < 6000 && !::Ng2InGameplay(); ++i) Sleep(100);
+  if (g_watch_wait_f9) {
+    REXLOG_WARN("[watch] armed for {} address(es), waiting for F9", addrs.size());
+    const int start = g_f9_presses.load();
+    for (int i = 0; i < 6000 && g_f9_presses.load() == start; ++i) Sleep(20);
+  } else {
+    REXLOG_WARN("[watch] armed for {} address(es), waiting for gameplay", addrs.size());
+    for (int i = 0; i < 6000 && !::Ng2InGameplay(); ++i) Sleep(100);
+  }
+  REXLOG_WARN("[watch] started");
   static bool veh = false;
   if (!veh) {
     AddVectoredExceptionHandler(1, WatchVeh);
@@ -406,9 +417,16 @@ void InstallCrashHandler_Watch() {
       if (!f) continue;
       std::vector<uint32_t> addrs;
       g_watch_lens.clear();
+      g_watch_wait_f9 = false;
+      int repeat = 1;
       char line[128];
       while (addrs.size() < 4 && fgets(line, sizeof(line), f)) {
         unsigned v = 0, len = 4;
+        if (std::strncmp(line, "wait_f9", 7) == 0) {
+          g_watch_wait_f9 = true;
+          continue;
+        }
+        if (std::sscanf(line, "repeat %d", &repeat) == 1) continue;
         if (sscanf(line, "%x %u", &v, &len) >= 1) {
           addrs.push_back(v);
           g_watch_lens.push_back(len == 8 ? 8 : 4);
@@ -416,12 +434,76 @@ void InstallCrashHandler_Watch() {
       }
       fclose(f);
       DeleteFileW(path.c_str());
-      if (!addrs.empty()) RunWatch(addrs);
+      for (int r = 0; r < std::max(1, repeat) && !addrs.empty(); ++r) RunWatch(addrs);
     }
   }).detach();
 }
 
 }  // namespace
+
+// NG2 DIAG: grab a burst of frames from our own window (PrintWindow, full content), saved as
+// downscaled BMPs next to ng2.exe: effect_<tag>_<n>.bmp. For effects too short to screenshot.
+void Ng2CaptureBurst(const char* tag) {
+  static std::atomic<int> bursts{0};
+  static std::atomic<bool> busy{false};
+  if (bursts.load() >= 6 || busy.exchange(true)) return;
+  const int burst = ++bursts;
+  std::string t = tag;
+  std::thread([burst, t] {
+    HWND hwnd = nullptr;
+    EnumWindows(
+        [](HWND h, LPARAM p) -> BOOL {
+          DWORD pid = 0;
+          GetWindowThreadProcessId(h, &pid);
+          if (pid == GetCurrentProcessId() && IsWindowVisible(h)) {
+            *reinterpret_cast<HWND*>(p) = h;
+            return FALSE;
+          }
+          return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&hwnd));
+    if (hwnd) {
+      RECT rc;
+      GetClientRect(hwnd, &rc);
+      const int w = rc.right, h = rc.bottom, ow = 1280, oh = std::max(1, h * 1280 / std::max(1, w));
+      HDC wdc = GetDC(hwnd);
+      for (int n = 0; n < 10; ++n) {
+        HDC full = CreateCompatibleDC(wdc), small = CreateCompatibleDC(wdc);
+        HBITMAP fb = CreateCompatibleBitmap(wdc, w, h), sb = CreateCompatibleBitmap(wdc, ow, oh);
+        HGDIOBJ of = SelectObject(full, fb), os = SelectObject(small, sb);
+        PrintWindow(hwnd, full, 3 /* PW_CLIENTONLY | PW_RENDERFULLCONTENT */);
+        SetStretchBltMode(small, HALFTONE);
+        StretchBlt(small, 0, 0, ow, oh, full, 0, 0, w, h, SRCCOPY);
+        BITMAPINFO bi{};
+        bi.bmiHeader = {sizeof(BITMAPINFOHEADER), ow, oh, 1, 24, BI_RGB};
+        const int stride = (ow * 3 + 3) & ~3;
+        std::vector<uint8_t> px(size_t(stride) * oh);
+        GetDIBits(small, sb, 0, oh, px.data(), &bi, DIB_RGB_COLORS);
+        const std::wstring path = ExeDir() + L"effect_" + std::wstring(t.begin(), t.end()) +
+                                  L"_" + std::to_wstring(burst) + L"_" + std::to_wstring(n) + L".bmp";
+        if (FILE* f = _wfopen(path.c_str(), L"wb")) {
+          BITMAPFILEHEADER fh{0x4D42, DWORD(sizeof(fh) + sizeof(BITMAPINFOHEADER) + px.size()), 0, 0,
+                              DWORD(sizeof(fh) + sizeof(BITMAPINFOHEADER))};
+          fwrite(&fh, sizeof(fh), 1, f);
+          fwrite(&bi.bmiHeader, sizeof(BITMAPINFOHEADER), 1, f);
+          fwrite(px.data(), 1, px.size(), f);
+          fclose(f);
+        }
+        SelectObject(full, of);
+        SelectObject(small, os);
+        DeleteObject(fb);
+        DeleteObject(sb);
+        DeleteDC(full);
+        DeleteDC(small);
+        Sleep(50);
+      }
+      ReleaseDC(hwnd, wdc);
+      REXLOG_WARN("[capture] effect burst {} saved ({})", burst, t);
+    }
+    Sleep(3000);  // cooldown
+    busy = false;
+  }).detach();
+}
 
 void InstallCrashHandler() {
   InstallCrashHandler_Watch();
@@ -447,7 +529,10 @@ void InstallCrashHandler() {
         static bool f9_was_down = false;
         static int marks = 0;
         const bool f9 = pid == GetCurrentProcessId() && (GetAsyncKeyState(VK_F9) & 0x8000);
-        if (f9 && !f9_was_down) REXLOG_WARN("[mark] MARK {}", ++marks);
+        if (f9 && !f9_was_down) {
+          REXLOG_WARN("[mark] MARK {}", ++marks);
+          g_f9_presses.fetch_add(1);
+        }
         f9_was_down = f9;
       }
       WIN32_FIND_DATAW fd;

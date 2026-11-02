@@ -26,7 +26,7 @@ Hard = reverse-engineering + game patches.
 - [x] Internal resolution and anti-aliasing apply live, no restart (GPU context rebuild, findings #50)
 - [x] Framerate Cap 30 / 60 / 120 (Interpolation), default 60 (30 = display cap: NG2 is frame-locked, findings #30)
 - [x] Keyboard & mouse: rebinding (Recomp Settings > Keyboard & Mouse), free mouse look with sensitivity / invert / auto-center (findings #51/#52)
-      - [ ] mouse in all menus (crystal skull cursor)   - [ ] keyboard & mouse button prompts with the player's bindings   - [ ] Show Karma bind
+      - [ ] mouse in all menus (crystal skull cursor)   - [x] keyboard & mouse button prompts with the player's bindings (findings #54)   - [ ] Show Karma bind
 - [ ] Audio: speaker setup (stereo/5.1), Music / SFX / Voice volumes if the mixer exposes them
 - [x] Skip intro logos: System > Skip Intro (default Off) skips the NinjaVI movie and Team NINJA logo; title in ~4 s (findings #47)
 

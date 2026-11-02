@@ -48,6 +48,8 @@ void Ng2QueueSystemSound(uint32_t id);
 
 // True while the player is in control in gameplay (ng2_hooks.cpp render pass).
 bool Ng2InGameplay();
+// NG2 DIAG: on-screen name of the F9 aspect test mode, or nullptr when off.
+const char* Ng2AspectTestModeName();
 
 namespace ng2 {
 
@@ -64,6 +66,15 @@ inline constexpr int kBindCount = 16;
 inline constexpr int kBindLayoutVersion = 2;
 extern const BindDef kBindDefs[kBindCount];
 std::array<std::string, kBindCount> DefaultBinds();
+
+// Keyboard & mouse prompts (findings #54): the game's @[pad:NAME] tags are shown as the
+// player's key bindings while the last input came from the keyboard or mouse.
+bool PromptsUseKeyboard();
+uint32_t PromptLabelsVersion();  // changes when bindings change
+std::string PromptLabel(const std::string& tag, bool gameplay);  // "" = keep the icon
+void UpdatePromptDevice(const ImGuiIO& io);
+void PushPromptGlyph(float x0, float y0, float x1, float y1, const std::string& label);
+void DrawPromptGlyphs(const ImGuiIO& io);
 
 struct RecompSettings {
   // Display

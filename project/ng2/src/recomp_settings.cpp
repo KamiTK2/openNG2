@@ -303,7 +303,18 @@ std::atomic<float> g_mouse_sens_y{1.0f};
 std::atomic<bool> g_mouse_invert_y{false};
 std::atomic<bool> g_mouse_auto_center{false};
 
+std::atomic<uint32_t> g_prompt_labels_version{1};
+std::mutex g_prompt_binds_mutex;
+std::array<std::string, kBindCount> g_prompt_binds;
+// Keyboard prompts: true after the last input came from the keyboard or mouse.
+std::atomic<bool> g_prompts_keyboard{false};
+
 void PublishMnk(const RecompSettings& s) {
+  {
+    std::lock_guard<std::mutex> lock(g_prompt_binds_mutex);
+    g_prompt_binds = s.binds;
+  }
+  g_prompt_labels_version.fetch_add(1);
   g_mnk_enabled = s.mnk_enabled;
   g_mouse_camera = s.mouse_camera;
   g_mouse_sens_x = s.mouse_sens / 10.0f;
@@ -444,11 +455,13 @@ void InstallRecompInputFilters() {
       if (esc_context >= 0) b = uint16_t(b & ~XINPUT_GAMEPAD_START);
       if (esc_context == 0) b |= XINPUT_GAMEPAD_B;
       if (down(VK_BACK)) b |= XINPUT_GAMEPAD_B;
+      if (down('F')) b |= XINPUT_GAMEPAD_X;  // menu X / Y (mouse buttons are off in menus)
+      if (down('R')) b |= XINPUT_GAMEPAD_Y;
       g.buttons = b;
     }
-    // App-side binds (Cast Ninpo = Y+B). Mouse buttons only count in gameplay, like the SDK's.
-    if (g_mnk_enabled && OurWindowFocused() && !RecompSettingsBlocksGameInput()) {
-      const bool gameplay = Ng2InGameplay();
+    // App-side binds (Cast Ninpo = Y+B): gameplay only (in menus B would back out).
+    if (g_mnk_enabled && gameplay_now && OurWindowFocused() && !RecompSettingsBlocksGameInput()) {
+      const bool gameplay = true;
       std::lock_guard<std::mutex> lock(g_app_binds_mutex);
       for (const auto& ab : g_app_binds) {
         for (int vk : ab.vks) {
@@ -984,6 +997,18 @@ void RecompOptionsPane::LogFrameRate() {
 
 void RecompOptionsPane::OnDraw(ImGuiIO& io) {
   pad_.Poll();
+  UpdatePromptDevice(io);
+  DrawPromptGlyphs(io);
+  if (const char* aspect_test = Ng2AspectTestModeName()) {  // NG2 DIAG (ng2_aspect_cycle)
+    ImFont* f = g_serif_font ? g_serif_font : ImGui::GetFont();
+    const float size = io.DisplaySize.y * 0.03f;
+    const ImVec2 ts = f->CalcTextSizeA(size, FLT_MAX, 0.0f, aspect_test);
+    const ImVec2 at((io.DisplaySize.x - ts.x) * 0.5f, io.DisplaySize.y * 0.02f);
+    ImGui::GetForegroundDrawList()->AddRectFilled(ImVec2(at.x - 8, at.y - 4),
+                                                  ImVec2(at.x + ts.x + 8, at.y + ts.y + 4),
+                                                  IM_COL32(0, 0, 0, 170), 6.0f);
+    ImGui::GetForegroundDrawList()->AddText(f, size, at, IM_COL32(255, 230, 120, 255), aspect_test);
+  }
   // Mouse look (cursor capture, mouse buttons as game inputs) only while playing.
   rex::input::mnk::SetMouseLookActive(Ng2InGameplay() && !focused_ && !overlay_open_);
   {
@@ -1448,6 +1473,150 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
 MouseCameraParams GetMouseCameraParams() {
   return {g_mnk_enabled.load() && g_mouse_camera.load(), g_mouse_sens_x.load(),
           g_mouse_sens_y.load(), g_mouse_invert_y.load(), g_mouse_auto_center.load()};
+}
+
+// ---- keyboard & mouse prompts -----------------------------------------------------------
+// The game writes button prompts as @[pad:NAME] tags in its text (findings #54); with
+// keyboard prompts on, ng2_hooks.cpp replaces them with these labels.
+bool PromptsUseKeyboard() { return g_mnk_enabled.load() && g_prompts_keyboard.load(); }
+uint32_t PromptLabelsVersion() { return g_prompt_labels_version.load(); }
+
+std::string PromptLabel(const std::string& tag, bool gameplay) {
+  std::array<std::string, kBindCount> b;
+  {
+    std::lock_guard<std::mutex> lock(g_prompt_binds_mutex);
+    b = g_prompt_binds;
+  }
+  // First key of binding i (index into kBindDefs), pretty-printed.
+  auto key = [&](int i) {
+    std::string v = b[i];
+    const size_t comma = v.find(',');
+    if (comma != std::string::npos) v.resize(comma);
+    return v.empty() ? std::string() : PrettyBind(v);
+  };
+  auto both = [&](int i, int j) { return key(i) + "/" + key(j); };
+  enum { kFwd, kBack, kLeft, kRight, kJump, kQuick, kStrong, kProj, kNinpo, kBlock, kCenter,
+         kInteract, kLook, kQuickMenu, kOptions, kPause };
+  if (tag == "ActAttack") return key(kQuick);
+  if (tag == "ActStrong" || tag == "ActNinpo0") return key(kStrong);
+  if (tag == "ActProjectile" || tag == "ActNinpo1") return key(kProj);
+  if (tag == "ActJump") return key(kJump);
+  if (tag == "ActGuard") return key(kBlock);
+  if (tag == "ActCenterCamera") return key(kCenter);
+  if (tag == "ActLook") return key(kLook);
+  if (tag == "Interact") return key(kInteract);
+  if (tag == "Decide" || tag == "Proceed" || tag == "Skip") return "Enter";
+  if (tag == "Cancel") return "Esc";
+  if (tag == "Rd") return gameplay ? key(kJump) : "Enter";
+  if (tag == "Rr") return gameplay ? key(kProj) : "Esc";
+  if (tag == "Rl") return gameplay ? key(kQuick) : "F";
+  if (tag == "Ru") return gameplay ? key(kStrong) : "R";
+  if (tag == "L1") return key(kLook);
+  if (tag == "R1") return key(kInteract);
+  if (tag == "L2") return key(kBlock);
+  if (tag == "R2") return key(kCenter);
+  if (tag == "Start") return gameplay ? key(kPause) : "Enter";
+  if (tag == "Select") return key(kOptions);
+  if (tag == "Lu") return gameplay ? key(kQuickMenu) : "Up";
+  if (tag == "Ld") return "Down";
+  if (tag == "Ll") return "Left";
+  if (tag == "Lr") return "Right";
+  if (tag == "Lud") return "Up/Down";
+  if (tag == "Llr") return "Left/Right";
+  if (tag == "LS" || tag == "Stick") return key(kFwd) + key(kLeft) + key(kBack) + key(kRight);
+  if (tag == "LSu") return key(kFwd);
+  if (tag == "LSd") return key(kBack);
+  if (tag == "LSud") return both(kFwd, kBack);
+  if (tag == "LSlr") return both(kLeft, kRight);
+  if (tag == "RS" || tag == "RSud" || tag == "RSlr") return "Mouse";
+  return {};  // symbols (ninpo kanji, shuriken, plus, ...) keep their icon
+}
+
+// Last input device: called once per frame from the pane (UI thread).
+void UpdatePromptDevice(const ImGuiIO& io) {
+  bool pad = false;
+  for (DWORD i = 0; i < XUSER_MAX_COUNT && !pad; ++i) {
+    XINPUT_STATE st{};
+    if (XInputGetState(i, &st) != ERROR_SUCCESS) continue;
+    const auto& g = st.Gamepad;
+    pad = g.wButtons != 0 || g.bLeftTrigger > 40 || g.bRightTrigger > 40 ||
+          std::abs(int(g.sThumbLX)) > 12000 || std::abs(int(g.sThumbLY)) > 12000 ||
+          std::abs(int(g.sThumbRX)) > 12000 || std::abs(int(g.sThumbRY)) > 12000;
+  }
+  bool kbm = false;
+  if (OurWindowFocused()) {
+    kbm = io.MouseDelta.x != 0.0f || io.MouseDelta.y != 0.0f || io.MouseWheel != 0.0f;
+    for (int vk = 1; vk < 255 && !kbm; ++vk) {
+      if (vk >= 0x07 && vk <= 0x0F && vk != 0x08 && vk != 0x09 && vk != 0x0D) continue;
+      kbm = (GetAsyncKeyState(vk) & 0x8000) != 0;
+    }
+  }
+  static bool first = true;
+  if (first) {  // start with keyboard prompts when no controller is connected
+    first = false;
+    XINPUT_STATE st{};
+    bool any_pad = false;
+    for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i) any_pad |= XInputGetState(i, &st) == ERROR_SUCCESS;
+    g_prompts_keyboard = !any_pad;
+  }
+  if (pad) g_prompts_keyboard = false;
+  else if (kbm) g_prompts_keyboard = true;
+}
+
+// Button icons the game draws as sprites (pause / inventory menu) are replaced by key caps
+// drawn here (game thread pushes, UI thread draws; positions in the 1280x720 2D space).
+namespace {
+struct PromptGlyph {
+  float x0, y0, x1, y1;
+  std::string label;
+  int64_t at_ms;
+};
+std::mutex g_prompt_glyphs_mutex;
+std::vector<PromptGlyph> g_prompt_glyphs;
+}  // namespace
+
+void PushPromptGlyph(float x0, float y0, float x1, float y1, const std::string& label) {
+  std::lock_guard<std::mutex> lock(g_prompt_glyphs_mutex);
+  const int64_t now = NowMs();
+  for (auto& g : g_prompt_glyphs) {
+    if (std::abs(g.x0 - x0) < 1.0f && std::abs(g.y0 - y0) < 1.0f) {
+      g = {x0, y0, x1, y1, label, now};
+      return;
+    }
+  }
+  g_prompt_glyphs.push_back({x0, y0, x1, y1, label, now});
+}
+
+void DrawPromptGlyphs(const ImGuiIO& io) {
+  std::vector<PromptGlyph> glyphs;
+  {
+    std::lock_guard<std::mutex> lock(g_prompt_glyphs_mutex);
+    const int64_t now = NowMs();
+    g_prompt_glyphs.erase(std::remove_if(g_prompt_glyphs.begin(), g_prompt_glyphs.end(),
+                                         [now](const PromptGlyph& g) { return now - g.at_ms > 120; }),
+                          g_prompt_glyphs.end());
+    glyphs = g_prompt_glyphs;
+  }
+  if (glyphs.empty()) return;
+  const Viewport vp = GameViewport(io);
+  ImDrawList* dl = ImGui::GetForegroundDrawList();
+  ImFont* font = g_serif_font ? g_serif_font : ImGui::GetFont();
+  for (const auto& g : glyphs) {
+    const float sx = vp.w / 1280.0f, sy = vp.h / 720.0f;
+    // The game draws its labels over the lower half of the button icon; keep the cap small
+    // and in the icon's upper half so the label stays readable.
+    const float icon_h = (g.y1 - g.y0) * sy;
+    const float cx = vp.x + (g.x0 + g.x1) * 0.5f * sx, cy = vp.y + g.y0 * sy + icon_h * 0.30f;
+    const float h = icon_h * 0.42f;
+    const float px = h * 0.70f;
+    const ImVec2 ts = font->CalcTextSizeA(px, FLT_MAX, 0.0f, g.label.c_str());
+    const float w = std::max(h, ts.x + px * 0.7f);
+    const ImVec2 a(cx - w * 0.5f, cy - h * 0.5f), b(cx + w * 0.5f, cy + h * 0.5f);
+    dl->AddRectFilled(a, b, IM_COL32(20, 14, 14, 175), h * 0.25f);
+    dl->AddRect(a, b, IM_COL32(220, 210, 200, 220), h * 0.25f, 0, std::max(1.0f, h * 0.06f));
+    dl->AddText(font, px, ImVec2(cx - ts.x * 0.5f, cy - ts.y * 0.5f), IM_COL32(245, 240, 232, 255),
+                g.label.c_str());
+  }
 }
 
 }  // namespace ng2

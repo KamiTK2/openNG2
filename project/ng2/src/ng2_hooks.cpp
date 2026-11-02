@@ -203,7 +203,7 @@ REXCVAR_DEFINE_DOUBLE(ng2_aspect_ratio, 0.0, "NG2",
 namespace {
 constexpr uint32_t kAspectConstant = 0x8228EBDC;
 // Wide aspect for the camera (0 = native 16:9). The constant itself stays 16:9 except while a
-// camera builds its projection (WideAspectScope in sub_822FA8B8): every other reader (screen
+// camera builds its main projection (WideAspectScope in sub_822FB368): every other reader (screen
 // effects that size themselves from it showed black bands, findings #37/#53) sees 16:9.
 std::atomic<float> g_wide_aspect{0.0f};
 void ApplyAspectOverride() {
@@ -242,11 +242,25 @@ void WriteAspectConstant(float value) {
 // so this only documents which readers must not see the wide value.
 struct NativeAspectScope {};
 // The camera's projection is the one reader that gets the wide value (Hor+).
+// NG2 DIAG (ng2_aspect_cycle, F9): where the wide value applies. 0 = main projection only
+// (sub_822FB368), 1 = whole camera update (sub_822FA8B8), 2 = everywhere (constant stays wide),
+// 3 = nowhere (plain 16:9 view).
+std::atomic<int> g_aspect_scope_mode{0};
+}  // namespace
+REXCVAR_DEFINE_BOOL(ng2_aspect_cycle, false, "NG2", "Diagnostic: F9 cycles the ultrawide aspect scope");
+const char* Ng2AspectTestModeName() {
+  static const char* const kNames[] = {"Aspect test A: main projection wide",
+                                       "Aspect test B: camera update wide",
+                                       "Aspect test C: wide everywhere (old)",
+                                       "Aspect test D: plain 16:9 view"};
+  return REXCVAR_GET(ng2_aspect_cycle) ? kNames[g_aspect_scope_mode.load() & 3] : nullptr;
+}
+namespace {
 struct WideAspectScope {
   bool active;
-  WideAspectScope() {
+  explicit WideAspectScope(int mode) {
     const float wide = g_wide_aspect.load();
-    active = wide > 0.0f;
+    active = wide > 0.0f && g_aspect_scope_mode.load() == mode;
     if (active) WriteAspectConstant(wide);
   }
   ~WideAspectScope() {
@@ -266,6 +280,31 @@ void Ng2SkipCutsceneFrame();
 void Ng2OnPresent() {
   ng2::RecompCountGameFrame();
   ApplyAspectOverride();
+  if (rex::cvar::GetFlagByName("ng2_aspect_cycle") == "true") {
+    static bool was_down = false;
+    const bool down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+    if (down && !was_down) {
+      const int mode = (g_aspect_scope_mode.load() + 1) % 4;
+      g_aspect_scope_mode = mode;
+      static const char* const kNames[] = {"A: main projection", "B: camera update",
+                                           "C: everywhere", "D: 16:9 view"};
+      REXLOG_WARN("NG2 aspect test mode {}", kNames[mode]);
+    }
+    was_down = down;
+  }
+  {
+    // Mode C keeps the constant wide; the others keep it 16:9 outside their scope. Written
+    // only on a change: the camera thread may be inside a scope right now.
+    static int applied = -1;
+    static float applied_wide = -1.0f;
+    const int mode = g_aspect_scope_mode.load();
+    const float wide = g_wide_aspect.load();
+    if (mode != applied || (mode == 2 && wide != applied_wide)) {
+      applied = mode;
+      applied_wide = wide;
+      WriteAspectConstant(mode == 2 && wide > 0.0f ? wide : 16.0f / 9.0f);
+    }
+  }
   Ng2SkipCutsceneFrame();
 }
 
@@ -504,9 +543,64 @@ extern "C" REX_FUNC(sub_8368EA48) {
 // sprite paths use it: sub_8368FDA0 (vertices from sub_83690280) and sub_8368F568 (gauges,
 // e.g. the health bar fill). The presenter stretches the whole 16:9 frame to the display
 // aspect, so pre-squeeze x around the centre by the same factor: 2D ends up 16:9.
+namespace ng2 {
+bool PromptsUseKeyboard();
+std::string PromptLabel(const std::string& tag, bool gameplay);
+void PushPromptGlyph(float x0, float y0, float x1, float y1, const std::string& label);
+}  // namespace ng2
+REXCVAR_DEFINE_BOOL(ng2_prompt_diag, false, "NG2",
+                    "Log distinct sprites drawn in menu buckets (button icon search)");
 extern "C" REX_FUNC(__imp__sub_8368EFE8);
 extern "C" REX_FUNC(sub_8368EFE8) {
   const uint32_t vertices = ctx.r4.u32;
+  // Pause / inventory menu button icons (bucket 49): 59x59 quads on one texture strip,
+  // v = 0 X, .125 Y, .25 B, .375 A (pausediag-1, findings #54). With keyboard prompts the
+  // icon is not drawn; the settings overlay draws the key in its place.
+  if (g_draw_bucket == 49 && ng2::PromptsUseKeyboard()) {
+    auto* m = REX_KERNEL_STATE()->memory();
+    auto f = [&](uint32_t i, uint32_t off) {
+      return rex::memory::load_and_swap<float>(m->TranslateVirtual(vertices + i * 24 + off));
+    };
+    float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f, v0 = 1e9f;
+    for (uint32_t i = 0; i < 4; ++i) {
+      x0 = std::min(x0, f(i, 0)), x1 = std::max(x1, f(i, 0));
+      y0 = std::min(y0, f(i, 4)), y1 = std::max(y1, f(i, 4));
+      v0 = std::min(v0, f(i, 16));
+    }
+    const float slot = v0 / 0.125f;
+    const int idx = int(std::lround(slot));
+    if (std::abs(x1 - x0 - 59.0f) < 3.0f && std::abs(y1 - y0 - 59.0f) < 3.0f && idx >= 0 &&
+        idx <= 3 && std::abs(slot - float(idx)) < 0.02f) {
+      static const char* const kTags[] = {"Rl", "Ru", "Rr", "Rd"};
+      const std::string label = ng2::PromptLabel(kTags[idx], false);
+      if (!label.empty()) {
+        ng2::PushPromptGlyph(x0, y0, x1, y1, label);
+        return;
+      }
+    }
+  }
+  if (REXCVAR_GET(ng2_prompt_diag) &&
+      ((g_draw_bucket >= 49 && g_draw_bucket <= 50) || (g_draw_bucket >= 70 && g_draw_bucket <= 72))) {
+    auto* m = REX_KERNEL_STATE()->memory();
+    float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f, u0 = 1e9f, u1 = -1e9f, v0 = 1e9f, v1 = -1e9f;
+    for (uint32_t i = 0; i < 4; ++i) {
+      auto f = [&](uint32_t off) {
+        return rex::memory::load_and_swap<float>(m->TranslateVirtual(vertices + i * 24 + off));
+      };
+      x0 = std::min(x0, f(0)), x1 = std::max(x1, f(0)), y0 = std::min(y0, f(4)), y1 = std::max(y1, f(4));
+      u0 = std::min(u0, f(12)), u1 = std::max(u1, f(12)), v0 = std::min(v0, f(16)), v1 = std::max(v1, f(16));
+    }
+    static std::unordered_map<std::string, int> seen;
+    char key[160];
+    std::snprintf(key, sizeof(key), "%d %08X uv %.4f %.4f %.4f %.4f", g_draw_bucket,
+                  GuestLoadU32(ctx.r3.u32 + 8), u0, v0, u1, v1);
+    if (seen[key]++ == 0) {
+      REXLOG_INFO("NG2 prompt diag: bucket {} sprite {:08X} tex {:08X} rect ({:.0f},{:.0f})-({:.0f},{:.0f}) "
+                  "uv ({:.4f},{:.4f})-({:.4f},{:.4f}) lr {:08X}",
+                  g_draw_bucket, ctx.r3.u32, GuestLoadU32(ctx.r3.u32 + 8), x0, y0, x1, y1, u0,
+                  v0, u1, v1, uint32_t(ctx.lr));
+    }
+  }
   if (REXCVAR_GET(ng2_bucket_dump) && g_draw_bucket < 0) {
     static std::unordered_map<uint32_t, int> seen_lr;
     const uint32_t lr = uint32_t(ctx.lr);
@@ -967,7 +1061,12 @@ REXCVAR_DEFINE_BOOL(ng2_cam_diag, false, "NG2", "Log camera source changes");
 // After all cameras updated: log small-integer fields (modes, states) that change in the
 // gameplay camera (slot 0, 5024 bytes) and the player object ([[0x83B28400]+1632], 1 KB).
 extern "C" REX_FUNC(__imp__sub_822F7318);
+void Ng2CaptureBurst(const char* tag);  // crash_handler.cpp (NG2 DIAG)
 extern "C" REX_FUNC(sub_822F7318) {
+  if (rex::cvar::GetFlagByName("ng2_effect_capture") == "true" &&
+      GuestLoadU32(ctx.r3.u32 + 1644) == 1) {  // camera shake pulse (camdiag-2: hits)
+    Ng2CaptureBurst("shake");
+  }
   if (REXCVAR_GET(ng2_cam_diag)) {
     const uint32_t mgr = ctx.r3.u32;
     const uint32_t cam = GuestLoadU32(mgr + 1604);
@@ -1013,7 +1112,7 @@ extern "C" REX_FUNC(sub_822F7318) {
 // their cameras.
 extern "C" REX_FUNC(__imp__sub_822FA8B8);
 extern "C" REX_FUNC(sub_822FA8B8) {
-  WideAspectScope wide_projection;  // Hor+ for this camera's projection only
+  WideAspectScope wide_update(1);  // NG2 DIAG mode B
   const uint32_t c = ctx.r3.u32;
   const uint32_t mode = c == 0x84C569F0 ? GuestLoadU32(c + 4716) : 1;
   if (g_mouse_has_camera && Ng2InGameplay() && mode != 1 && mode < 64) {
@@ -1077,8 +1176,12 @@ extern "C" REX_FUNC(__imp__sub_82845BD8);
 // sub_82845BD8 (1.0 sub_828205F8) builds a projection from the 16:9 constant for effects:
 // silent in normal play, bursts during projectile hits and Ultimate Technique charges
 // (aspectdiag-1), which showed black bands with the wide value. It runs with 16:9 (#37, #53).
+void Ng2CaptureBurst(const char* tag);  // crash_handler.cpp (NG2 DIAG)
+REXCVAR_DEFINE_BOOL(ng2_effect_capture, false, "NG2",
+                    "Capture frame bursts when effect projection sub_82845BD8 runs");
 extern "C" REX_FUNC(sub_82845BD8) {
   NativeAspectScope native;
+  if (REXCVAR_GET(ng2_effect_capture)) Ng2CaptureBurst("82845BD8");
   if (REXCVAR_GET(ng2_aspect_diag)) {
     g_aspect_calls[3].fetch_add(1);
     AspectDiagTick();
@@ -1102,10 +1205,110 @@ extern "C" REX_FUNC(sub_83889098) {
   __imp__sub_83889098(ctx, base);
 }
 extern "C" REX_FUNC(__imp__sub_822FB368);
+// sub_822FB368(r3 = camera) builds the camera's main projection (camera+512) from the 16:9
+// constant (or 4:3 0x8228716C under some flag). It is the only code that gets the wide value:
+// the camera update sub_822FA8B8 also builds +688 (4:3) and +752 (16:9) projections, which
+// effects use; widening those gave explosion effects black bands (findings #53).
 extern "C" REX_FUNC(sub_822FB368) {
+  WideAspectScope wide_projection(0);
   if (REXCVAR_GET(ng2_aspect_diag)) {
     g_aspect_calls[6].fetch_add(1);
     AspectDiagTick();
   }
   __imp__sub_822FB368(ctx, base);
+}
+
+// ---- Keyboard & mouse prompts ------------------------------------------------------------
+// Text layout sub_83706C20(r3 = text renderer state): UTF-16BE string at +52, position +96;
+// "@[" tags go to the parser sub_837073A0, where "pad:NAME" becomes one button-icon glyph
+// (name -> glyph map via sub_837082D0, glyph at +168). The renderer state is per draw and
+// does not own the string, so with keyboard prompts on, a string holding pad tags is swapped
+// for a cached copy (guest heap) where each tag reads "[Key]" (findings #54).
+namespace ng2 {
+bool PromptsUseKeyboard();
+uint32_t PromptLabelsVersion();
+std::string PromptLabel(const std::string& tag, bool gameplay);
+}  // namespace ng2
+namespace {
+// renderer state -> {last +52, prompt mode it was checked under}
+std::unordered_map<uint32_t, std::pair<uint32_t, uint32_t>> g_text_last_string;
+std::unordered_map<uint32_t, bool> g_prompt_buffers;        // our rewritten strings
+std::unordered_map<uint64_t, uint32_t> g_prompt_cache;      // source key -> rewritten
+
+uint32_t RewritePromptString(uint32_t src) {
+  auto* mem = REX_KERNEL_STATE()->memory();
+  const uint8_t* p = mem->TranslateVirtual<uint8_t*>(src);
+  std::vector<uint16_t> in;
+  for (int i = 0; i < 4096; ++i) {
+    const uint16_t c = rex::memory::load_and_swap<uint16_t>(p + 2 * i);
+    if (!c) break;
+    in.push_back(c);
+  }
+  static const char kTag[] = "@[pad:";
+  auto tag_at = [&](size_t i) {
+    for (size_t k = 0; k < 6; ++k) {
+      if (i + k >= in.size() || in[i + k] != uint16_t(kTag[k])) return false;
+    }
+    return true;
+  };
+  bool any = false;
+  for (size_t i = 0; i < in.size() && !any; ++i) any = tag_at(i);
+  if (!any) return 0;
+  const bool gameplay = Ng2InGameplay();
+  uint64_t h = 1469598103934665603ull;
+  for (uint16_t c : in) h = (h ^ c) * 1099511628211ull;
+  const uint64_t key = h ^ (uint64_t(src) << 1) ^ (uint64_t(ng2::PromptLabelsVersion()) << 40) ^
+                       (gameplay ? 0x8000000000000000ull : 0);
+  if (auto it = g_prompt_cache.find(key); it != g_prompt_cache.end()) return it->second;
+  std::vector<uint16_t> out;
+  for (size_t i = 0; i < in.size();) {
+    if (tag_at(i)) {
+      size_t end = i + 6;
+      while (end < in.size() && in[end] != uint16_t(']')) ++end;
+      std::string name;
+      for (size_t k = i + 6; k < end; ++k) name.push_back(char(in[k] & 0x7F));
+      const std::string label = ng2::PromptLabel(name, gameplay);
+      if (!label.empty() && end < in.size()) {
+        out.push_back(uint16_t('['));
+        for (char ch : label) out.push_back(uint16_t(uint8_t(ch)));
+        out.push_back(uint16_t(']'));
+        i = end + 1;
+        continue;
+      }
+    }
+    out.push_back(in[i]);
+    ++i;
+  }
+  out.push_back(0);
+  const uint32_t buf = mem->SystemHeapAlloc(uint32_t(out.size() * 2));
+  if (!buf) return 0;
+  uint8_t* d = mem->TranslateVirtual<uint8_t*>(buf);
+  for (size_t i = 0; i < out.size(); ++i) rex::memory::store_and_swap<uint16_t>(d + 2 * i, out[i]);
+  g_prompt_cache[key] = buf;
+  g_prompt_buffers[buf] = true;
+  return buf;
+}
+}  // namespace
+
+extern "C" REX_FUNC(__imp__sub_83706C20);
+extern "C" REX_FUNC(sub_83706C20) {
+  const uint32_t obj = ctx.r3.u32;
+  const uint32_t str = GuestLoadU32(obj + 52);
+  if (str) {
+    const bool keyboard = ng2::PromptsUseKeyboard();
+    const uint32_t mode = keyboard ? (ng2::PromptLabelsVersion() << 2) | (Ng2InGameplay() ? 2u : 1u)
+                                   : 0u;
+    auto& last = g_text_last_string[obj];
+    if (last.first != str || last.second != mode) {
+      last = {str, mode};
+      if (!g_prompt_buffers.count(str) && keyboard) {
+        if (const uint32_t buf = RewritePromptString(str)) {
+          rex::memory::store_and_swap<uint32_t>(
+              REX_KERNEL_STATE()->memory()->TranslateVirtual<uint8_t*>(obj + 52), buf);
+          last.first = buf;
+        }
+      }
+    }
+  }
+  __imp__sub_83706C20(ctx, base);
 }
