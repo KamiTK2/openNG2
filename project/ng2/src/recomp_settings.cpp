@@ -309,10 +309,17 @@ std::array<std::string, kBindCount> g_prompt_binds;
 // Keyboard prompts: true after the last input came from the keyboard or mouse.
 std::atomic<bool> g_prompts_keyboard{false};
 
+// Movement keys (first key of Move Forward / Back / Left / Right): also menu up/down/left/right.
+std::atomic<int> g_move_vk[4] = {{'W'}, {'S'}, {'A'}, {'D'}};
+
 void PublishMnk(const RecompSettings& s) {
   {
     std::lock_guard<std::mutex> lock(g_prompt_binds_mutex);
     g_prompt_binds = s.binds;
+  }
+  for (int i = 0; i < 4; ++i) {
+    const std::vector<int> vks = ParseBindVks(s.binds[i]);
+    g_move_vk[i] = vks.empty() ? 0 : vks.front();
   }
   g_prompt_labels_version.fetch_add(1);
   g_mnk_enabled = s.mnk_enabled;
@@ -443,14 +450,36 @@ void InstallRecompInputFilters() {
     if (g_mnk_enabled && gameplay_now && esc_context == 0) {
       g.buttons = uint16_t(uint16_t(g.buttons) & ~XINPUT_GAMEPAD_START);
     }
+    auto key_down = [](int vk) { return vk > 0 && (GetAsyncKeyState(vk) & 0x8000) != 0; };
+    // Arrows are the D-pad everywhere (in gameplay too: the quick-select wheel runs with the
+    // HUD up, and arrows have no gameplay binding).
+    if (g_mnk_enabled && OurWindowFocused() && !RecompSettingsBlocksGameInput()) {
+      uint16_t b = uint16_t(g.buttons);
+      if (key_down(VK_UP)) b |= XINPUT_GAMEPAD_DPAD_UP;
+      if (key_down(VK_DOWN)) b |= XINPUT_GAMEPAD_DPAD_DOWN;
+      if (key_down(VK_LEFT)) b |= XINPUT_GAMEPAD_DPAD_LEFT;
+      if (key_down(VK_RIGHT)) b |= XINPUT_GAMEPAD_DPAD_RIGHT;
+      g.buttons = b;
+    }
     if (g_mnk_enabled && !gameplay_now && OurWindowFocused() &&
         !RecompSettingsBlocksGameInput()) {
-      auto down = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
+      auto down = key_down;
       uint16_t b = uint16_t(g.buttons);
-      if (down(VK_UP)) b |= XINPUT_GAMEPAD_DPAD_UP;
-      if (down(VK_DOWN)) b |= XINPUT_GAMEPAD_DPAD_DOWN;
-      if (down(VK_LEFT)) b |= XINPUT_GAMEPAD_DPAD_LEFT;
-      if (down(VK_RIGHT)) b |= XINPUT_GAMEPAD_DPAD_RIGHT;
+      // Movement keys (WASD) are the D-pad in menus too; their left-stick output is dropped so
+      // menus that read both don't move twice.
+      static const uint16_t kDpad[4] = {XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_DPAD_DOWN,
+                                        XINPUT_GAMEPAD_DPAD_LEFT, XINPUT_GAMEPAD_DPAD_RIGHT};
+      bool move_key = false;
+      for (int i = 0; i < 4; ++i) {
+        if (down(g_move_vk[i].load())) {
+          b |= kDpad[i];
+          move_key = true;
+        }
+      }
+      if (move_key) {
+        g.thumb_lx = int16_t(0);
+        g.thumb_ly = int16_t(0);
+      }
       if (down(VK_RETURN)) b |= XINPUT_GAMEPAD_A;
       if (esc_context >= 0) b = uint16_t(b & ~XINPUT_GAMEPAD_START);
       if (esc_context == 0) b |= XINPUT_GAMEPAD_B;
@@ -509,10 +538,11 @@ void PadInput::Poll() {
   }
   if (OurWindowFocused()) {
     auto down = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
-    if (down(VK_UP)) cur |= kUp;
-    if (down(VK_DOWN)) cur |= kDown;
-    if (down(VK_LEFT)) cur |= kLeft;
-    if (down(VK_RIGHT)) cur |= kRight;
+    auto move = [&](int i) { const int vk = g_move_vk[i].load(); return vk > 0 && down(vk); };
+    if (down(VK_UP) || move(0)) cur |= kUp;
+    if (down(VK_DOWN) || move(1)) cur |= kDown;
+    if (down(VK_LEFT) || move(2)) cur |= kLeft;
+    if (down(VK_RIGHT) || move(3)) cur |= kRight;
     if (down(VK_RETURN) || down(VK_SPACE)) cur |= kAccept;
     if (down(VK_ESCAPE) || down(VK_BACK)) cur |= kBack;
   }
