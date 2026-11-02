@@ -54,6 +54,14 @@ Players supply their own game; we never ship game data or game-derived code. A l
 - Open questions: build time / disk (the recompiled C++ is ~560 MB, a full build takes minutes);
   whether the Windows SDK headers/libs can be fetched portably.
 
+## Version 1.1: native renderer (user 2026-11-02)
+Replace NG2's statically linked Xbox Direct3D layer with a D3D12 implementation (as Unleashed Recompiled does) instead of emulating the Xenos GPU: no PM4 interpretation, no EDRAM / ROV emulation, lower per-draw cost (weak machines). Estimate ~30-60 h of active work (findings #59-#63 for current costs):
+- [ ] Feasibility (2-4 h): find the D3D functions, how NG2 uses them, whether it writes GPU commands directly
+- [ ] Shaders: translate the 175 Xenos shaders to D3D12 ahead of time (Xenos -> HLSL translator)
+- [ ] Core renderer: textures (tiled formats), vertex formats, constants, render states, render targets, resolves
+- [ ] Scene-by-scene correctness (1120x584 scene buffer, effects, cutscenes, HUD)
+- [ ] Port features: internal resolution, ultrawide, FSR, frame generation, HUD pinning, prompts
+
 ## Cheats (user request 2026-11-01)
 - [x] Recomp Settings > Cheats: Unlock Difficulties, Unlock Costumes (apply after restart; nothing written to the save)
 
