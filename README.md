@@ -16,6 +16,12 @@ launcher builds it from your own copy.
    - **DLC folder** (optional): Mission Mode and the three costume packs
 3. Click **Build**, then **Play**.
 
+**Updates:** the launcher and the game check this repository for a new release. Click
+**Update now** in the launcher, or **Update** in Recomp Settings > System in the game: the
+launcher updates itself and rebuilds the game from the files already installed. You can keep
+playing while it builds. Saves and settings are kept. Turn the check off in the launcher or
+with System > Check for Updates.
+
 ## Upgrades
 
 - **Display:** any resolution and window mode, ultrawide (21:9 / 32:9) with the HUD pinned to
@@ -29,7 +35,8 @@ launcher builds it from your own copy.
 - **Content:** Mission Mode and DLC costumes, cheats (unlock all difficulties — including every
   Mission Mode difficulty — and costumes)
 - **Performance:** shader precompilation, lower GPU and CPU overhead than a straight emulation
-- **Launcher:** checks your files, downloads its own compiler, builds and installs the game
+- **Launcher:** checks your files, downloads its own compiler, builds and installs the game,
+  and keeps it up to date
 
 ## Known issues
 

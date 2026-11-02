@@ -44,7 +44,7 @@ Players supply their own game; we never ship game data or game-derived code. A l
 - [x] Extract the game, apply the TU, add DLC, codegen + build, install ng2.exe + DLLs into the install folder (ng2.exe finds game\ next to itself), remove the build files; VC++ runtime installed if missing; Play / Open folder / desktop shortcut
 - [x] Release folder: tools/make_release.py -> dist/openNG2 (launcher + payload: our project sources + SDK, no game data); icon tools/make_icon.py
 - [ ] Before release: licence review of the SDK's bundled third-party libraries (ffmpeg etc.) and a LICENSE / third-party notices file; test on a clean PC without Visual Studio; GitHub release upload
-- [ ] Later: updates, and launching the game from the launcher
+- [x] Updates (findings #69): launcher + game check GitHub releases; the launcher updates itself and rebuilds from the installed files; Play from the launcher
 
 ## Version 1.1: native renderer (user 2026-11-02)
 Replace NG2's statically linked Xbox Direct3D layer with a D3D12 implementation (as Unleashed Recompiled does) instead of emulating the Xenos GPU: no PM4 interpretation, no EDRAM / ROV emulation, lower per-draw cost (weak machines). Estimate ~30-60 h of active work (findings #59-#63 for current costs):

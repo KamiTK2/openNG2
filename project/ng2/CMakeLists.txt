@@ -17,6 +17,7 @@ set(NG2_SOURCES
     src/ng2_hooks.cpp
     src/recomp_settings.cpp
     src/shader_precompile.cpp
+    src/update_check.cpp
     src/ng2.rc
 )
 
@@ -27,6 +28,18 @@ else()
 endif()
 
 rexglue_setup_target(ng2 GPU_PLUGINS xenos)
+
+# openNG2 version (update check). The launcher passes it; a source checkout reads ../../VERSION.
+if(NOT OPENNG2_VERSION)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../VERSION")
+        file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/../../VERSION" OPENNG2_VERSION LIMIT_COUNT 1)
+    else()
+        set(OPENNG2_VERSION "dev")
+    endif()
+endif()
+set_source_files_properties(src/update_check.cpp src/recomp_settings.cpp PROPERTIES
+    COMPILE_DEFINITIONS "OPENNG2_VERSION=\"${OPENNG2_VERSION}\"")
+target_link_libraries(ng2 PRIVATE winhttp)
 
 # NG2 DIAG: whole-program guest function counter (tools/gen_trace_all.py). Off by default.
 option(NG2_TRACE_ALL "Count guest function entries (diagnostic)" OFF)

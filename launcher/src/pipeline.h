@@ -19,6 +19,8 @@ struct BuildRequest {
   std::vector<Identified> dlc;
   std::filesystem::path install_dir;
   std::filesystem::path payload_dir;  // shipped project + SDK (next to the launcher)
+  // Update rebuild: game, title update and DLC are already in <install>\game (no inputs).
+  bool rebuild = false;
 };
 
 enum class StepState { kPending, kRunning, kDone, kSkipped, kFailed };
@@ -53,6 +55,14 @@ class Pipeline {
   // settings live in %LOCALAPPDATA%\openNG2.
   static std::filesystem::path ToolchainDir(const std::filesystem::path& install_dir);
   static std::filesystem::path AppDataDir();
+
+  // Installed openNG2 version in that folder: "" = none, else from openNG2-install.ini (an
+  // install without it predates the file: 1.0).
+  static std::string InstalledVersion(const std::filesystem::path& install_dir);
+  // True when <install>\game holds everything a rebuild needs (no files to add again).
+  static bool CanRebuild(const std::filesystem::path& install_dir);
+  // True while ng2.exe in that folder is running (its files cannot be replaced).
+  static bool GameRunning(const std::filesystem::path& install_dir);
 
  private:
   void Run(BuildRequest request);

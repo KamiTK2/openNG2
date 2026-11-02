@@ -14,6 +14,7 @@
 #include <regex>
 #include <sstream>
 
+#include "update_check.h"
 #include "util.h"
 #include "xbox.h"
 
@@ -87,6 +88,33 @@ fs::path Pipeline::AppDataDir() {
   if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &local))) p = fs::path(local);
   CoTaskMemFree(local);
   return p / "openNG2";
+}
+
+std::string Pipeline::InstalledVersion(const fs::path& install_dir) {
+  std::error_code ec;
+  if (!fs::exists(install_dir / "ng2.exe", ec)) return {};
+  std::ifstream f(install_dir / openng2::kInstallInfoFile);
+  std::string line;
+  while (std::getline(f, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.rfind("version=", 0) == 0 && line.size() > 8) return line.substr(8);
+  }
+  return "1.0";
+}
+
+bool Pipeline::CanRebuild(const fs::path& install_dir) {
+  std::error_code ec;
+  const fs::path game = install_dir / "game";
+  return fs::exists(game / ".openng2-extracted", ec) && fs::exists(game / "default.xex", ec) &&
+         fs::exists(game / "default.xexp", ec);
+}
+
+bool Pipeline::GameRunning(const fs::path& install_dir) {
+  const fs::path exe = install_dir / "ng2.exe";
+  HANDLE h = CreateFileW(exe.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_SHARING_VIOLATION;
+  CloseHandle(h);
+  return false;
 }
 
 Pipeline::Pipeline() {
@@ -278,6 +306,9 @@ bool Pipeline::Game(const BuildRequest& r) {
     End(kStepGame, StepState::kSkipped);
     return true;
   }
+  if (r.game.path.empty()) {
+    return Fail(kStepGame, "The game files in " + PathText(out) + " are missing. Add your game files again and build.");
+  }
   const uint64_t need = 16'000'000'000ull;
   if (FreeDiskBytes(r.install_dir) < need) {
     return Fail(kStepGame, "Not enough free space in " + PathText(r.install_dir) + ": the game and the build need about " +
@@ -336,6 +367,13 @@ bool Pipeline::Update(const BuildRequest& r) {
   Begin(kStepUpdate);
   std::string err;
   const fs::path out = r.install_dir / "game" / "default.xexp";
+  if (r.update.path.empty()) {
+    std::error_code ec;
+    if (!fs::exists(out, ec)) return Fail(kStepUpdate, "Title Update #2 is missing. Add it again and build.");
+    SetDetail(kStepUpdate, "Already applied.", 1.0f);
+    End(kStepUpdate, StepState::kSkipped);
+    return true;
+  }
   if (!ExtractStfsFile(r.update.path, "default.xexp", out, &err)) return Fail(kStepUpdate, err);
   Log("Title Update #2: default.xexp extracted");
   End(kStepUpdate, StepState::kDone);
@@ -348,7 +386,7 @@ bool Pipeline::Dlc(const BuildRequest& r) {
   std::error_code ec;
   const fs::path dir = r.install_dir / "game" / "dlc";
   if (r.dlc.empty()) {
-    SetDetail(kStepDlc, "None added (optional).", 1.0f);
+    SetDetail(kStepDlc, r.rebuild ? "Kept as installed." : "None added (optional).", 1.0f);
     End(kStepDlc, StepState::kSkipped);
     return true;
   }
@@ -418,7 +456,8 @@ bool Pipeline::Build(const BuildRequest& r) {
                                  out.wstring() +
                                  L"\" -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_TRY_COMPILE_CONFIGURATION=Release "
                                  L"-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_RC_COMPILER=llvm-rc "
-                                 L"\"-Drexglue_DIR=" + (sdk / "lib" / "cmake" / "rexglue").wstring() + L"\"";
+                                 L"\"-Drexglue_DIR=" + (sdk / "lib" / "cmake" / "rexglue").wstring() + L"\" -DOPENNG2_VERSION=" +
+                                 Widen(openng2::kVersion);
   if (RunProcess(configure, project, env, log_line, [this] { return Cancelled(); }) != 0) {
     return Cancelled() ? false : Fail(kStepBuild, "Configuring the build failed (see the log).");
   }
@@ -468,6 +507,14 @@ bool Pipeline::Finish(const BuildRequest& r) {
   Begin(kStepFinish);
   std::error_code ec;
   const fs::path out = r.install_dir / "build" / "out";
+  // An update can be built while the old version is still being played; its files can only be
+  // replaced once it is closed.
+  while (GameRunning(r.install_dir)) {
+    if (Cancelled()) return false;
+    SetDetail(kStepFinish, "Close Ninja Gaiden II to finish installing the update...", -1.0f);
+    Sleep(1000);
+  }
+  SetDetail(kStepFinish, "", -1.0f);
   for (const auto& e : fs::directory_iterator(out, ec)) {
     const fs::path& p = e.path();
     const std::string ext = p.extension().string();
@@ -487,7 +534,14 @@ bool Pipeline::Finish(const BuildRequest& r) {
   exe_path_ = r.install_dir / "ng2.exe";
   if (!fs::exists(exe_path_, ec)) return Fail(kStepFinish, "ng2.exe was not produced.");
   if (!EnsureVcRuntime(r)) return false;
-  Log("Installed: " + PathText(exe_path_));
+  {
+    // Read by the launcher (installed version) and the game (which launcher to open to update).
+    wchar_t self[MAX_PATH * 2];
+    GetModuleFileNameW(nullptr, self, DWORD(std::size(self)));
+    std::ofstream info(r.install_dir / openng2::kInstallInfoFile, std::ios::trunc);
+    info << "version=" << openng2::kVersion << "\n" << "launcher=" << PathText(fs::path(self)) << "\n";
+  }
+  Log("Installed: " + PathText(exe_path_) + " (openNG2 " + openng2::kVersion + ")");
   End(kStepFinish, StepState::kDone);
   return true;
 }

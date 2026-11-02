@@ -1,5 +1,6 @@
 ﻿#include "recomp_settings.h"
 #include "shader_precompile.h"
+#include "update_check.h"
 
 // Must come before <xinput.h>: its enum names collide with XInput's macros.
 #include <rex/input/input_filter.h>
@@ -612,6 +613,7 @@ bool RecompSettings::Load(const std::filesystem::path& path) {
     else if (k == "ng2_invert_camera_y") invert_camera_y = ParseBool(v, invert_camera_y);
     else if (k == "ng2_stick_deadzone") stick_deadzone = ParseInt(v, stick_deadzone, 0, 30);
     else if (k == "ng2_vibration") vibration = ParseInt(v, vibration, 0, 100);
+    else if (k == "ng2_check_updates") check_updates = ParseBool(v, check_updates);
     else if (k == "ng2_pause_in_background")
       pause_in_background = ParseBool(v, pause_in_background);
     else if (k == "ng2_window_width") window_width = ParseInt(v, window_width, 0, 16384);
@@ -675,6 +677,7 @@ bool RecompSettings::Save(const std::filesystem::path& path) const {
       << "ng2_stick_deadzone = " << stick_deadzone << "\n"
       << "ng2_vibration = " << vibration << "\n"
       << "ng2_pause_in_background = " << b(pause_in_background) << "\n"
+      << "ng2_check_updates = " << b(check_updates) << "\n"
       << "ng2_window_width = " << window_width << "\n"
       << "ng2_window_height = " << window_height << "\n";
   if (window_x != INT_MIN && window_y != INT_MIN) {
@@ -768,6 +771,139 @@ struct RowDef {
 
 }  // namespace
 
+// ---- update check (System > Update) ---------------------------------------------------
+
+struct UpdateCheckState {
+  std::mutex mutex;
+  int phase = 0;  // 0 not started, 1 checking, 2 done
+  bool logged = false;
+  openng2::ReleaseInfo info;
+};
+
+void RecompOptionsPane::StartUpdateCheck() {
+  auto st = update_;
+  {
+    std::lock_guard<std::mutex> lock(st->mutex);
+    if (st->phase == 1) return;
+    st->phase = 1;
+    st->logged = false;
+  }
+  // Detached: the request can take seconds (timeouts) and must never hold up quitting.
+  std::thread([st] {
+    openng2::ReleaseInfo info =
+        openng2::FetchLatestRelease((std::string("openNG2/") + openng2::kVersion).c_str());
+    std::lock_guard<std::mutex> lock(st->mutex);
+    st->info = std::move(info);
+    st->phase = 2;
+  }).detach();
+}
+
+// The launcher that built this copy (openNG2-install.ini next to ng2.exe) does the update:
+// it replaces itself with the new release and rebuilds the game; the player keeps playing
+// until it asks them to close the game. Without a launcher, open the release page.
+void RecompOptionsPane::OpenUpdater() {
+  wchar_t exe[MAX_PATH * 2];
+  GetModuleFileNameW(nullptr, exe, DWORD(std::size(exe)));
+  const std::filesystem::path dir = std::filesystem::path(exe).parent_path();
+  std::ifstream f(dir / openng2::kInstallInfoFile);
+  std::string line, launcher_utf8;
+  while (std::getline(f, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.rfind("launcher=", 0) == 0) launcher_utf8 = line.substr(9);
+  }
+  std::wstring launcher;
+  if (!launcher_utf8.empty()) {
+    const int n = MultiByteToWideChar(CP_UTF8, 0, launcher_utf8.data(), int(launcher_utf8.size()), nullptr, 0);
+    launcher.resize(size_t(n));
+    MultiByteToWideChar(CP_UTF8, 0, launcher_utf8.data(), int(launcher_utf8.size()), launcher.data(), n);
+  }
+  std::error_code ec;
+  const int64_t now = NowMs();
+  if (!launcher.empty() && std::filesystem::exists(launcher, ec)) {
+    const std::wstring work = std::filesystem::path(launcher).parent_path().wstring();
+    if (reinterpret_cast<intptr_t>(ShellExecuteW(nullptr, L"open", launcher.c_str(), L"--update", work.c_str(),
+                                                 SW_SHOWNORMAL)) > 32) {
+      REXLOG_INFO("UPDATE: opened the launcher to update");
+      status_ = "The launcher is updating openNG2. Keep playing; close the game when it asks.";
+      status_until_ms_ = now + 10000;
+      return;
+    }
+  }
+  REXLOG_INFO("UPDATE: no launcher registered, opening the release page");
+  ShellExecuteW(nullptr, L"open", L"https://github.com/KamiTK2/openNG2/releases/latest", nullptr, nullptr,
+                SW_SHOWNORMAL);
+  status_ = "Launcher not found: opened the openNG2 release page in your browser.";
+  status_until_ms_ = now + 10000;
+}
+
+// Short notice outside gameplay once a newer release is known.
+void RecompOptionsPane::DrawUpdateNotice(ImGuiIO& io, int64_t now) {
+  std::string version;
+  {
+    std::lock_guard<std::mutex> lock(update_->mutex);
+    if (update_->phase != 2) return;
+    if (!update_->logged) {
+      update_->logged = true;
+      if (update_->info.ok) {
+        REXLOG_INFO("UPDATE: latest release {} (this build {})", update_->info.version, openng2::kVersion);
+      } else {
+        REXLOG_INFO("UPDATE: check failed: {}", update_->info.error);
+      }
+    }
+    if (!update_->info.ok || !openng2::IsNewer(update_->info.version, openng2::kVersion)) return;
+    version = update_->info.version;
+  }
+  // Shown on the title screen and menus until the player first reaches gameplay, with a
+  // clickable UPDATE NOW button (opens the launcher, like System > Update).
+  if (Ng2InGameplay()) update_notice_until_ms_ = 0;
+  if (update_notice_until_ms_ == 0 || Ng2InGameplay() || !settings_.check_updates) return;
+  // After a click the notice shows the launcher message for a while, then goes away.
+  const bool clicked = update_notice_until_ms_ > 0;
+  if (clicked && now >= update_notice_until_ms_) {
+    update_notice_until_ms_ = 0;
+    return;
+  }
+  const std::string text = clicked ? status_ : "Update available (openNG2 " + version + ") - Open the launcher";
+  const char* kUpdate = "UPDATE NOW";
+  const char* kClose = "CLOSE";
+  ImFont* f = g_serif_font ? g_serif_font : ImGui::GetFont();
+  const float size = io.DisplaySize.y * 0.03f;
+  const float pad = size * 0.6f, vpad = size * 0.35f;
+  const ImVec2 ts = f->CalcTextSizeA(size, FLT_MAX, 0.0f, text.c_str());
+  auto button_width = [&](const char* label) {
+    return f->CalcTextSizeA(size, FLT_MAX, 0.0f, label).x + pad * 2.0f;
+  };
+  // Buttons (mouse only; keyboard and controller use System > Update).
+  const float update_w = clicked ? 0.0f : button_width(kUpdate);
+  const float close_w = clicked ? 0.0f : button_width(kClose);
+  const float buttons_w = clicked ? 0.0f : pad + update_w + vpad + close_w;
+  const ImVec2 at(io.DisplaySize.x - ts.x - buttons_w - size * 1.2f, io.DisplaySize.y - ts.y - size * 1.2f);
+  ImDrawList* dl = ImGui::GetForegroundDrawList();
+  const ImVec2 box0(at.x - pad, at.y - vpad);
+  const ImVec2 box1(at.x + ts.x + buttons_w + (clicked ? pad : vpad), at.y + ts.y + vpad);
+  dl->AddRectFilled(box0, box1, IM_COL32(0, 0, 0, 185), size * 0.3f);
+  dl->AddRectFilled(box0, ImVec2(at.x - pad + size * 0.15f, box1.y), kRedMarker);
+  dl->AddText(f, size, at, kWhite, text.c_str());
+  if (clicked) return;
+  auto button = [&](float x, float w, const char* label, ImU32 normal, ImU32 hot) {
+    const ImVec2 b0(x, at.y - vpad * 0.6f), b1(x + w, at.y + ts.y + vpad * 0.6f);
+    const ImVec2 m = io.MousePos;
+    const bool hover = m.x >= b0.x && m.x < b1.x && m.y >= b0.y && m.y < b1.y;
+    dl->AddRectFilled(b0, b1, hover ? hot : normal, size * 0.2f);
+    dl->AddText(f, size, ImVec2(x + pad, at.y), kWhite, label);
+    return hover && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+  };
+  const float update_x = at.x + ts.x + pad;
+  if (button(update_x, update_w, kUpdate, IM_COL32(170, 20, 14, 255), IM_COL32(230, 40, 30, 255))) {
+    OpenUpdater();
+    update_notice_until_ms_ = now + 10000;
+    return;
+  }
+  if (button(update_x + update_w + vpad, close_w, kClose, IM_COL32(60, 58, 56, 255), IM_COL32(95, 92, 88, 255))) {
+    update_notice_until_ms_ = 0;  // hidden for this session (System > Update still works)
+  }
+}
+
 RecompOptionsPane::RecompOptionsPane(rex::ui::ImGuiDrawer* drawer, rex::ui::Window* window,
                                      std::filesystem::path settings_path,
                                      std::filesystem::path user_data_root,
@@ -778,7 +914,8 @@ RecompOptionsPane::RecompOptionsPane(rex::ui::ImGuiDrawer* drawer, rex::ui::Wind
       settings_path_(std::move(settings_path)),
       user_data_root_(std::move(user_data_root)),
       pane_visible_(std::move(pane_visible)),
-      ingame_row_selected_(std::move(ingame_row_selected)) {
+      ingame_row_selected_(std::move(ingame_row_selected)),
+      update_(std::make_shared<UpdateCheckState>()) {
   settings_.Load(settings_path_);
   // Show what this session actually runs with (may come from the command line).
   settings_.resolution_scale =
@@ -1103,6 +1240,15 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
   UpdateBackgroundMute();
   LogFrameRate();
   UpdateWindowGeometry(NowMs());
+  if (settings_.check_updates) {
+    bool start;
+    {
+      std::lock_guard<std::mutex> lock(update_->mutex);
+      start = update_->phase == 0;
+    }
+    if (start) StartUpdateCheck();
+  }
+  DrawUpdateNotice(io, NowMs());
 
   // In-game menu: A on Recomp Settings opens the full-screen panel.
   if (!overlay_open_ && ingame_row_selected_ && ingame_row_selected_() && pad_.accept) {
@@ -1344,6 +1490,47 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
       pair_row("Fast Loading", "On", "Off", s.fast_loading, [&s](bool a) { s.fast_loading = a; });
       pair_row("Pause in Background", "On", "Off", s.pause_in_background,
                [&s](bool a) { s.pause_in_background = a; });
+      pair_row("Check for Updates", "On", "Off", s.check_updates,
+               [&s](bool a) { s.check_updates = a; });
+      {
+        // Update: opens the launcher when a newer release exists; otherwise shows the state.
+        int phase;
+        openng2::ReleaseInfo info;
+        {
+          std::lock_guard<std::mutex> lock(update_->mutex);
+          phase = update_->phase;
+          info = update_->info;
+        }
+        const bool newer = phase == 2 && info.ok && openng2::IsNewer(info.version, openng2::kVersion);
+        if (newer) {
+          update_label_ = "Update to openNG2 " + info.version;
+          action_row(update_label_.c_str(), [this] {
+            OpenUpdater();
+            return false;
+          });
+        } else if (phase == 1) {
+          update_label_ = "Checking for Updates...";
+          action_row(update_label_.c_str(), [] { return false; });
+          rows.back().disabled = true;
+          rows.back().change = nullptr;
+        } else if (phase == 2 && info.ok) {
+          update_label_ = std::string("openNG2 ") + openng2::kVersion + " Is Up to Date";
+          action_row(update_label_.c_str(), [] { return false; });
+          rows.back().disabled = true;
+          rows.back().change = nullptr;
+        } else {
+          update_label_ = phase == 2 ? "Update Check Failed - Retry" : "Check for Updates Now";
+          const std::string error = info.error;
+          action_row(update_label_.c_str(), [this, error, phase] {
+            if (phase == 2 && !error.empty()) {
+              status_ = error;
+              status_until_ms_ = NowMs() + 6000;
+            }
+            StartUpdateCheck();
+            return false;
+          });
+        }
+      }
       action_row("Open Save Folder", [this] {
         ShellExecuteW(nullptr, L"open", user_data_root_.wstring().c_str(), nullptr, nullptr,
                       SW_SHOWNORMAL);
@@ -1595,6 +1782,13 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
       std::strcmp(rows[row_].label, "Internal Resolution") == 0) {
     text_at(X(L.label_x), fy, kGrey,
             "Render sizes above 1x may slow the game depending on your hardware.", false, note_px);
+    fy += note_px * 1.5f;
+  }
+  if (focused_ && row_ >= 0 && row_ < int(rows.size()) &&
+      std::strncmp(rows[row_].label, "Update to", 9) == 0) {
+    text_at(X(L.label_x), fy, kGrey,
+            "Opens the openNG2 launcher, which updates and rebuilds the game. Keep playing until it asks.",
+            false, note_px);
     fy += note_px * 1.5f;
   }
   if (now < status_until_ms_) text_at(X(L.label_x), fy, kWhite, status_.c_str(), false, note_px);

@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -123,6 +124,7 @@ struct RecompSettings {
   bool fast_loading = true;  // cvar ng2_fast_loading: loading screens run unthrottled (live)
   bool skip_intro = false;  // skip the boot movie (cvar ng2_skip_intro; next launch)
   bool pause_in_background = false;  // sends XN_SYS_UI (like the Guide button) on focus loss
+  bool check_updates = true;  // ask GitHub for a newer openNG2 release (update_check.h)
   // Cheats (cvars ng2_cheat_*; apply after a restart, nothing is written to the game save)
   bool cheat_difficulties = false;
   bool cheat_costumes = false;
@@ -144,6 +146,8 @@ struct PadInput {
   int64_t repeat_at_ms_ = 0;
   bool primed_ = false;
 };
+
+struct UpdateCheckState;  // recomp_settings.cpp
 
 class RecompOptionsPane : public rex::ui::ImGuiDialog {
  public:
@@ -171,6 +175,9 @@ class RecompOptionsPane : public rex::ui::ImGuiDialog {
   void RestoreBackup(const std::string& name);
   void UpdateWindowGeometry(int64_t now);
   void ApplyWindowGeometry(bool with_position);
+  void StartUpdateCheck();
+  void DrawUpdateNotice(ImGuiIO& io, int64_t now);
+  void OpenUpdater();
 
   rex::ui::Window* window_;
   std::filesystem::path settings_path_;
@@ -209,6 +216,10 @@ class RecompOptionsPane : public rex::ui::ImGuiDialog {
   // paused, and OnDraw only runs when the game presents.
   std::thread focus_thread_;
   std::atomic<bool> focus_thread_quit_{false};
+  // Update check (System > Update): shared with its detached worker thread.
+  std::shared_ptr<UpdateCheckState> update_;
+  int64_t update_notice_until_ms_ = -1;  // 0 = hidden for good (gameplay was reached)
+  std::string update_label_;  // row label storage for the current frame
 };
 
 }  // namespace ng2

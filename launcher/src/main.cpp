@@ -26,6 +26,8 @@
 #include "imgui_impl_win32.h"
 #include "inputs.h"
 #include "pipeline.h"
+#include "update_check.h"
+#include "updater.h"
 #include "util.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
@@ -33,7 +35,7 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM,
 namespace fs = std::filesystem;
 using namespace launcher;
 
-constexpr char kVersion[] = "1.0";  // keep in sync with tools/make_release.py VERSION
+using openng2::kVersion;  // root VERSION file (also read by tools/make_release.py)
 
 namespace {
 
@@ -84,7 +86,15 @@ DlcSet g_dlc;  // DLC folder scan (plus single DLC files dropped on the window)
 std::string g_notice;  // last message about a dropped file that fit no slot
 fs::path g_install_dir;
 bool g_license = false;
+bool g_check_updates = true;
 Pipeline g_pipeline;
+SelfUpdater g_updater;
+// Command line: --update (opened by the game's Update row: install a newer launcher, then
+// rebuild), --updated (just replaced by a newer launcher: rebuild the installed game).
+bool g_arg_update = false, g_arg_updated = false;
+bool g_auto_done = false;  // the automatic step for those has run
+std::string g_installed;   // installed openNG2 version ("" = none)
+bool g_can_rebuild = false;
 HWND g_hwnd = nullptr;
 std::mutex g_drop_mutex;
 std::vector<fs::path> g_dropped;
@@ -96,6 +106,7 @@ void LoadSettings() {
   while (std::getline(f, line)) {
     if (line.rfind("install=", 0) == 0) g_install_dir = fs::u8path(line.substr(8));
     if (line == "license=1") g_license = true;
+    if (line == "check_updates=0") g_check_updates = false;
   }
   if (g_install_dir.empty()) {
     wchar_t* docs = nullptr;
@@ -109,7 +120,8 @@ void SaveSettings() {
   std::error_code ec;
   fs::create_directories(SettingsFile().parent_path(), ec);
   std::ofstream f(SettingsFile());
-  f << "install=" << PathText(g_install_dir) << "\n" << "license=" << (g_license ? 1 : 0) << "\n";
+  f << "install=" << PathText(g_install_dir) << "\n" << "license=" << (g_license ? 1 : 0) << "\n"
+    << "check_updates=" << (g_check_updates ? 1 : 0) << "\n";
 }
 
 // Identify a path in the background; route it to a slot by what it turns out to be.
@@ -353,6 +365,132 @@ void DrawDlcCard() {
   ImGui::PopID();
 }
 
+fs::path PayloadDir() { return SelfUpdater::LauncherDir() / "payload"; }
+
+void RefreshInstalled() {
+  g_installed = Pipeline::InstalledVersion(g_install_dir);
+  g_can_rebuild = !g_installed.empty() && Pipeline::CanRebuild(g_install_dir);
+}
+
+// Update rebuild: everything the build needs is already in the install folder.
+void StartRebuild() {
+  BuildRequest req;
+  req.rebuild = true;
+  req.install_dir = g_install_dir;
+  req.payload_dir = PayloadDir();
+  g_pipeline.Start(req);
+}
+bool ToolchainReady() {
+  std::error_code ec;
+  return fs::exists(Pipeline::ToolchainDir(g_install_dir) / "toolchain-v1.ok", ec);
+}
+bool InstalledIsOlder() { return !g_installed.empty() && openng2::IsNewer(kVersion, g_installed); }
+bool RebuildPossible() { return g_can_rebuild && (g_license || ToolchainReady()); }
+
+void PlayGame(const fs::path& exe) {
+  ShellExecuteW(nullptr, L"open", exe.c_str(), nullptr, exe.parent_path().c_str(), SW_SHOW);
+}
+
+// Newer launcher on GitHub: banner with the release notes and Update now.
+void DrawUpdateBanner() {
+  using S = SelfUpdater::State;
+  const auto st = g_updater.state();
+  if (st != S::kAvailable && st != S::kInstalling && st != S::kFailed && st != S::kReady) return;
+  const openng2::ReleaseInfo rel = g_updater.release();
+  ImGui::Spacing();
+  ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.20f, 0.07f, 0.07f, 1.0f));
+  ImGui::BeginChild("update", ImVec2(-1, 0),
+                    ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysUseWindowPadding);
+  ImGui::PushFont(g_font_bold, 0.0f);
+  ImGui::Text("openNG2 %s is available", rel.version.c_str());
+  ImGui::PopFont();
+  ImGui::SameLine();
+  ImGui::TextColored(kDim, "(this is %s)", kVersion);
+  if (!rel.notes.empty() && ImGui::TreeNode("What's new")) {
+    const std::string notes = rel.notes.size() > 3000 ? rel.notes.substr(0, 3000) + "..." : rel.notes;
+    ImGui::PushStyleColor(ImGuiCol_Text, kDim);
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextUnformatted(notes.c_str());
+    ImGui::PopTextWrapPos();
+    ImGui::PopStyleColor();
+    ImGui::TreePop();
+  }
+  if (st == S::kInstalling || st == S::kReady) {
+    const float p = g_updater.progress();
+    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, kAccent);
+    ImGui::ProgressBar(p >= 0 ? p : -1.0f * float(ImGui::GetTime()), ImVec2(-1, ImGui::GetFontSize() * 0.6f), "");
+    ImGui::PopStyleColor();
+    ImGui::TextColored(kDim, "%s", g_updater.message().c_str());
+  } else {
+    if (st == S::kFailed) {
+      ImGui::PushStyleColor(ImGuiCol_Text, kBad);
+      ImGui::TextWrapped("%s", g_updater.message().c_str());
+      ImGui::PopStyleColor();
+    } else {
+      ImGui::PushStyleColor(ImGuiCol_Text, kDim);
+      ImGui::TextWrapped("%s", g_installed.empty()
+                                   ? "Update the launcher before building."
+                                   : "Update now replaces this launcher, then rebuilds your installed game from the "
+                                     "files already in its folder - nothing to add again. You can keep playing "
+                                     "while it builds; close the game when it asks.");
+      ImGui::PopStyleColor();
+    }
+    ImGui::BeginDisabled(g_pipeline.running());
+    ImGui::PushStyleColor(ImGuiCol_Button, kAccent);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.92f, 0.20f, 0.20f, 1.0f));
+    if (ImGui::Button(st == S::kFailed ? "Try again" : "Update now")) g_updater.Install();
+    ImGui::PopStyleColor(2);
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Release page")) {
+      ShellExecuteW(nullptr, L"open", Widen(rel.page_url).c_str(), nullptr, nullptr, SW_SHOW);
+    }
+  }
+  ImGui::EndChild();
+  ImGui::PopStyleColor();
+}
+
+// An existing install in the install folder: Play, or rebuild it (needed after a launcher update).
+void DrawInstalledCard() {
+  if (g_installed.empty()) return;
+  Heading("Installed");
+  const bool older = InstalledIsOlder();
+  StatusDot(older ? kAccent : kOk);
+  ImGui::PushFont(g_font_bold, 0.0f);
+  ImGui::Text("openNG2 %s", g_installed.c_str());
+  ImGui::PopFont();
+  ImGui::SameLine();
+  ImGui::TextColored(kDim, "%s", PathText(g_install_dir).c_str());
+  const float indent = ImGui::GetFontSize() * 1.2f;
+  ImGui::Indent(indent);
+  if (older) {
+    ImGui::PushStyleColor(ImGuiCol_Text, kAccent);
+    ImGui::TextWrapped("This launcher is openNG2 %s. Rebuild the game to update it (your files are already in "
+                       "place).", kVersion);
+    ImGui::PopStyleColor();
+  }
+  if (!g_can_rebuild) {
+    ImGui::PushStyleColor(ImGuiCol_Text, kDim);
+    ImGui::TextWrapped("To rebuild, add your files below (the extracted game files in this folder are incomplete).");
+    ImGui::PopStyleColor();
+  }
+  if (ImGui::Button("Play")) PlayGame(g_install_dir / "ng2.exe");
+  ImGui::SameLine();
+  ImGui::BeginDisabled(!RebuildPossible() || g_updater.busy());
+  if (older) {
+    ImGui::PushStyleColor(ImGuiCol_Button, kAccent);
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.92f, 0.20f, 0.20f, 1.0f));
+  }
+  if (ImGui::Button(older ? "Update the game" : "Rebuild")) {
+    SaveSettings();
+    StartRebuild();
+  }
+  if (older) ImGui::PopStyleColor(2);
+  ImGui::EndDisabled();
+  ImGui::Unindent(indent);
+  ImGui::Spacing();
+}
+
 void DrawFilesPage() {
   ImGui::PushStyleColor(ImGuiCol_Text, kDim);
   ImGui::TextWrapped(
@@ -360,6 +498,7 @@ void DrawFilesPage() {
       "below - drag and drop them anywhere on this window, or use the buttons. Each file is checked as soon as "
       "you add it. Nothing is uploaded anywhere; everything happens on this PC.");
   ImGui::PopStyleColor();
+  DrawInstalledCard();
 
   Heading("Required");
   InputCard(
@@ -391,6 +530,7 @@ void DrawFilesPage() {
     if (!p.empty()) {
       g_install_dir = p[0];
       SaveSettings();
+      RefreshInstalled();
     }
   }
   ImGui::PushStyleColor(ImGuiCol_Text, kDim);
@@ -424,9 +564,7 @@ void DrawFilesPage() {
       if (d.ok) req.dlc.push_back(d);
     }
     req.install_dir = g_install_dir;
-    wchar_t exe[MAX_PATH];
-    GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    req.payload_dir = fs::path(exe).parent_path() / "payload";
+    req.payload_dir = PayloadDir();
     SaveSettings();
     g_pipeline.Start(req);
   }
@@ -488,8 +626,7 @@ void DrawBuildPage() {
   } else if (g_pipeline.succeeded()) {
     ImGui::PushStyleColor(ImGuiCol_Button, kAccent);
     if (ImGui::Button("Play", ImVec2(ImGui::GetFontSize() * 8, ImGui::GetFontSize() * 2.0f))) {
-      const fs::path exe = g_pipeline.exe_path();
-      ShellExecuteW(nullptr, L"open", exe.c_str(), nullptr, exe.parent_path().c_str(), SW_SHOW);
+      PlayGame(g_pipeline.exe_path());
     }
     ImGui::PopStyleColor();
     ImGui::SameLine();
@@ -502,12 +639,20 @@ void DrawBuildPage() {
       CreateShortcut(g_pipeline.exe_path());
       shortcut_done = true;
     }
+    ImGui::SameLine();
+    if (ImGui::Button("Done")) {
+      g_pipeline.Reset();
+      RefreshInstalled();
+    }
     ImGui::TextColored(kDim, "Game: %s", PathText(g_pipeline.exe_path()).c_str());
   } else {
     ImGui::PushStyleColor(ImGuiCol_Text, kBad);
     ImGui::TextWrapped("%s", g_pipeline.error().c_str());
     ImGui::PopStyleColor();
-    if (ImGui::Button("Back")) g_pipeline.Reset();
+    if (ImGui::Button("Back")) {
+      g_pipeline.Reset();
+      RefreshInstalled();
+    }
     ImGui::SameLine();
     if (ImGui::Button("Open the build log")) {
       ShellExecuteW(nullptr, L"open", g_pipeline.log_path().c_str(), nullptr, nullptr, SW_SHOW);
@@ -538,6 +683,26 @@ void DrawUi() {
   ImGui::SameLine();
   ImGui::SetCursorPosY(ImGui::GetCursorPosY() + ImGui::GetFontSize() * 0.55f);
   ImGui::TextColored(kDim, "Ninja Gaiden II for Windows - builder %s", kVersion);
+  {
+    using S = SelfUpdater::State;
+    const auto st = g_updater.state();
+    const char* status = st == S::kChecking      ? "Checking for updates..."
+                         : st == S::kUpToDate    ? "Up to date."
+                         : st == S::kCheckFailed ? "Update check failed."
+                                                 : nullptr;
+    if (status) {
+      ImGui::SameLine();
+      ImGui::TextColored(st == S::kCheckFailed ? kBad : kDim, " %s", status);
+      if (st == S::kCheckFailed && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", g_updater.message().c_str());
+    }
+    if ((st == S::kIdle || st == S::kUpToDate || st == S::kCheckFailed) && !g_pipeline.running()) {
+      ImGui::SameLine();
+      if (ImGui::SmallButton("Check for updates")) g_updater.Check();
+      ImGui::SameLine();
+      if (ImGui::Checkbox("at start", &g_check_updates)) SaveSettings();
+    }
+  }
+  DrawUpdateBanner();
   const bool build_view = g_pipeline.running() || g_pipeline.finished();
   if (build_view) {
     DrawBuildPage();
@@ -618,12 +783,26 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
   CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
   ImGui_ImplWin32_EnableDpiAwareness();
   LoadSettings();
+  {
+    int argc = 0;
+    if (LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc)) {
+      for (int i = 1; i < argc; ++i) {
+        if (std::wstring(argv[i]) == L"--update") g_arg_update = true;
+        if (std::wstring(argv[i]) == L"--updated") g_arg_updated = true;
+      }
+      LocalFree(argv);
+    }
+  }
+  SelfUpdater::CleanupOldFiles();
+  RefreshInstalled();
+  if (g_check_updates || g_arg_update) g_updater.Check();
 
   WNDCLASSEXW wc{sizeof(wc), CS_CLASSDC, WndProc, 0, 0, inst, LoadIconW(inst, MAKEINTRESOURCEW(1)),
                  LoadCursorW(nullptr, IDC_ARROW), nullptr, nullptr, L"openNG2Launcher", nullptr};
   RegisterClassExW(&wc);
   const float dpi = ImGui_ImplWin32_GetDpiScaleForMonitor(MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY));
-  g_hwnd = CreateWindowExW(WS_EX_ACCEPTFILES, wc.lpszClassName, L"openNG2 1.0 - Ninja Gaiden II builder",
+  const std::wstring title = L"openNG2 " + Widen(kVersion) + L" - Ninja Gaiden II builder";
+  g_hwnd = CreateWindowExW(WS_EX_ACCEPTFILES, wc.lpszClassName, title.c_str(),
                            WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, int(940 * dpi), int(900 * dpi), nullptr,
                            nullptr, inst, nullptr);
   const BOOL dark = TRUE;
@@ -658,7 +837,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
   while (!done) {
     MSG msg;
     // Sleep while idle; wake for input, or every 100 ms while work is in progress.
-    const bool active = g_pipeline.running() || Busy();
+    const bool active = g_pipeline.running() || Busy() || g_updater.busy();
     if (!active) MsgWaitForMultipleObjects(0, nullptr, FALSE, 250, QS_ALLINPUT);
     while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
       TranslateMessage(&msg);
@@ -674,6 +853,30 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
       g_dropped.clear();
     }
     PumpRouting();
+    {
+      // A finished self-update restarts into the new launcher, which then rebuilds the game.
+      using S = SelfUpdater::State;
+      const auto st = g_updater.state();
+      if (st == S::kReady && !done) {
+        if (!SelfUpdater::Restart(L"--updated")) {
+          MessageBoxW(g_hwnd, L"The update is installed. Start openNG2.exe again to continue.", L"openNG2",
+                      MB_ICONINFORMATION);
+        }
+        done = true;
+        break;
+      }
+      // --update: install a newer launcher if there is one, else rebuild an older game.
+      // --updated: rebuild the installed game with this (new) launcher.
+      if (!g_auto_done && (g_arg_update || g_arg_updated) && !g_pipeline.running()) {
+        if (g_arg_update && st == S::kAvailable) {
+          g_auto_done = true;
+          g_updater.Install();
+        } else if (g_arg_updated || st == S::kUpToDate || st == S::kCheckFailed) {
+          g_auto_done = true;
+          if (InstalledIsOlder() && RebuildPossible()) StartRebuild();
+        }
+      }
+    }
     if (g_resize_w) {
       if (g_rtv) g_rtv->Release();
       g_swap->ResizeBuffers(0, g_resize_w, g_resize_h, DXGI_FORMAT_UNKNOWN, 0);

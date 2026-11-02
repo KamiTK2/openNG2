@@ -18,9 +18,11 @@ import shutil
 import sys
 import zipfile
 
-VERSION = "1.0"
-
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Single version source (also built into the launcher and the game for the update check).
+# Publish as GitHub release tag "v<VERSION>" with openNG2-<VERSION>.zip attached: the update
+# check (project/ng2/src/update_check.cpp) looks for exactly that.
+VERSION = open(os.path.join(ROOT, "VERSION"), encoding="utf-8").read().strip()
 OUT = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.path.join(ROOT, "dist", "openNG2")
 SDK = os.path.join(ROOT, "tools", "rexglue-sdk", "out", "install", "win-amd64")
 PROJECT = os.path.join(ROOT, "project", "ng2")
@@ -139,6 +141,10 @@ def main():
             "The launcher checks the files, downloads a compiler, rebuilds the game for Windows from\n"
             "your copy and gives you ng2.exe. No game files are included in this download.\n"
             "Keep the payload folder next to openNG2.exe.\n\n"
+            "Updates: the launcher and the game check GitHub for a newer openNG2 release (one\n"
+            "anonymous request; switch it off in the launcher or in Recomp Settings > System).\n"
+            "Update now replaces the launcher and rebuilds the game from the files already\n"
+            "installed - nothing to add again. Saves and settings are kept.\n\n"
             "Ninja Gaiden II belongs to Koei Tecmo; use only a copy you own.\n"
             "Third-party licences: THIRD-PARTY-NOTICES.txt\n"
             "Project page: https://github.com/KamiTK2/openNG2\n")
