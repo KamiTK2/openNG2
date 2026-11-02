@@ -1,58 +1,81 @@
+<p align="center"><img src="assets/openNG2-256.png" width="128" alt="openNG2"></p>
+
 # openNG2
 
-A native Windows PC port of **Ninja Gaiden II** (Xbox 360, 2008), made by statically
-recompiling the game's PowerPC code to x64 with the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk).
+A native Windows version of **Ninja Gaiden II** (Xbox 360, 2008). The game's code is recompiled
+to run directly on PC, with a set of PC upgrades on top. **No game files are included** — the
+launcher builds it from your own copy.
 
-**No game data is included.** You need your own copy of the game.
+## Getting started
 
-## Features
+1. Run `openNG2.exe` from the release.
+2. Add your files:
+   - **Game** (required): Games on Demand package `C1200E9B558D04454FA6` + its `.data` folder,
+     a disc image (`.iso`), or an extracted game folder
+   - **Title Update #2** (required): `TU_1A461UL_000000G000000.00000000000G4`
+   - **DLC folder** (optional): Mission Mode and the three costume packs
+3. Click **Build**, then **Play**.
 
-- Runs the full game: menus, saves, gameplay, cutscenes, audio
-- Mission Mode and DLC costumes (with your own Title Update #2 and DLC)
-- Ultrawide (21:9 / 32:9) with the HUD pinned to the screen edges
-- 120 FPS frame generation, up to 3x internal resolution, FXAA
-- **Recomp Settings** in the game's own Options menu and in the in-game (Back) menu:
-  display, graphics, audio, controls, save backup/restore, Skip Intro, Skip Any Cutscene,
-  cheats (unlock difficulties / costumes)
+## Upgrades
 
-## What you need
+- **Display:** any resolution and window mode, ultrawide (21:9 / 32:9) with the HUD pinned to
+  the screen edges, field of view slider, internal resolution 1x–5x, FSR 1.0 / CAS upscaling,
+  FXAA, graphics presets (Low–Ultra)
+- **Frame rate:** 120 FPS frame generation, smooth frame pacing
+- **Keyboard & mouse:** full rebinding, free mouse look, mouse-wheel zoom, keyboard prompts in
+  the game's own text and menus
+- **Convenience:** settings inside the game's own menus, fast loading, skip intro, skip any
+  cutscene, save backup / restore, pause when unfocused
+- **Content:** Mission Mode and DLC costumes, cheats (unlock all difficulties — including every
+  Mission Mode difficulty — and costumes)
+- **Performance:** shader precompilation, lower GPU and CPU overhead than a straight emulation
+- **Launcher:** checks your files, downloads its own compiler, builds and installs the game
 
-- Your dump of the Xbox 360 disc (`default.xex` and game files, media ID `69F555CB`)
-- **Title Update #2** for that disc (`TU_1A461UL_000000G000000.00000000000G4`)
-- Optional: your DLC packages (Mission Mode, costumes)
-- Windows 10/11, Visual Studio 2022 Build Tools (clang-cl), CMake, Ninja, Python
+## Known issues
 
-## Build
+- Game logic runs at 60 FPS; above 60 is frame generation, not real extra frames.
+- If the GPU can't hold 60 FPS (e.g. 5x resolution) the game slows down, as on the console.
+- Only tested through the early chapters and Mission Mode so far.
+- Menus can't be used with the mouse (keyboard and controller work).
+- Not yet checked: bow aiming with the mouse; the Show Karma key has no keyboard binding yet.
+- Only the original disc release with Title Update #2 is supported.
 
-1. Run `Setup.bat` once to install the toolchain.
-2. Put your game files in `game\` and your DLC packages in `game\dlc\`.
-3. Extract the title update next to `default.xex`:
-   `python tools\stfs_extract.py <TU file> game` (creates `game\default.xexp`).
-4. Get ReXGlue v0.10.0 and apply our SDK patch:
-   ```
-   git clone https://github.com/rexglue/rexglue-sdk.git tools/rexglue-sdk
-   cd tools/rexglue-sdk
-   git checkout c94f5ebdcb3c9d1a460ca48e04f9758448f8d518
-   git submodule update --init --recursive
-   git apply ../../patches/rexglue-sdk-v0.10.0.patch
-   ```
-   Build and install it from a VS 2022 x64 prompt (`cmake --preset win-amd64`,
-   RelWithDebInfo, `cmake --install`).
-5. Build the game: `project\ng2\build.cmd`. Run `ng2.exe` from
-   `project\ng2\out\build\win-amd64-relwithdebinfo` with `--game_data_root=<path to game>`.
+## Future plans
 
-An easy launcher that does all of this from your files is planned (`notes/roadmap.md`).
+- **1.0:** full playthrough testing, audio options, graphics quality toggles, public release
+- **1.1:** a native PC renderer (no GPU emulation) for much better performance on weak PCs
 
-## Repository
+## Credits
 
-| Path | Contents |
-| --- | --- |
-| `project/ng2/` | The app: hooks, Recomp Settings, codegen manifest |
-| `patches/` | Our changes to the ReXGlue SDK |
-| `tools/` | Scripts (address mapping, STFS/GOD extraction, test runs) |
-| `notes/` | `findings.md` (research ledger) and `roadmap.md` |
+- **Ninja Gaiden II** — Team Ninja / Tecmo. All rights belong to Koei Tecmo. Please buy the game.
+- **[ReXGlue SDK](https://github.com/rexglue/rexglue-sdk)** — the recompiler and runtime this port
+  is built on: Tom (crack), Loreaxe, mystixor, Graine25, Carlos Estrague (mrcmunir), sanjay900,
+  Toby, Roxxsen and the ReXGlue community.
+- **[Xenia](https://github.com/xenia-project/xenia)** — Ben Vanik and the Xenia contributors, whose
+  Xbox 360 emulation work the SDK's runtime and GPU code come from.
+- **[XenonRecomp](https://github.com/hedge-dev/XenonRecomp)** (hedge-dev) and
+  **[rexdex's recompiler](https://github.com/rexdex/recompiler)** — the static recompilation work
+  ReXGlue builds on. Thanks also to the ninjas-dawn ReXGlue project, used as a reference.
+- **Libraries:** [SDL3](https://github.com/libsdl-org/SDL),
+  [Dear ImGui](https://github.com/ocornut/imgui) (Omar Cornut),
+  [AMD FidelityFX](https://gpuopen.com/fidelityfx-superresolution/) (FSR 1.0, CAS),
+  [FFmpeg](https://ffmpeg.org), [xxHash](https://github.com/Cyan4973/xxHash) (Yann Collet),
+  [{fmt}](https://github.com/fmtlib/fmt), [spdlog](https://github.com/gabime/spdlog),
+  [toml++](https://github.com/marzer/tomlplusplus), [libmspack](https://github.com/kyz/libmspack),
+  [Tracy](https://github.com/wolfpld/tracy), [o1heap](https://github.com/pavel-kirienko/o1heap),
+  [utfcpp](https://github.com/nemtrif/utfcpp), [stb](https://github.com/nothings/stb).
+- **Build tools used by the launcher:** [LLVM](https://llvm.org), [CMake](https://cmake.org),
+  [Ninja](https://ninja-build.org), [xwin](https://github.com/Jake-Shadle/xwin) (Jake Shadle), and
+  Microsoft's Visual C++ libraries and Windows SDK.
+- **Research tools:** [Ghidra](https://github.com/NationalSecurityAgency/ghidra) and
+  [XEXLoaderWV](https://github.com/zeroKilo/XEXLoaderWV) (zeroKilo).
 
 ## Legal
 
-Only use a copy of Ninja Gaiden II you own. This repository never contains game files,
-saves, recompiled code or built executables, and you must not share them.
+Use only a copy of Ninja Gaiden II that you own. This repository contains no game files, saves,
+recompiled code or built executables — do not share those either.
+
+---
+
+<sub>Developers: the app is in `project/ng2/`, the launcher in `launcher/`, SDK changes in
+`patches/`, research notes in `notes/findings.md`, plans in `notes/roadmap.md`.</sub>
