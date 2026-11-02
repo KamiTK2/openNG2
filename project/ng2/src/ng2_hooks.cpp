@@ -1390,34 +1390,38 @@ extern "C" REX_FUNC(sub_823053F0) {
     return;
   }
   static int64_t game_owns_until = 0;
-  if (have_dir) {
-    // Another part of the game turned the camera since our last write: forced lock-ons (boss
-    // fights turn it toward the boss between frames: 150-210 deg jumps with the mouse still,
-    // cam-hist-1). Fighting it made the camera flicker; the game keeps the camera until it has
-    // left it alone for a moment, then the mouse continues from there (user: "always allow
-    // the lock-on for the enemies that force it").
-    const float ax = last_out.x - pre_tgt.x, ay = last_out.y - pre_tgt.y, az = last_out.z - pre_tgt.z;
-    const float bx = pre_eye.x - pre_tgt.x, by = pre_eye.y - pre_tgt.y, bz = pre_eye.z - pre_tgt.z;
-    const float la = std::sqrt(ax * ax + ay * ay + az * az), lb = std::sqrt(bx * bx + by * by + bz * bz);
-    if (la > 1e-3f && lb > 1e-3f) {
-      const float cosang = (ax * bx + ay * by + az * bz) / (la * lb);
-      if (cosang < 0.9986f) {  // > 3 deg
-        have_dir = false;
+  // Forced lock-on (boss fights): the game aims the camera at a point away from Ryu and turns
+  // it between frames; fighting that made the camera flicker. Lock-on = the camera target more
+  // than 3 units (horizontally) from Ryu (player object +0x130, feet; normally within ~2 units,
+  // pos scan in cam-scripted-2). The game then keeps the camera, until 0.4 s after the target
+  // is back on Ryu. A 3-degree "the game turned it" rule caught ordinary nudges and left the
+  // mouse dead for 0.4 s at a time (user, 2026-11-02).
+  {
+    const uint32_t pla = GuestLoadU32(0x83B28400) ? GuestLoadU32(GuestLoadU32(0x83B28400) + 1632) : 0;
+    if (pla) {
+      const GuestVec ryu = LoadVec(mem->TranslateVirtual<uint8_t*>(pla + 0x130));
+      const float dxz = std::hypot(pre_tgt.x - ryu.x, pre_tgt.z - ryu.z);
+      if (std::isfinite(dxz) && dxz > 3.0f) {
         if (REXCVAR_GET(ng2_mouse_cam_log) && now >= game_owns_until) {
-          REXLOG_INFO("NG2 mouse cam: game turned the camera {:.0f} deg, lock-on has it",
-                      std::acos(std::clamp(cosang, -1.0f, 1.0f)) * 57.2958f);
+          REXLOG_INFO("NG2 mouse cam: lock-on (target {:.1f} from Ryu), game has the camera", dxz);
         }
         game_owns_until = now + 400;
       }
     }
   }
+  if (have_dir && now >= game_owns_until) {
+    // A big turn by the game since our last write (a lock-on just ended, a respawn, ...):
+    // continue from the game's direction instead of snapping back.
+    const float ax = last_out.x - pre_tgt.x, ay = last_out.y - pre_tgt.y, az = last_out.z - pre_tgt.z;
+    const float bx = pre_eye.x - pre_tgt.x, by = pre_eye.y - pre_tgt.y, bz = pre_eye.z - pre_tgt.z;
+    const float la = std::sqrt(ax * ax + ay * ay + az * az), lb = std::sqrt(bx * bx + by * by + bz * bz);
+    if (la > 1e-3f && lb > 1e-3f && (ax * bx + ay * by + az * bz) / (la * lb) < 0.9063f) {  // > 25 deg
+      have_dir = false;
+    }
+  }
   if (now < game_owns_until) {
-    // Lock-on: the game's camera as is; track where it is so the next frame compares with it.
-    last_out = pre_eye;
-    have_dir = true;
-    yaw_state = std::atan2(ox, oz);
-    elev_state = std::atan2(oy, std::sqrt(ox * ox + oz * oz));
-    last_out = eye;
+    // Lock-on: the game's camera as is; mouse look resumes from its direction afterwards.
+    have_dir = false;
     return;
   }
   if (!have_dir) {
