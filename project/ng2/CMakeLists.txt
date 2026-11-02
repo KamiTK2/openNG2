@@ -16,6 +16,7 @@ set(NG2_SOURCES
     src/crash_handler.cpp
     src/ng2_hooks.cpp
     src/recomp_settings.cpp
+    src/shader_precompile.cpp
 )
 
 if(WIN32)
@@ -38,4 +39,6 @@ endif()
 add_custom_command(TARGET ng2 POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         ${CMAKE_CURRENT_SOURCE_DIR}/ng2.toml $<TARGET_FILE_DIR:ng2>/ng2.toml
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        ${CMAKE_CURRENT_SOURCE_DIR}/shaders $<TARGET_FILE_DIR:ng2>/shaders
     VERBATIM)

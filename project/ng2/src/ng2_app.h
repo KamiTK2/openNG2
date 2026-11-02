@@ -7,6 +7,7 @@
 #include <fstream>
 #include <memory>
 
+#include <rex/filesystem.h>
 #include <rex/input/input_system.h>
 #include <rex/rex_app.h>
 #include <rex/runtime.h>
@@ -18,6 +19,7 @@
 #include "ng2_trace_all.h"
 #endif
 #include "recomp_settings.h"
+#include "shader_precompile.h"
 
 void Ng2InstallDataPatches();  // ng2_hooks.cpp
 bool Ng2RecompPaneVisible();   // ng2_hooks.cpp
@@ -64,7 +66,25 @@ class Ng2App : public rex::ReXApp {
   // DLC: install every package in <game data>\dlc that isn't installed yet (extracted into the
   // user data folder like a console's marketplace content), before the game starts and
   // enumerates content. The launcher only has to put the player's DLC files there.
-  void OnPreLaunchModule() override { InstallDlc(); }
+  // Shaders: add every shader/pipeline from the shipped manifest that the cache lacks, so the
+  // SDK builds them all before the game starts (findings #58).
+  void OnPreLaunchModule() override {
+    InstallDlc();
+    if (auto* ks = REX_KERNEL_STATE()) {
+      ng2::PrepareShaderCache(rex::filesystem::GetExecutableFolder() / "shaders", cache_root(),
+                              ks->title_id());
+    }
+  }
+
+  // Shader storage progress (drawn by the settings overlay until the game starts).
+  void OnShaderStorageProgress(int stage, uint32_t done, uint32_t total) override {
+    ng2::SetShaderProgress(stage, done, total);
+    if (stage == 0 && total == 0 && done == 0) {  // first call, on the UI thread
+      ng2::SetShaderProgressActive(true);
+      if (auto* d = imgui_drawer(); d && d->presenter()) d->presenter()->RequestUIPaintFromUIThread();
+    }
+  }
+  void OnPostLaunchModule(rex::system::XThread*) override { ng2::SetShaderProgressActive(false); }
 
   void OnConfigureFonts(ImFontAtlas* atlas) override { ng2::LoadRecompSettingsFonts(atlas); }
 

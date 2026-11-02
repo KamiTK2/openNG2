@@ -155,7 +155,8 @@ class RecompOptionsPane : public rex::ui::ImGuiDialog {
 
   // Draw only when the guest presents, so the host presents exactly once per game
   // frame (lets driver frame generation interpolate real frames).
-  bool WantsContinuousPaint() const override { return false; }
+  // While shaders build before the game starts nothing presents, so the overlay paints itself.
+  bool WantsContinuousPaint() const override;
 
  protected:
   void OnDraw(ImGuiIO& io) override;

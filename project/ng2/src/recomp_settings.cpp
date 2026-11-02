@@ -1,4 +1,5 @@
 ﻿#include "recomp_settings.h"
+#include "shader_precompile.h"
 
 // Must come before <xinput.h>: its enum names collide with XInput's macros.
 #include <rex/input/input_filter.h>
@@ -1034,8 +1035,48 @@ void RecompOptionsPane::LogFrameRate() {
   }
 }
 
+bool RecompOptionsPane::WantsContinuousPaint() const {
+  int stage;
+  uint32_t done, total;
+  return ShaderProgress(&stage, &done, &total);
+}
+
+// "Preparing shaders" screen while the SDK builds the shader cache before the game starts.
+static void DrawShaderProgress(ImGuiIO& io) {
+  int stage;
+  uint32_t done, total;
+  if (!ShaderProgress(&stage, &done, &total)) return;
+  ImDrawList* dl = ImGui::GetForegroundDrawList();
+  const ImVec2 ds = io.DisplaySize;
+  dl->AddRectFilled(ImVec2(0, 0), ds, IM_COL32(0, 0, 0, 255));
+  ImFont* f = g_serif_font ? g_serif_font : ImGui::GetFont();
+  const float size = ds.y * 0.035f;
+  char text[96];
+  if (total == 0) {
+    std::snprintf(text, sizeof(text), "Preparing shaders...");
+  } else {
+    std::snprintf(text, sizeof(text), "%s %u / %u", stage == 0 ? "Compiling shaders" : "Building pipelines",
+                  done, total);
+  }
+  const ImVec2 ts = f->CalcTextSizeA(size, FLT_MAX, 0.0f, text);
+  const float cy = ds.y * 0.5f;
+  dl->AddText(f, size, ImVec2((ds.x - ts.x) * 0.5f, cy - ts.y - size * 0.4f), IM_COL32(230, 220, 200, 255), text);
+  const float w = ds.x * 0.36f, h = std::max(4.0f, ds.y * 0.008f);
+  const ImVec2 a((ds.x - w) * 0.5f, cy), b(a.x + w, cy + h);
+  dl->AddRectFilled(a, b, IM_COL32(60, 55, 50, 255), h * 0.5f);
+  // Two halves: shader translation, then pipeline creation.
+  float frac = total ? float(done) / float(total) : 0.0f;
+  frac = std::clamp((stage == 0 ? 0.0f : 0.5f) + frac * 0.5f, 0.0f, 1.0f);
+  if (frac > 0.0f) dl->AddRectFilled(a, ImVec2(a.x + w * frac, b.y), IM_COL32(180, 30, 30, 255), h * 0.5f);
+  const char* note = "Later launches are faster";
+  const float ns = size * 0.6f;
+  const ImVec2 nts = f->CalcTextSizeA(ns, FLT_MAX, 0.0f, note);
+  dl->AddText(f, ns, ImVec2((ds.x - nts.x) * 0.5f, b.y + ns), IM_COL32(150, 140, 130, 255), note);
+}
+
 void RecompOptionsPane::OnDraw(ImGuiIO& io) {
   pad_.Poll();
+  DrawShaderProgress(io);
   UpdatePromptDevice(io);
   DrawPromptGlyphs(io);
   if (const char* aspect_test = Ng2AspectTestModeName()) {  // NG2 DIAG (ng2_aspect_cycle)

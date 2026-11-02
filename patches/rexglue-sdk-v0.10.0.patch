@@ -27,6 +27,22 @@ index da8e432..17c6cf4 100644
  
    // MicroEngine binary from PM4_ME_INIT
    std::vector<uint32_t> me_bin_;
+diff --git a/include/rex/graphics/graphics_system.h b/include/rex/graphics/graphics_system.h
+index ac6b056..a7c79ee 100644
+--- a/include/rex/graphics/graphics_system.h
++++ b/include/rex/graphics/graphics_system.h
+@@ -82,6 +82,11 @@ class GraphicsSystem : public system::IGraphicsSystem {
+ 
+   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
+                                bool blocking) override;
++  // NG2 ADDITION (see IGraphicsSystem).
++  void InitializeShaderStorageAsync(
++      const std::filesystem::path& cache_root, uint32_t title_id,
++      std::function<void(int stage, uint32_t done, uint32_t total)> progress,
++      std::function<void()> done) override;
+ 
+   bool is_paused() const { return paused_; }
+   void Pause();
 diff --git a/include/rex/input/input_filter.h b/include/rex/input/input_filter.h
 new file mode 100644
 index 0000000..8943925
@@ -115,6 +131,55 @@ index 0000000..0b03c29
 +void SetFileReadHook(FileReadHook hook);
 +
 +}  // namespace rex::kernel
+diff --git a/include/rex/rex_app.h b/include/rex/rex_app.h
+index 1f52480..22cf04f 100644
+--- a/include/rex/rex_app.h
++++ b/include/rex/rex_app.h
+@@ -161,6 +161,13 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
+   /// Called after the main guest thread is created but before it starts
+   /// executing. The thread is suspended -- attach debuggers/monitors here.
+   virtual void OnPostLaunchModule(system::XThread* thread) { (void)thread; }
++  // NG2 ADDITION: shader storage load progress before the game starts (any thread). stage 0 =
++  // shaders translated, 1 = pipelines created; total 0 = loading just started.
++  virtual void OnShaderStorageProgress(int stage, uint32_t done, uint32_t total) {
++    (void)stage;
++    (void)done;
++    (void)total;
++  }
+ 
+   /// Called when the main guest thread exits. The runtime is still alive.
+   /// Use for cleanup that depends on runtime resources.
+diff --git a/include/rex/system/interfaces/graphics.h b/include/rex/system/interfaces/graphics.h
+index d54df86..4542853 100644
+--- a/include/rex/system/interfaces/graphics.h
++++ b/include/rex/system/interfaces/graphics.h
+@@ -13,6 +13,7 @@
+ 
+ #include <cstdint>
+ #include <filesystem>
++#include <functional>
+ 
+ #include <rex/system/xtypes.h>
+ 
+@@ -79,6 +80,18 @@ class IGraphicsSystem {
+     (void)blocking;
+   }
+ 
++  // NG2 ADDITION: loads the storage fully (all pipelines created) off the calling thread, so the
++  // UI can show progress. progress(stage, done, total): stage 0 = shaders translated, 1 =
++  // pipelines created; may be called from any thread. done() runs once everything is ready.
++  virtual void InitializeShaderStorageAsync(
++      const std::filesystem::path& cache_root, uint32_t title_id,
++      std::function<void(int stage, uint32_t done, uint32_t total)> progress,
++      std::function<void()> done) {
++    (void)progress;
++    InitializeShaderStorage(cache_root, title_id, true);
++    if (done) done();
++  }
++
+   // One-shot convenience for callers that don't care about the split.
+   X_STATUS Setup(runtime::FunctionDispatcher* function_dispatcher, KernelState* kernel_state,
+                  ui::WindowedAppContext* app_context, bool with_presentation) {
 diff --git a/include/rex/ui/d3d12/d3d12_frame_interpolator.h b/include/rex/ui/d3d12/d3d12_frame_interpolator.h
 new file mode 100644
 index 0000000..5124869
@@ -892,8 +957,118 @@ index 19874a5..26d5462 100644
      uint8_t* destination = memory_->TranslatePhysical(written_address);
      if (destination) {
        std::memcpy(destination, static_cast<uint8_t*>(rb.mapped_data[read_index]), written_length);
+diff --git a/src/graphics/d3d12/pipeline_cache.cpp b/src/graphics/d3d12/pipeline_cache.cpp
+index 8e6b854..bfd5681 100644
+--- a/src/graphics/d3d12/pipeline_cache.cpp
++++ b/src/graphics/d3d12/pipeline_cache.cpp
+@@ -62,8 +62,24 @@ REXCVAR_DEFINE_INT32(d3d12_pipeline_creation_threads, -1, "GPU/D3D12",
+ REXCVAR_DEFINE_BOOL(d3d12_tessellation_wireframe, false, "GPU/D3D12",
+                     "Render tessellation as wireframe");
+ 
++namespace rex::graphics {
++void ReportShaderStorageProgress(int stage, uint32_t done, uint32_t total);  // graphics_system.cpp
++}  // namespace rex::graphics
++
+ namespace rex::graphics::d3d12 {
+ 
++// NG2 ADDITION: pipelines created while the shader storage loads (progress for the UI).
++namespace {
++std::atomic<bool> g_storage_progress_active{false};
++std::atomic<uint32_t> g_storage_pipelines_done{0};
++std::atomic<uint32_t> g_storage_pipelines_total{0};
++void CountStoragePipelineCreated() {
++  if (!g_storage_progress_active.load()) return;
++  const uint32_t done = g_storage_pipelines_done.fetch_add(1) + 1;
++  ReportShaderStorageProgress(1, done, g_storage_pipelines_total.load());
++}
++}  // namespace
++
+ // Generated with `xb buildshaders`.
+ namespace shaders {
+ #include "../shaders/bytecode/d3d12_5_1/adaptive_quad_hs.h"
+@@ -366,6 +382,9 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
+     bool shader_translation_threads_shutdown = false;
+     std::mutex shaders_failed_to_translate_mutex;
+     std::vector<D3D12Shader::D3D12Translation*> shaders_failed_to_translate;
++    // NG2 ADDITION: load progress for the UI (GraphicsSystem::InitializeShaderStorageAsync).
++    std::atomic<uint32_t> progress_shaders_done{0};
++    std::atomic<uint32_t> progress_shaders_total{0};
+     auto shader_translation_thread_function = [&]() {
+       const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+       string::StringBuffer ucode_disasm_buffer;
+@@ -428,6 +447,8 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
+           std::lock_guard<std::mutex> lock(shaders_translation_thread_mutex);
+           --shader_translation_threads_busy;
+         }
++        ReportShaderStorageProgress(0, progress_shaders_done.fetch_add(1) + 1,
++                                    progress_shaders_total.load());
+       }
+       if (dxc_compiler) {
+         dxc_compiler->Release();
+@@ -490,6 +511,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
+       }
+       shaders_translation_thread_cond.notify_one();
+       ++shaders_translated;
++      progress_shaders_total = uint32_t(shaders_translated);
+     }
+     if (!shader_translation_threads.empty()) {
+       {
+@@ -532,7 +554,8 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
+     size_t creation_thread_needed_count =
+         std::max(std::min(pipeline_stored_descriptions.size(), logical_processor_count) - size_t(1),
+                  creation_thread_original_count);
+-    while (creation_threads_.size() < creation_thread_original_count) {
++    // NG2 FIX: was `< creation_thread_original_count`, so no extra threads were ever started.
++    while (creation_threads_.size() < creation_thread_needed_count) {
+       size_t creation_thread_index = creation_threads_.size();
+       std::unique_ptr<rex::thread::Thread> creation_thread = rex::thread::Thread::Create(
+           {}, [this, creation_thread_index]() { CreationThread(creation_thread_index); });
+@@ -542,6 +565,9 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
+     }
+ 
+     size_t pipelines_created = 0;
++    g_storage_pipelines_done = 0;
++    g_storage_pipelines_total = uint32_t(pipeline_stored_descriptions.size());
++    g_storage_progress_active = true;
+     for (const PipelineStoredDescription& pipeline_stored_description :
+          pipeline_stored_descriptions) {
+       const PipelineDescription& pipeline_description = pipeline_stored_description.description;
+@@ -646,6 +672,7 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
+       } else {
+         new_pipeline->state.store(CreateD3D12Pipeline(pipeline_runtime_description),
+                                   std::memory_order_release);
++        CountStoragePipelineCreated();
+       }
+       ++pipelines_created;
+     }
+@@ -685,6 +712,9 @@ void PipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_r
+       }
+     }
+ 
++    g_storage_progress_active = false;
++    ReportShaderStorageProgress(1, g_storage_pipelines_total.load(),
++                                g_storage_pipelines_total.load());
+     REXGPU_INFO(
+         "Created {} graphics pipelines (not including reading the "
+         "descriptions) from the storage in {} milliseconds",
+@@ -3232,6 +3262,7 @@ void PipelineCache::CreationThread(size_t thread_index) {
+       pipeline_to_create->state.store(CreateD3D12Pipeline(runtime_description),
+                                       std::memory_order_release);
+     }
++    CountStoragePipelineCreated();  // NG2 ADDITION
+ 
+     // Pipeline created - the thread is not busy anymore, safe to set the
+     // completion event if needed (at the next iteration, or in some other
+@@ -3262,6 +3293,7 @@ void PipelineCache::CreateQueuedPipelinesOnProcessorThread() {
+     }
+     pipeline_to_create->state.store(CreateD3D12Pipeline(runtime_description),
+                                     std::memory_order_release);
++    CountStoragePipelineCreated();  // NG2 ADDITION
+   }
+ }
+ 
 diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
-index 8f2fcb0..05084fc 100644
+index 8f2fcb0..4fe6299 100644
 --- a/src/graphics/graphics_system.cpp
 +++ b/src/graphics/graphics_system.cpp
 @@ -12,6 +12,7 @@
@@ -1062,6 +1237,50 @@ index 8f2fcb0..05084fc 100644
    if (command_processor_) {
      command_processor_->Shutdown();
      command_processor_.reset();
+@@ -339,6 +447,43 @@ void GraphicsSystem::InvalidateGpuMemory() {
+   command_processor_->CallInThread([&]() { command_processor_->InvalidateGpuMemory(); });
+ }
+ 
++// NG2 ADDITION: shader storage load progress, reported by the pipeline cache (same DLL).
++namespace {
++std::mutex g_storage_progress_mutex;
++std::function<void(int, uint32_t, uint32_t)> g_storage_progress;
++}  // namespace
++
++void ReportShaderStorageProgress(int stage, uint32_t done, uint32_t total) {
++  std::function<void(int, uint32_t, uint32_t)> cb;
++  {
++    std::lock_guard lock(g_storage_progress_mutex);
++    cb = g_storage_progress;
++  }
++  if (cb) cb(stage, done, total);
++}
++
++void GraphicsSystem::InitializeShaderStorageAsync(
++    const std::filesystem::path& cache_root, uint32_t title_id,
++    std::function<void(int stage, uint32_t done, uint32_t total)> progress,
++    std::function<void()> done) {
++  if (!REXCVAR_GET(store_shaders) || !command_processor_) {
++    if (done) done();
++    return;
++  }
++  command_processor_->CallInThread([this, cache_root, title_id, progress, done]() {
++    {
++      std::lock_guard lock(g_storage_progress_mutex);
++      g_storage_progress = progress;
++    }
++    command_processor_->InitializeShaderStorage(cache_root, title_id, true);
++    {
++      std::lock_guard lock(g_storage_progress_mutex);
++      g_storage_progress = nullptr;
++    }
++    if (done) done();
++  });
++}
++
+ void GraphicsSystem::InitializeShaderStorage(const std::filesystem::path& cache_root,
+                                              uint32_t title_id, bool blocking) {
+   if (!REXCVAR_GET(store_shaders)) {
 diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
 index 813bb1c..2bdc8d5 100644
 --- a/src/input/input_system.cpp
@@ -2650,6 +2869,69 @@ index 7360ed9..fb4f4ce 100644
    window_->RequestPaint();
    return true;
  }
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index b94fe9e..3e0c8ce 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -456,26 +456,40 @@ void ReXApp::LaunchModule() {
+       return;
+     }
+ 
++    // Starts the guest once the shader storage is loaded.
++    auto start = [this, main_thread]() mutable {
++      OnPostLaunchModule(main_thread.get());
++      main_thread->Resume();
++
++      module_thread_ = std::thread([this, main_thread = std::move(main_thread)]() mutable {
++        main_thread->Wait(0, 0, 0, nullptr);
++        OnGuestThreadExit(main_thread.get());
++        REXLOG_INFO("Execution complete");
++        if (!shutting_down_.load(std::memory_order_acquire)) {
++          app_context().CallInUIThread([this]() { app_context().QuitFromUIThread(); });
++        }
++      });
++    };
++
+     auto* graphics_system = runtime_->graphics_system();
+-    if (graphics_system && !runtime_->cache_root().empty()) {
+-      uint32_t title_id = runtime_->kernel_state()->title_id();
+-      if (title_id != 0) {
+-        REXLOG_INFO("Initializing shader storage for title {:08X}...", title_id);
+-        graphics_system->InitializeShaderStorage(runtime_->cache_root(), title_id, true);
+-      }
++    uint32_t title_id =
++        runtime_->kernel_state() ? runtime_->kernel_state()->title_id() : uint32_t(0);
++    if (graphics_system && !runtime_->cache_root().empty() && title_id != 0) {
++      // NG2 ADDITION: load (and build) all stored pipelines off the UI thread so the window
++      // stays responsive and the app can draw progress; the guest starts when it is done.
++      REXLOG_INFO("Initializing shader storage for title {:08X}...", title_id);
++      OnShaderStorageProgress(0, 0, 0);
++      graphics_system->InitializeShaderStorageAsync(
++          runtime_->cache_root(), title_id,
++          [this](int stage, uint32_t done, uint32_t total) {
++            OnShaderStorageProgress(stage, done, total);
++          },
++          [this, start]() mutable {
++            app_context().CallInUIThread([start]() mutable { start(); });
++          });
++    } else {
++      start();
+     }
+-
+-    OnPostLaunchModule(main_thread.get());
+-    main_thread->Resume();
+-
+-    module_thread_ = std::thread([this, main_thread = std::move(main_thread)]() mutable {
+-      main_thread->Wait(0, 0, 0, nullptr);
+-      OnGuestThreadExit(main_thread.get());
+-      REXLOG_INFO("Execution complete");
+-      if (!shutting_down_.load(std::memory_order_acquire)) {
+-        app_context().CallInUIThread([this]() { app_context().QuitFromUIThread(); });
+-      }
+-    });
+   });
+ }
+ 
 diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
 index 2251429..887ed79 100644
 --- a/src/ui/window_sdl.cpp
