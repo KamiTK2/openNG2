@@ -27,17 +27,14 @@ Hard = reverse-engineering + game patches.
 - [x] Framerate Cap 30 / 60 / 120 (Interpolation), default 60 (30 = display cap: NG2 is frame-locked, findings #30)
 - [x] Keyboard & mouse: rebinding (Recomp Settings > Keyboard & Mouse), free mouse look with sensitivity / invert / auto-center (findings #51/#52)
       (dropped by user: mouse in menus / point and click; per-menu layout + selection RE for ~12 screens, too much work; the skull-marker cursor also crashed and was removed)   - [x] keyboard & mouse button prompts with the player's bindings (findings #54)   - [ ] Show Karma bind   - [ ] final-playthrough check: bow aiming with the mouse (camera mode unknown until the bow is obtained; the special-mode reset may need it exempted like first person)
-- [ ] Audio: speaker setup (stereo/5.1), Music / SFX / Voice volumes if the mixer exposes them
 - [x] Skip intro logos: System > Skip Intro (default Off) skips the NinjaVI movie and Team NINJA logo; title in ~4 s (findings #47)
 
 ## Phase D: Hard (game patches)
 - [x] Ultrawide (Display > Aspect Ratio: Auto / 16:9 / 21:9 / 32:9, default Auto): Hor+ camera via the 16:9 constant, presenter stretch, HUD/menus/text/FMV kept at 16:9 (findings #31-#35)
       - [x] HUD pinned to the screen edges by render bucket (`ng2_hud_anchor`, default on); boss bar still to check
 - [x] Aspect ratio selector + FOV slider (Display > Field of View 70-150 %), mouse wheel camera zoom (findings #56)
-- [ ] Quality toggles: 16x anisotropic, disable motion blur / DoF / film grain, shadow resolution
 - [x] Skip any cutscene (System > Skip Any Cutscene, default On): movies and real-time scenes, seen or not (findings #48)   - [x] reduce artificial load waits: System > Fast Loading (loading screens run unthrottled, findings #57)
       - [x] Shader precompile: the shipped manifest fills the shader / pipeline cache from the player's game image before launch, with a progress screen (findings #58); rebuild the manifest (tools/build_shader_manifest.py) after the final full playthrough
-- [ ] Frame rate above 60 (interpolation or timing patches; speed-up risk, do last)
       - [x] Built-in frame generation 60->120: Graphics > Framerate Cap = 120 FPS (Interpolation); user: "feels great"
 
 ## Distribution: easy launcher (end goal, user 2026-11-01)
@@ -61,6 +58,9 @@ Replace NG2's statically linked Xbox Direct3D layer with a D3D12 implementation 
 - [x] Recomp Settings > Cheats: Unlock Difficulties, Unlock Costumes (apply after restart; nothing written to the save)
 
 ## Not selected
+- Audio: speaker setup (stereo/5.1), Music / SFX / Voice volumes if the mixer exposes them (dropped for 1.0, user 2026-11-02)
+- Quality toggles: 16x anisotropic, disable motion blur / DoF / film grain, shadow resolution (dropped for 1.0, user 2026-11-02)
+- Frame rate above 60 (interpolation or timing patches; speed-up risk, do last) (dropped for 1.0, user 2026-11-02)
 - In-game button prompt style swap (PlayStation/Switch icons)
 
 

@@ -42,7 +42,6 @@ launcher builds it from your own copy.
 
 ## Future plans
 
-- **1.0:** full playthrough testing, audio options, graphics quality toggles, public release
 - **1.1:** a native PC renderer (no GPU emulation) for much better performance on weak PCs
 
 ## Credits
