@@ -558,6 +558,13 @@ enum class Anchor { kCenter, kLeft, kRight };
 Anchor AnchorOfExtent(float x0, float x1) {
   if (x1 <= 640.0f) return Anchor::kLeft;
   if (x0 >= 640.0f) return Anchor::kRight;
+  // Across the centre: by where its middle is. The hit counter's blood splash (x -18..698,
+  // middle 340) crosses the centre a little; centring it moved the counter back to its 16:9
+  // place on the frames the splash existed (flicker, user 2026-11-02). Boss bar (64..1190,
+  // middle 627) stays centred.
+  const float mid = (x0 + x1) * 0.5f;
+  if (mid < 1280.0f / 3.0f) return Anchor::kLeft;
+  if (mid > 1280.0f * 2.0f / 3.0f) return Anchor::kRight;
   return Anchor::kCenter;
 }
 // Pieces of a widget (the boss bar's blue damage rectangle and purple lost-health sprite lie in

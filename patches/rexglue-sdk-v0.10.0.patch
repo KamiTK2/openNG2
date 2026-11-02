@@ -2419,6 +2419,32 @@ index 57fd161..dcd2f3f 100644
    uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
    return xeNtWaitForMultipleObjectsEx(count, handles, wait_type, wait_mode, alertable,
                                        timeout_ptr ? &timeout : nullptr);
+diff --git a/src/system/achievement_manager.cpp b/src/system/achievement_manager.cpp
+index f4e0efd..0e91e60 100644
+--- a/src/system/achievement_manager.cpp
++++ b/src/system/achievement_manager.cpp
+@@ -135,8 +135,19 @@ AchievementUnlockResult AchievementManager::UnlockAchievement(
+     auto info = std::find_if(achievements_.begin(), achievements_.end(),
+                              [&](const AchievementInfo& current) { return current.id == id; });
+     if (info == achievements_.end()) {
+-      REXSYS_WARN("Achievement store: ignoring unknown achievement {:08X}", id);
+-      return AchievementUnlockResult::kUnknownAchievement;
++      // NG2 FIX: achievements outside the title's own list (NG2's Mission Mode DLC, id 93)
++      // were ignored, so the game's achievement enumeration never reported them earned; NG2
++      // re-enumerates until it does, and the Mission Mode results screen never continued.
++      // Register a placeholder so the unlock is kept and enumerated.
++      if (id == 0) {
++        return AchievementUnlockResult::kUnknownAchievement;
++      }
++      REXSYS_WARN("Achievement store: unknown achievement {:08X} (DLC?), adding a placeholder", id);
++      AchievementInfo placeholder;
++      placeholder.id = id;
++      placeholder.label = fmt::format("Achievement {}", id);
++      achievements_.push_back(std::move(placeholder));
++      info = std::prev(achievements_.end());
+     }
+ 
+     uint64_t filetime = CurrentFileTime();
 diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
 index 77bce25..00412cf 100644
 --- a/src/system/xthread.cpp
