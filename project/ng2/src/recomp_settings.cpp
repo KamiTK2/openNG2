@@ -905,7 +905,7 @@ void RecompOptionsPane::DrawUpdateNotice(ImGuiIO& io, int64_t now) {
   const char* kUpdate = "UPDATE NOW";
   const char* kClose = "CLOSE";
   ImFont* f = g_serif_font ? g_serif_font : ImGui::GetFont();
-  const float size = io.DisplaySize.y * 0.03f;
+  const float size = io.DisplaySize.y * 0.022f;  // small, top centre (any aspect)
   const float pad = size * 0.6f, vpad = size * 0.35f;
   const ImVec2 ts = f->CalcTextSizeA(size, FLT_MAX, 0.0f, text.c_str());
   auto button_width = [&](const char* label) {
@@ -915,7 +915,7 @@ void RecompOptionsPane::DrawUpdateNotice(ImGuiIO& io, int64_t now) {
   const float update_w = clicked ? 0.0f : button_width(kUpdate);
   const float close_w = clicked ? 0.0f : button_width(kClose);
   const float buttons_w = clicked ? 0.0f : pad + update_w + vpad + close_w;
-  const ImVec2 at(io.DisplaySize.x - ts.x - buttons_w - size * 1.2f, io.DisplaySize.y - ts.y - size * 1.2f);
+  const ImVec2 at(std::floor((io.DisplaySize.x - ts.x - buttons_w) * 0.5f), std::floor(size * 0.6f + vpad));
   ImDrawList* dl = ImGui::GetForegroundDrawList();
   const ImVec2 box0(at.x - pad, at.y - vpad);
   const ImVec2 box1(at.x + ts.x + buttons_w + (clicked ? pad : vpad), at.y + ts.y + vpad);
@@ -961,7 +961,9 @@ bool ProcessAlive(DWORD pid) {
 }
 }  // namespace
 
-// Newest write time of any profile's NG2 save data (<user data>/<xuid>/544307D5/...).
+// Newest write time of any profile's story saves (<user data>/<xuid>/544307D5/.../ng2stryd*):
+// statue saves and chapter autosaves count; system data (ng2sysd.dat, written when settings
+// change) does not (user, 2026-11-02).
 int64_t RecompOptionsPane::LatestSaveWriteStamp() const {
   std::error_code ec;
   int64_t newest = 0;
@@ -973,6 +975,7 @@ int64_t RecompOptionsPane::LatestSaveWriteStamp() const {
     for (auto it = std::filesystem::recursive_directory_iterator(title, ec);
          !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
       if (!it->is_regular_file(ec)) continue;
+      if (it->path().filename().string().rfind("ng2stryd", 0) != 0) continue;
       const auto t = it->last_write_time(ec);
       if (!ec) newest = std::max<int64_t>(newest, t.time_since_epoch().count());
     }
@@ -1069,7 +1072,7 @@ bool RecompOptionsPane::DrawUpdateReadyNotice(ImGuiIO& io, int64_t now) {
     }
   }
   ImFont* f = g_serif_font ? g_serif_font : ImGui::GetFont();
-  const float size = io.DisplaySize.y * 0.03f;
+  const float size = io.DisplaySize.y * 0.022f;  // small, top centre (any aspect)
   const float pad = size * 0.6f, vpad = size * 0.35f;
   const ImVec2 ts = f->CalcTextSizeA(size, FLT_MAX, 0.0f, text.c_str());
   std::vector<float> widths;
@@ -1078,7 +1081,7 @@ bool RecompOptionsPane::DrawUpdateReadyNotice(ImGuiIO& io, int64_t now) {
     widths.push_back(f->CalcTextSizeA(size, FLT_MAX, 0.0f, b.label).x + pad * 2.0f);
     buttons_w += (buttons_w == 0.0f ? pad : vpad) + widths.back();
   }
-  const ImVec2 at(io.DisplaySize.x - ts.x - buttons_w - size * 1.2f, io.DisplaySize.y - ts.y - size * 1.2f);
+  const ImVec2 at(std::floor((io.DisplaySize.x - ts.x - buttons_w) * 0.5f), std::floor(size * 0.6f + vpad));
   ImDrawList* dl = ImGui::GetForegroundDrawList();
   const ImVec2 box0(at.x - pad, at.y - vpad);
   const ImVec2 box1(at.x + ts.x + buttons_w + (btns.empty() ? pad : vpad), at.y + ts.y + vpad);

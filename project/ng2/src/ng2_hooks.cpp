@@ -472,6 +472,7 @@ std::atomic<bool> g_in_gameplay{false};
 
 bool Ng2InGameplay() { return g_in_gameplay.load(std::memory_order_relaxed); }
 
+
 void Ng2IngameMenuFrame(bool drawn);
 void Ng2DrainSystemSounds(PPCContext& ctx, uint8_t* base);
 extern "C" REX_FUNC(__imp__sub_8368E2D8);
