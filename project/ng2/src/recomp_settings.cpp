@@ -14,6 +14,7 @@
 #include <ctime>
 #include <fstream>
 #include <string>
+#include <mutex>
 #include <vector>
 
 #include <imgui.h>
@@ -21,8 +22,10 @@
 #include <rex/audio/downmix.h>
 #include <rex/cvar.h>
 #include <rex/input/input_filter.h>
+#include <rex/input/mnk/mnk_input_driver.h>
 #include <rex/logging.h>
 #include <rex/system/kernel_state.h>
+#include <rex/ui/keybinds.h>
 #include <rex/ui/presenter.h>
 #include <rex/ui/window.h>
 
@@ -143,6 +146,192 @@ void PublishInputSettings(const RecompSettings& s) {
   g_pause_in_background = s.pause_in_background;
 }
 
+// ---- keyboard & mouse ------------------------------------------------------------------
+
+std::atomic<bool> g_mnk_enabled{true};
+
+// PC defaults chosen by the user (2026-11-01). Labels are NG2's action names (game text and
+// Controller Settings, default Type A shoulder layout).
+}  // namespace
+const BindDef kBindDefs[kBindCount] = {
+    {"keybind_lstick_up", "Move Forward", "W"},
+    {"keybind_lstick_down", "Move Back", "S"},
+    {"keybind_lstick_left", "Move Left", "A"},
+    {"keybind_lstick_right", "Move Right", "D"},
+    {"keybind_a", "Jump", "Space"},
+    {"keybind_x", "Quick Attack", "LMB"},
+    {"keybind_y", "Strong Attack", "RMB"},
+    {"keybind_b", "Projectile Weapon", "MMB"},
+    {"ng2_bind_ninpo", "Cast Ninpo", "X", XINPUT_GAMEPAD_Y | XINPUT_GAMEPAD_B},
+    {"keybind_left_trigger", "Block", "Shift"},
+    {"keybind_right_trigger", "Center Camera", "C"},
+    {"keybind_right_shoulder", "Interact", "E"},
+    {"keybind_left_shoulder", "1st-Person View", "V"},
+    {"keybind_dpad_up", "Quick Menu", "Q"},
+    {"keybind_back", "Options Menu", "Tab"},
+    {"keybind_start", "Pause Menu", "Escape"},
+};
+// SDK keybinds no row uses: cleared so their SDK defaults (arrows, K, Shift+arrows) stay off.
+const char* const kUnusedBindCvars[] = {
+    "keybind_rstick_up",   "keybind_rstick_down", "keybind_rstick_left", "keybind_rstick_right",
+    "keybind_rstick_press", "keybind_lstick_press", "keybind_dpad_down",  "keybind_dpad_left",
+    "keybind_dpad_right",  "keybind_guide"};
+
+struct MouseCameraParams {
+  bool enabled;
+  float sens_x, sens_y;
+  bool invert_y;
+  bool auto_center;
+};
+MouseCameraParams GetMouseCameraParams();
+
+std::array<std::string, kBindCount> DefaultBinds() {
+  std::array<std::string, kBindCount> out;
+  for (int i = 0; i < kBindCount; ++i) out[i] = kBindDefs[i].def;
+  return out;
+}
+namespace {
+
+// Key names the SDK parser accepts (keybinds.cpp); the first name per key wins.
+const char* const kKeyNameList[] = {
+    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R",
+    "S", "T", "U", "V", "W", "X", "Y", "Z", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+    "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "Backtick",
+    "Minus", "Plus", "Comma", "Period", "Semicolon", "Slash", "Backslash", "LBracket",
+    "RBracket", "Quote", "Escape", "Return", "Space", "Tab", "Backspace", "Delete", "Insert",
+    "Home", "End", "PageUp", "PageDown", "Left", "Right", "Up", "Down", "Shift", "Control",
+    "Alt", "Numpad0", "Numpad1", "Numpad2", "Numpad3", "Numpad4", "Numpad5", "Numpad6",
+    "Numpad7", "Numpad8", "Numpad9", "NumpadPlus", "NumpadMinus", "NumpadStar", "NumpadSlash",
+    "CapsLock", "LMB", "RMB", "MMB", "Mouse4", "Mouse5", "WheelUp", "WheelDown"};
+
+// Virtual key -> bind name (for key capture).
+const std::string& NameForVk(int vk) {
+  static const std::array<std::string, 256> table = [] {
+    std::array<std::string, 256> t;
+    for (const char* n : kKeyNameList) {
+      const int v = int(rex::ui::ParseVirtualKey(n));
+      if (v > 0 && v < 256 && t[v].empty()) t[v] = n;
+    }
+    return t;
+  }();
+  static const std::string none;
+  return vk > 0 && vk < 256 ? table[vk] : none;
+}
+
+std::string PrettyKey(const std::string& n) {
+  static const std::pair<const char*, const char*> kPretty[] = {
+      {"LMB", "Left Mouse"},   {"RMB", "Right Mouse"},  {"MMB", "Middle Mouse"},
+      {"Mouse4", "Mouse 4"},   {"Mouse5", "Mouse 5"},   {"WheelUp", "Wheel Up"},
+      {"WheelDown", "Wheel Down"}, {"Control", "Ctrl"}, {"Return", "Enter"},
+      {"Escape", "Esc"},       {"Backtick", "`"},       {"Minus", "-"},
+      {"Plus", "="},           {"Comma", ","},          {"Period", "."},
+      {"Semicolon", ";"},      {"Slash", "/"},          {"Backslash", "\\"},
+      {"LBracket", "["},       {"RBracket", "]"},       {"Quote", "'"},
+      {"PageUp", "Page Up"},   {"PageDown", "Page Down"}, {"CapsLock", "Caps Lock"},
+      {"NumpadPlus", "Num +"}, {"NumpadMinus", "Num -"}, {"NumpadStar", "Num *"},
+      {"NumpadSlash", "Num /"}};
+  for (const auto& [k, v] : kPretty) {
+    if (n == k) return v;
+  }
+  if (n.rfind("Numpad", 0) == 0) return "Num " + n.substr(6);
+  return n;
+}
+
+// "Shift+W,Up" -> "Shift+W / Up"; "" -> "None".
+std::string PrettyBind(const std::string& v) {
+  std::string out, tok;
+  auto flush = [&] {
+    while (!tok.empty() && tok.front() == ' ') tok.erase(0, 1);
+    while (!tok.empty() && tok.back() == ' ') tok.pop_back();
+    if (tok.empty()) return;
+    std::string pretty;
+    size_t start = 0, plus;
+    while ((plus = tok.find('+', start)) != std::string::npos && plus > start) {
+      pretty += PrettyKey(tok.substr(start, plus - start)) + "+";
+      start = plus + 1;
+    }
+    pretty += PrettyKey(tok.substr(start));
+    if (!out.empty()) out += " / ";
+    out += pretty;
+    tok.clear();
+  };
+  for (char c : v) {
+    if (c == ',') flush();
+    else tok += c;
+  }
+  flush();
+  return out.empty() ? "None" : out;
+}
+
+std::string FormatSens(int v) {
+  char b[16];
+  std::snprintf(b, sizeof(b), "%.1f", v / 10.0);
+  return b;
+}
+
+// App-side binds (keys that press several buttons): virtual keys per alternative.
+struct AppBind {
+  std::vector<int> vks;  // any of these held = pressed (modifier prefixes are not supported)
+  uint16_t buttons;
+};
+std::mutex g_app_binds_mutex;
+std::vector<AppBind> g_app_binds;
+
+std::vector<int> ParseBindVks(const std::string& v) {
+  std::vector<int> out;
+  std::string tok;
+  auto flush = [&] {
+    while (!tok.empty() && tok.front() == ' ') tok.erase(0, 1);
+    while (!tok.empty() && tok.back() == ' ') tok.pop_back();
+    const size_t plus = tok.rfind('+');
+    if (plus != std::string::npos) tok = tok.substr(plus + 1);
+    const int vk = tok.empty() ? 0 : int(rex::ui::ParseVirtualKey(tok));
+    if (vk > 0 && vk < 256) out.push_back(vk);
+    tok.clear();
+  };
+  for (char c : v) {
+    if (c == ',') flush();
+    else tok += c;
+  }
+  flush();
+  return out;
+}
+
+std::atomic<bool> g_mouse_camera{true};
+std::atomic<float> g_mouse_sens_x{1.0f};
+std::atomic<float> g_mouse_sens_y{1.0f};
+std::atomic<bool> g_mouse_invert_y{false};
+std::atomic<bool> g_mouse_auto_center{false};
+
+void PublishMnk(const RecompSettings& s) {
+  g_mnk_enabled = s.mnk_enabled;
+  g_mouse_camera = s.mouse_camera;
+  g_mouse_sens_x = s.mouse_sens / 10.0f;
+  g_mouse_sens_y = s.mouse_sens_y / 10.0f;
+  g_mouse_invert_y = s.invert_mouse_y;
+  g_mouse_auto_center = s.mouse_auto_center;
+  // Mouse camera: motion goes straight into the game's stick floats (ng2_hooks.cpp), not
+  // through the SDK's capped right-stick emulation.
+  rex::cvar::SetFlagByName("mnk_mouse_raw", "true");
+  rex::cvar::SetFlagByName("mnk_mode", s.mnk_enabled ? "true" : "false");
+  rex::cvar::SetFlagByName("mnk_mouse", s.mouse_camera ? "true" : "false");
+  rex::cvar::SetFlagByName("mnk_sensitivity", std::to_string(s.mouse_sens / 10.0));
+  rex::cvar::SetFlagByName("mnk_sensitivity_y", std::to_string(s.mouse_sens_y / 10.0));
+  rex::cvar::SetFlagByName("mnk_invert_y", s.invert_mouse_y ? "true" : "false");
+  {
+    std::lock_guard<std::mutex> lock(g_app_binds_mutex);
+    g_app_binds.clear();
+    for (int i = 0; i < kBindCount; ++i) {
+      if (kBindDefs[i].app_buttons) {
+        g_app_binds.push_back({ParseBindVks(s.binds[i]), kBindDefs[i].app_buttons});
+      } else {
+        rex::cvar::SetFlagByName(kBindDefs[i].cvar, s.binds[i]);
+      }
+    }
+  }
+  for (const char* c : kUnusedBindCvars) rex::cvar::SetFlagByName(c, "");
+}
+
 // "2026-11-01_01-53-09[_before-restore]" -> "2026-11-01 01:53" (+ " (pre-restore)").
 std::string BackupLabel(const std::string& name) {
   if (name.size() < 16 || name[10] != '_') return name;
@@ -228,6 +417,37 @@ void InstallRecompInputFilters() {
                                                    XINPUT_GAMEPAD_DPAD_RIGHT | XINPUT_GAMEPAD_A));
       g.thumb_lx = int16_t(0);
     }
+    // Keyboard in the game's menus: fixed PC keys (arrows, Enter = A, Esc / Backspace = B).
+    // In gameplay Esc is the Pause binding (Start); in menus it must not reach Start.
+    if (g_mnk_enabled && !Ng2InGameplay() && OurWindowFocused() &&
+        !RecompSettingsBlocksGameInput()) {
+      auto down = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
+      uint16_t b = uint16_t(g.buttons);
+      if (down(VK_UP)) b |= XINPUT_GAMEPAD_DPAD_UP;
+      if (down(VK_DOWN)) b |= XINPUT_GAMEPAD_DPAD_DOWN;
+      if (down(VK_LEFT)) b |= XINPUT_GAMEPAD_DPAD_LEFT;
+      if (down(VK_RIGHT)) b |= XINPUT_GAMEPAD_DPAD_RIGHT;
+      if (down(VK_RETURN)) b |= XINPUT_GAMEPAD_A;
+      if (down(VK_ESCAPE)) b = uint16_t((b & ~XINPUT_GAMEPAD_START) | XINPUT_GAMEPAD_B);
+      if (down(VK_BACK)) b |= XINPUT_GAMEPAD_B;
+      g.buttons = b;
+    }
+    // App-side binds (Cast Ninpo = Y+B). Mouse buttons only count in gameplay, like the SDK's.
+    if (g_mnk_enabled && OurWindowFocused() && !RecompSettingsBlocksGameInput()) {
+      const bool gameplay = Ng2InGameplay();
+      std::lock_guard<std::mutex> lock(g_app_binds_mutex);
+      for (const auto& ab : g_app_binds) {
+        for (int vk : ab.vks) {
+          const bool mouse = vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON ||
+                             vk == VK_XBUTTON1 || vk == VK_XBUTTON2;
+          if (mouse && !gameplay) continue;
+          if (GetAsyncKeyState(vk) & 0x8000) {
+            g.buttons = uint16_t(uint16_t(g.buttons) | ab.buttons);
+            break;
+          }
+        }
+      }
+    }
     const int dz = g_deadzone_pct.load();
     if (dz > 0) {
       ApplyDeadzone(g.thumb_lx, g.thumb_ly, dz / 100.0f);
@@ -305,6 +525,7 @@ void LoadRecompSettingsFonts(ImFontAtlas* atlas) {
 bool RecompSettings::Load(const std::filesystem::path& path) {
   std::ifstream in(path);
   if (!in) return false;
+  int bind_layout = 0;
   std::string line;
   while (std::getline(in, line)) {
     auto hash = line.find('#');
@@ -343,7 +564,25 @@ bool RecompSettings::Load(const std::filesystem::path& path) {
     else if (k == "ng2_skip_intro") skip_intro = ParseBool(v, skip_intro);
     else if (k == "ng2_skip_any_cutscene")
       skip_any_cutscene = ParseBool(v, skip_any_cutscene);
+    else if (k == "mnk_mode") mnk_enabled = ParseBool(v, mnk_enabled);
+    else if (k == "mnk_mouse") mouse_camera = ParseBool(v, mouse_camera);
+    else if (k == "ng2_mouse_sens") mouse_sens = ParseInt(v, mouse_sens, 1, 50);
+    else if (k == "ng2_mouse_sens_y") mouse_sens_y = ParseInt(v, mouse_sens_y, 1, 50);
+    else if (k == "mnk_invert_y") invert_mouse_y = ParseBool(v, invert_mouse_y);
+    else if (k == "ng2_mouse_auto_center") mouse_auto_center = ParseBool(v, mouse_auto_center);
+    else if (k == "ng2_bind_layout") bind_layout = ParseInt(v, 0, 0, 1000);
+    else if (k.rfind("keybind_", 0) == 0 || k.rfind("ng2_bind_", 0) == 0) {
+      std::string val = v;
+      if (val.size() >= 2 && val.front() == '"' && val.back() == '"') {
+        val = val.substr(1, val.size() - 2);
+      }
+      for (int i = 0; i < kBindCount; ++i) {
+        if (k == kBindDefs[i].cvar) binds[i] = val;
+      }
+    }
   }
+  // Bindings saved under an older default layout are replaced by the current defaults.
+  if (bind_layout < kBindLayoutVersion) binds = DefaultBinds();
   return true;
 }
 
@@ -385,7 +624,19 @@ bool RecompSettings::Save(const std::filesystem::path& path) const {
       << "ng2_cheat_difficulties = " << b(cheat_difficulties) << "\n"
       << "ng2_cheat_costumes = " << b(cheat_costumes) << "\n"
       << "ng2_skip_intro = " << b(skip_intro) << "\n"
-      << "ng2_skip_any_cutscene = " << b(skip_any_cutscene) << "\n";
+      << "ng2_skip_any_cutscene = " << b(skip_any_cutscene) << "\n"
+      << "mnk_mode = " << b(mnk_enabled) << "\n"
+      << "mnk_mouse = " << b(mouse_camera) << "\n"
+      << "ng2_mouse_sens = " << mouse_sens << "\n"
+      << "ng2_mouse_sens_y = " << mouse_sens_y << "\n"
+      << "mnk_sensitivity = " << mouse_sens / 10.0 << "\n"
+      << "mnk_sensitivity_y = " << mouse_sens_y / 10.0 << "\n"
+      << "mnk_invert_y = " << b(invert_mouse_y) << "\n"
+      << "ng2_mouse_auto_center = " << b(mouse_auto_center) << "\n";
+  out << "ng2_bind_layout = " << kBindLayoutVersion << "\n";
+  for (int i = 0; i < kBindCount; ++i) {
+    out << kBindDefs[i].cvar << " = \"" << binds[i] << "\"\n";
+  }
   return bool(out);
 }
 
@@ -404,6 +655,7 @@ void RecompSettings::ApplyStartup(const std::filesystem::path& path) {
   rex::audio::SetOutputGain(s.master_volume / 100.0f);
   PublishInputSettings(s);
   PublishCheats(s);
+  PublishMnk(s);  // also when the file predates these keys (PC defaults, not the SDK's)
   REXLOG_INFO("RECOMP SETTINGS loaded from {} (present_effect {})", path.string(),
               rex::cvar::GetFlagByName("present_effect"));
 }
@@ -431,10 +683,13 @@ const ImU32 kDisabled = IM_COL32(110, 106, 100, 255);
 const ImU32 kShadow = IM_COL32(0, 0, 0, 150);
 const ImU32 kRedMarker = IM_COL32(200, 24, 16, 255);
 
-const char* kCategories[] = {"Display", "Graphics", "Audio", "Controls", "System", "Cheats"};
-constexpr int kCategoryCount = 6;
+const char* kCategories[] = {"Display",          "Graphics", "Audio", "Controls",
+                             "Keyboard & Mouse", "System",   "Cheats"};
+constexpr int kCategoryCount = 7;
+// Rows on screen including the pinned Category row; longer lists scroll.
+constexpr int kVisibleRows = 9;
 
-enum class Kind { kStepper, kPair, kAction };
+enum class Kind { kStepper, kPair, kAction, kBind };
 struct RowDef {
   const char* label;
   Kind kind;
@@ -445,6 +700,7 @@ struct RowDef {
   bool a_selected = false;
   std::function<bool(int dir, bool accept)> change;  // returns true if settings changed
   bool disabled = false;  // greyed out and skipped by the cursor
+  int bind = -1;          // kBind: index into kBindDefs
 };
 
 }  // namespace
@@ -533,6 +789,7 @@ void RecompOptionsPane::ApplyAndSave() {
   if (!muted_for_background_) rex::audio::SetOutputGain(settings_.master_volume / 100.0f);
   PublishInputSettings(settings_);
   PublishCheats(settings_);
+  PublishMnk(settings_);
   if (!settings_.Save(settings_path_)) {
     REXLOG_WARN("RECOMP SETTINGS: failed to write {}", settings_path_.string());
   }
@@ -713,6 +970,8 @@ void RecompOptionsPane::LogFrameRate() {
 
 void RecompOptionsPane::OnDraw(ImGuiIO& io) {
   pad_.Poll();
+  // Mouse look (cursor capture, mouse buttons as game inputs) only while playing.
+  rex::input::mnk::SetMouseLookActive(Ng2InGameplay() && !focused_ && !overlay_open_);
   {
     // Aspect Ratio (Auto re-evaluates when the window changes shape).
     const double want = AspectForMode(settings_.aspect_mode, io.DisplaySize.x, io.DisplaySize.y);
@@ -760,6 +1019,8 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
                   category_ < kCategoryCount - 1, nullptr, nullptr, false,
                   [this](int dir, bool) {
                     category_ = std::clamp(category_ + dir, 0, kCategoryCount - 1);
+                    scroll_ = 0;
+                    capture_bind_ = -1;
                     return false;
                   }});
   auto pair_row = [&](const char* label, const char* a, const char* b, bool a_sel,
@@ -884,14 +1145,44 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
       step_row("Vibration", buf, s.vibration, 0, 100, 10, [&s](int v) { s.vibration = v; });
       break;
     }
-    case 5: {  // Cheats
+    case 4: {  // Keyboard & Mouse
+      pair_row("Keyboard & Mouse", "On", "Off", s.mnk_enabled,
+               [&s](bool a) { s.mnk_enabled = a; });
+      pair_row("Mouse Camera", "On", "Off", s.mouse_camera, [&s](bool a) { s.mouse_camera = a; });
+      step_row("Mouse Sensitivity", FormatSens(s.mouse_sens), s.mouse_sens, 1, 50, 1,
+               [&s](int v) { s.mouse_sens = v; });
+      step_row("Vertical Sensitivity", FormatSens(s.mouse_sens_y), s.mouse_sens_y, 1, 50, 1,
+               [&s](int v) { s.mouse_sens_y = v; });
+      pair_row("Invert Mouse Y", "On", "Off", s.invert_mouse_y,
+               [&s](bool a) { s.invert_mouse_y = a; });
+      pair_row("Camera Auto-Center", "On", "Off", s.mouse_auto_center,
+               [&s](bool a) { s.mouse_auto_center = a; });
+      for (int i = 0; i < kBindCount; ++i) {
+        RowDef r{kBindDefs[i].label, Kind::kBind, PrettyBind(s.binds[i])};
+        r.bind = i;
+        r.change = [this, i, now](int dir, bool accept) {
+          if (!accept || dir) return false;
+          capture_bind_ = i;  // next key / mouse button / wheel becomes the binding
+          capture_armed_ = false;
+          capture_until_ms_ = now + 8000;
+          return false;
+        };
+        rows.push_back(std::move(r));
+      }
+      action_row("Reset Bindings", [&s] {
+        s.binds = DefaultBinds();
+        return true;
+      });
+      break;
+    }
+    case 6: {  // Cheats
       pair_row("Unlock Difficulties", "On", "Off", s.cheat_difficulties,
                [&s](bool a) { s.cheat_difficulties = a; });
       pair_row("Unlock Costumes", "On", "Off", s.cheat_costumes,
                [&s](bool a) { s.cheat_costumes = a; });
       break;
     }
-    case 4: {  // System
+    case 5: {  // System
       pair_row("Skip Intro", "On", "Off", s.skip_intro, [&s](bool a) { s.skip_intro = a; });
       pair_row("Skip Any Cutscene", "On", "Off", s.skip_any_cutscene,
                [&s](bool a) { s.skip_any_cutscene = a; });
@@ -954,6 +1245,43 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
       g_pane_focused = true;
       row_ = 0;
     }
+  } else if (capture_bind_ >= 0) {
+    // Key capture for a binding row: wait until everything is released, then take the next
+    // key, mouse button or wheel tick. Esc / controller B cancel, Delete clears.
+    bool done = false;
+    if (!OurWindowFocused() || now > capture_until_ms_ || capture_bind_ >= kBindCount) {
+      done = true;
+    } else {
+      int pressed_vk = 0;
+      bool any = false;
+      for (int vk = 1; vk < 255; ++vk) {
+        if (vk >= 0xA0 && vk <= 0xA5) continue;  // L/R variants; the generic code is reported
+        if (GetAsyncKeyState(vk) & 0x8000) {
+          any = true;
+          if (!pressed_vk && !NameForVk(vk).empty()) pressed_vk = vk;
+        }
+      }
+      if (!capture_armed_) {
+        if (!any && !pad_.any_held && io.MouseWheel == 0.0f) capture_armed_ = true;
+      } else if (io.MouseWheel != 0.0f) {
+        s.binds[capture_bind_] = io.MouseWheel > 0.0f ? "WheelUp" : "WheelDown";
+        changed = done = true;
+      } else if (pressed_vk == VK_ESCAPE) {
+        done = true;
+      } else if (pressed_vk == VK_DELETE) {
+        s.binds[capture_bind_].clear();
+        changed = done = true;
+      } else if (pressed_vk) {
+        s.binds[capture_bind_] = NameForVk(pressed_vk);
+        changed = done = true;
+      } else if (pad_.back) {
+        done = true;
+      }
+    }
+    if (done) {
+      capture_bind_ = -1;
+      Ng2QueueSystemSound(kSoundCursor);
+    }
   } else {
     const int n = int(rows.size());
     row_ = std::clamp(row_, 0, n - 1);
@@ -977,6 +1305,15 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
     }
   }
   if (changed) ApplyAndSave();
+  // Keep the cursor row on screen (Category stays pinned at the top).
+  const int row_count = int(rows.size());
+  if (row_count > kVisibleRows) {
+    if (row_ >= 1 && row_ < scroll_ + 1) scroll_ = row_ - 1;
+    if (row_ > scroll_ + kVisibleRows - 1) scroll_ = row_ - (kVisibleRows - 1);
+    scroll_ = std::clamp(scroll_, 0, row_count - kVisibleRows);
+  } else {
+    scroll_ = 0;
+  }
   if (!overlay_open_ && !pane_visible_()) return;
 
   // ---- drawing -----------------------------------------------------------------------
@@ -1019,9 +1356,12 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
 
   // The row list can change after input (category switch), so rebuild-free drawing uses
   // the category that was current when the rows were built; a switch shows next frame.
-  for (int i = 0; i < int(rows.size()); ++i) {
+  const int slots = std::min(row_count, kVisibleRows);
+  for (int slot = 0; slot < slots; ++slot) {
+    const int i = slot == 0 ? 0 : scroll_ + slot;
+    if (i >= row_count) break;
     const RowDef& r = rows[i];
-    const float y = Y(i);
+    const float y = Y(slot);
     const bool on = focused_ && row_ == i;
     if (on) {
       const float m = px * 0.18f, cx = X(L.label_x) - px * 0.55f;
@@ -1037,6 +1377,13 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
       text_at(X(L.pair_left_x), y, r.a_selected ? kWhite : kGrey, r.a, true, px);
       text_at(X(L.pair_slash_x), y, kGrey, "/", true, px);
       text_at(X(L.pair_right_x), y, r.a_selected ? kGrey : kWhite, r.b, true, px);
+    } else if (r.kind == Kind::kBind) {
+      const bool capturing = capture_bind_ == r.bind;
+      const char* v = capturing ? "Press a key  (Esc cancel, Del clear)" : r.value.c_str();
+      const float room = X(L.arrow_right_x) - X(L.arrow_left_x) + px * 2.0f;
+      const float w = font->CalcTextSizeA(px, FLT_MAX, 0.0f, v).x;
+      const float vpx = w > room ? std::max(px * room / w, px * 0.45f) : px;
+      text_at(X(L.value_x), y, capturing ? kRedMarker : kWhite, v, true, vpx);
     } else if (r.kind == Kind::kStepper) {
       const float t = px * 0.30f;
       dl->AddTriangleFilled(ImVec2(X(L.arrow_left_x) - t, y), ImVec2(X(L.arrow_left_x) + t * 0.8f, y - t),
@@ -1056,7 +1403,21 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
 
   // Footer: restart note / status message (below the rows, like the game's play time).
   const float note_px = vp.h * 0.026f;
-  float fy = Y(int(rows.size())) + px * 0.2f;
+  // Scroll hints: more rows above / below.
+  if (row_count > kVisibleRows) {
+    const float t = px * 0.22f, ax = X(L.label_x) - px * 1.1f;
+    if (scroll_ > 0) {
+      const float ay = Y(1) - px * 0.15f;
+      dl->AddTriangleFilled(ImVec2(ax, ay - t), ImVec2(ax - t, ay + t * 0.6f),
+                            ImVec2(ax + t, ay + t * 0.6f), kGrey);
+    }
+    if (scroll_ + kVisibleRows < row_count) {
+      const float ay = Y(slots - 1) + px * 0.15f;
+      dl->AddTriangleFilled(ImVec2(ax, ay + t), ImVec2(ax - t, ay - t * 0.6f),
+                            ImVec2(ax + t, ay - t * 0.6f), kGrey);
+    }
+  }
+  float fy = Y(slots) + px * 0.2f;
   // Internal Resolution and Anti-Aliasing apply live (SDK cvar callbacks; a resolution
   // change rebuilds the GPU context with a brief hitch).
   const bool needs_restart = s.cheat_difficulties != startup_.cheat_difficulties ||
@@ -1068,6 +1429,11 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
     fy += note_px * 1.5f;
   }
   if (now < status_until_ms_) text_at(X(L.label_x), fy, kWhite, status_.c_str(), false, note_px);
+}
+
+MouseCameraParams GetMouseCameraParams() {
+  return {g_mnk_enabled.load() && g_mouse_camera.load(), g_mouse_sens_x.load(),
+          g_mouse_sens_y.load(), g_mouse_invert_y.load(), g_mouse_auto_center.load()};
 }
 
 }  // namespace ng2

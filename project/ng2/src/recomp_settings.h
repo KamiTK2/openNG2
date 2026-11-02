@@ -9,6 +9,7 @@
 // - RecompOptionsPane: draws the settings in the Options right-hand pane in the game's
 //   style (Category stepper + rows) and handles navigation.
 
+#include <array>
 #include <atomic>
 #include <climits>
 #include <cstdint>
@@ -45,7 +46,24 @@ void RecompCountGameFrame();
 inline constexpr uint32_t kSoundCursor = 17;
 void Ng2QueueSystemSound(uint32_t id);
 
+// True while the player is in control in gameplay (ng2_hooks.cpp render pass).
+bool Ng2InGameplay();
+
 namespace ng2 {
+
+// Keyboard & Mouse bindings: one row per controller input (SDK cvar keybind_*), shown with
+// NG2's action names. A value is a comma-separated list of key names (SDK keybinds.cpp).
+struct BindDef {
+  const char* cvar;    // SDK keybind cvar, or an ng2_bind_* settings key when app_buttons != 0
+  const char* label;
+  const char* def;
+  uint16_t app_buttons = 0;  // app-side bind: XInput buttons it presses (Cast Ninpo = Y+B)
+};
+inline constexpr int kBindCount = 16;
+// Bump when the default layout changes: older saved bindings are replaced by the defaults.
+inline constexpr int kBindLayoutVersion = 2;
+extern const BindDef kBindDefs[kBindCount];
+std::array<std::string, kBindCount> DefaultBinds();
 
 struct RecompSettings {
   // Display
@@ -79,6 +97,14 @@ struct RecompSettings {
   bool invert_camera_y = false;
   int stick_deadzone = 0;  // extra radial deadzone, percent 0..30
   int vibration = 100;     // percent 0..100
+  // Keyboard & Mouse (SDK MnK driver cvars; live)
+  bool mnk_enabled = true;      // mnk_mode
+  bool mouse_camera = true;     // mnk_mouse (camera from the mouse in gameplay)
+  int mouse_sens = 10;          // 1..50 = 0.1..5.0 (mnk_sensitivity)
+  int mouse_sens_y = 10;        // 1..50 (mnk_sensitivity_y)
+  bool invert_mouse_y = false;  // mnk_invert_y
+  bool mouse_auto_center = false;  // game swings the camera back behind Ryu between mouse moves
+  std::array<std::string, kBindCount> binds = DefaultBinds();
   // System
   bool skip_any_cutscene = true;  // cvar ng2_skip_any_cutscene (live)
   bool skip_intro = false;  // skip the boot movie (cvar ng2_skip_intro; next launch)
@@ -145,6 +171,10 @@ class RecompOptionsPane : public rex::ui::ImGuiDialog {
   bool focused_ = false;
   int category_ = 0;
   int row_ = 0;
+  int scroll_ = 0;            // first visible row below Category (long lists scroll)
+  int capture_bind_ = -1;     // binding row waiting for a key (-1 = none)
+  bool capture_armed_ = false;  // all keys released since capture started
+  int64_t capture_until_ms_ = 0;
   bool muted_for_background_ = false;
   int applied_monitor_ = 0;  // display the window is currently placed on
   double applied_aspect_ = -1.0;  // ng2_aspect_ratio last set by Aspect Ratio

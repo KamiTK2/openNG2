@@ -10,6 +10,7 @@
 #include <tlhelp32.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <mutex>
 #include <string>
@@ -271,12 +272,184 @@ void DumpGuestMemory(const std::wstring& tag) {
   REXLOG_WARN("[memdump] wrote memdump_{}.bin", std::string(tag.begin(), tag.end()));
 }
 
+// ---- NG2 DIAG: hardware data watchpoints ----------------------------------------------
+// Create ng2_watch.txt next to ng2.exe with up to 4 guest addresses (hex, one per line).
+// Once the player is in gameplay, DR0-3 are set on every thread for 8 s (read/write, 4 bytes)
+// and each accessing host instruction is logged with its symbol and generated line (which
+// carries the PPC instruction), i.e. which recompiled function touches the data.
+bool Ng2InGameplay();  // ng2_hooks.cpp
+
+namespace {
+
+constexpr int kWatchSlots = 512;
+std::atomic<uint64_t> g_watch_pc[kWatchSlots];
+std::atomic<uint32_t> g_watch_count[kWatchSlots];
+std::atomic<uint32_t> g_watch_which[kWatchSlots];
+std::atomic<bool> g_watch_on{false};
+
+LONG CALLBACK WatchVeh(EXCEPTION_POINTERS* ep) {
+  if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || !g_watch_on) {
+    return EXCEPTION_CONTINUE_SEARCH;
+  }
+  CONTEXT* c = ep->ContextRecord;
+  const uint32_t hit = uint32_t(c->Dr6 & 0xF);
+  if (!hit) return EXCEPTION_CONTINUE_SEARCH;
+  const uint64_t pc = c->Rip;
+  for (int i = 0, h = int((pc >> 2) % kWatchSlots); i < kWatchSlots; ++i, h = (h + 1) % kWatchSlots) {
+    uint64_t cur = g_watch_pc[h].load();
+    if (cur == pc || (cur == 0 && g_watch_pc[h].compare_exchange_strong(cur, pc)) || cur == pc) {
+      g_watch_count[h].fetch_add(1);
+      g_watch_which[h].fetch_or(hit);
+      break;
+    }
+  }
+  c->Dr6 = 0;
+  return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+std::vector<uint32_t> g_watch_lens;  // 4 or 8 bytes per address
+
+void SetWatchRegs(const std::vector<uint32_t>& guest_addrs) {
+  DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
+  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+  if (snap == INVALID_HANDLE_VALUE) return;
+  THREADENTRY32 te{sizeof(te)};
+  for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+    if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+    HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE,
+                          te.th32ThreadID);
+    if (!t) continue;
+    if (SuspendThread(t) != DWORD(-1)) {
+      CONTEXT ctx{};
+      ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+      if (GetThreadContext(t, &ctx)) {
+        DWORD64 dr7 = 0;
+        DWORD64* regs[4] = {&ctx.Dr0, &ctx.Dr1, &ctx.Dr2, &ctx.Dr3};
+        for (size_t i = 0; i < 4; ++i) {
+          const bool eight = i < g_watch_lens.size() && g_watch_lens[i] == 8;
+          *regs[i] = i < guest_addrs.size()
+                         ? kGuestVirtualBase + (guest_addrs[i] & (eight ? ~7u : ~3u))
+                         : 0;
+          if (i < guest_addrs.size()) {
+            dr7 |= 1ull << (2 * i);                          // local enable
+            dr7 |= 3ull << (16 + 4 * i);                     // read/write
+            dr7 |= (eight ? 2ull : 3ull) << (18 + 4 * i);    // 8 or 4 bytes
+          }
+        }
+        ctx.Dr7 = dr7;
+        ctx.Dr6 = 0;
+        SetThreadContext(t, &ctx);
+      }
+      ResumeThread(t);
+    }
+    CloseHandle(t);
+  }
+  CloseHandle(snap);
+}
+
+void RunWatch(std::vector<uint32_t> addrs) {
+  REXLOG_WARN("[watch] armed for {} address(es), waiting for gameplay", addrs.size());
+  for (int i = 0; i < 6000 && !::Ng2InGameplay(); ++i) Sleep(100);
+  static bool veh = false;
+  if (!veh) {
+    AddVectoredExceptionHandler(1, WatchVeh);
+    veh = true;
+  }
+  for (auto& p : g_watch_pc) p = 0;
+  for (auto& c : g_watch_count) c = 0;
+  for (auto& w : g_watch_which) w = 0;
+  g_watch_on = true;
+  for (int i = 0; i < 16; ++i) {  // 8 s; re-apply for threads created meanwhile
+    SetWatchRegs(addrs);
+    Sleep(500);
+  }
+  SetWatchRegs({});
+  Sleep(100);
+  g_watch_on = false;
+  static bool sym_ready = false;
+  if (!sym_ready) {
+    SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+    SymInitialize(GetCurrentProcess(), nullptr, TRUE);
+    sym_ready = true;
+  }
+  int n = 0;
+  for (int i = 0; i < kWatchSlots; ++i) {
+    const uint64_t pc = g_watch_pc[i].load();
+    if (!pc) continue;
+    ++n;
+    HANDLE proc = GetCurrentProcess();
+    alignas(SYMBOL_INFO) char symbuf[sizeof(SYMBOL_INFO) + 512];
+    auto* sym = reinterpret_cast<SYMBOL_INFO*>(symbuf);
+    sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+    sym->MaxNameLen = 511;
+    DWORD64 disp = 0;
+    std::string name = SymFromAddr(proc, pc, &disp, sym) ? sym->Name : "?";
+    IMAGEHLP_LINE64 line{sizeof(IMAGEHLP_LINE64)};
+    DWORD ldisp = 0;
+    std::string where;
+    if (SymGetLineFromAddr64(proc, pc, &ldisp, &line)) {
+      std::string f = line.FileName;
+      where = f.substr(f.find_last_of("\\/") + 1) + ":" + std::to_string(line.LineNumber);
+    }
+    REXLOG_WARN("[watch] slots {:X} hits {} at {}+0x{:X} {}", g_watch_which[i].load(),
+                g_watch_count[i].load(), name, disp, where);
+  }
+  REXLOG_WARN("[watch] done, {} accessing instruction(s)", n);
+}
+
+void InstallCrashHandler_Watch() {
+  std::thread([] {
+    const std::wstring path = ExeDir() + L"ng2_watch.txt";
+    for (;;) {
+      Sleep(1000);
+      FILE* f = _wfopen(path.c_str(), L"r");
+      if (!f) continue;
+      std::vector<uint32_t> addrs;
+      g_watch_lens.clear();
+      char line[128];
+      while (addrs.size() < 4 && fgets(line, sizeof(line), f)) {
+        unsigned v = 0, len = 4;
+        if (sscanf(line, "%x %u", &v, &len) >= 1) {
+          addrs.push_back(v);
+          g_watch_lens.push_back(len == 8 ? 8 : 4);
+        }
+      }
+      fclose(f);
+      DeleteFileW(path.c_str());
+      if (!addrs.empty()) RunWatch(addrs);
+    }
+  }).detach();
+}
+
+}  // namespace
+
 void InstallCrashHandler() {
+  InstallCrashHandler_Watch();
   SetUnhandledExceptionFilter(Filter);
   // On-demand guest memory dump: create "ng2_dumpmem_<tag>" next to ng2.exe.
   std::thread([] {
+    int hotkey_count = 0;
+    bool f8_was_down = false;
     for (;;) {
-      Sleep(200);
+      Sleep(50);
+      // NG2 DIAG: F8 (game window focused) writes memdump_cam<N>.bin, for memory diffs that
+      // need the player to do something between snapshots (e.g. turn the camera).
+      {
+        HWND fg = GetForegroundWindow();
+        DWORD pid = 0;
+        GetWindowThreadProcessId(fg, &pid);
+        const bool f8 = pid == GetCurrentProcessId() && (GetAsyncKeyState(VK_F8) & 0x8000);
+        if (f8 && !f8_was_down) {
+          DumpGuestMemory(L"cam" + std::to_wstring(++hotkey_count));
+        }
+        f8_was_down = f8;
+        // F9: a marker line in the log (to line diagnostics up with what the player did).
+        static bool f9_was_down = false;
+        static int marks = 0;
+        const bool f9 = pid == GetCurrentProcessId() && (GetAsyncKeyState(VK_F9) & 0x8000);
+        if (f9 && !f9_was_down) REXLOG_WARN("[mark] MARK {}", ++marks);
+        f9_was_down = f9;
+      }
       WIN32_FIND_DATAW fd;
       std::wstring pattern = ExeDir() + L"ng2_dumpmem_*";
       HANDLE f = FindFirstFileW(pattern.c_str(), &fd);

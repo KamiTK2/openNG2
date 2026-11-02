@@ -54,6 +54,39 @@ index 0000000..8943925
 +void SetVibrationFilter(VibrationFilter filter);
 +
 +}  // namespace rex::input
+diff --git a/include/rex/input/mnk/mnk_input_driver.h b/include/rex/input/mnk/mnk_input_driver.h
+index c8751b7..a469fa6 100644
+--- a/include/rex/input/mnk/mnk_input_driver.h
++++ b/include/rex/input/mnk/mnk_input_driver.h
+@@ -24,6 +24,10 @@ namespace rex::input::mnk {
+ 
+ void SetMouseLookActive(bool active);
+ bool IsMouseLookActive();
++// NG2 ADDITION: with cvar mnk_mouse_raw, captured mouse motion is not turned into right-stick
++// input; it accumulates here for the app (e.g. to drive the game camera directly). Returns the
++// motion since the last call (physical pixels, +x right, +y down) and resets it.
++void ConsumeMouseDelta(float& dx, float& dy);
+ 
+ class MnkInputDriver final : public InputDriver,
+                              public rex::ui::WindowInputListener,
+@@ -50,6 +54,7 @@ class MnkInputDriver final : public InputDriver,
+   void OnMouseDown(rex::ui::MouseEvent& e) override;
+   void OnMouseUp(rex::ui::MouseEvent& e) override;
+   void OnMouseMove(rex::ui::MouseEvent& e) override;
++  void OnMouseWheel(rex::ui::MouseEvent& e) override;  // NG2 ADDITION
+ 
+   // WindowListener
+   void OnClosing(rex::ui::UIEvent& e) override;
+@@ -81,6 +86,9 @@ class MnkInputDriver final : public InputDriver,
+   // Filled on the UI thread, drained on the guest thread, hence the lock.
+   float mouse_dx_ = 0.0f;
+   float mouse_dy_ = 0.0f;
++  // NG2 ADDITION: wheel ticks act as short presses of WheelUp / WheelDown (steady clock ms).
++  int64_t wheel_up_until_ms_ = 0;
++  int64_t wheel_down_until_ms_ = 0;
+ 
+   // UI thread only.
+   int32_t prev_mouse_x_ = 0;
 diff --git a/include/rex/kernel/file_read_hook.h b/include/rex/kernel/file_read_hook.h
 new file mode 100644
 index 0000000..0b03c29
@@ -1091,6 +1124,207 @@ index 813bb1c..2bdc8d5 100644
  
  }  // namespace rex::input
 +
+diff --git a/src/input/mnk/mnk_input_driver.cpp b/src/input/mnk/mnk_input_driver.cpp
+index 3f9422d..8e38ec8 100644
+--- a/src/input/mnk/mnk_input_driver.cpp
++++ b/src/input/mnk/mnk_input_driver.cpp
+@@ -18,6 +18,7 @@
+ #include <rex/ui/window.h>
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cmath>
+ #include <cstdlib>
+ #include <cstring>
+@@ -29,6 +30,13 @@ REXCVAR_DEFINE_BOOL(mnk_mouse, false, "Input",
+                     "from the keybind_rstick_* keys only");
+ REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 1.0, "Input", "Mouse sensitivity for right stick")
+     .range(0.01, 10.0);
++// NG2 ADDITION: separate vertical sensitivity and inversion.
++REXCVAR_DEFINE_DOUBLE(mnk_sensitivity_y, 1.0, "Input", "Vertical mouse sensitivity")
++    .range(0.01, 10.0);
++REXCVAR_DEFINE_BOOL(mnk_invert_y, false, "Input", "Invert vertical mouse look");
++REXCVAR_DEFINE_BOOL(mnk_mouse_raw, false, "Input",
++                    "Deliver captured mouse motion to the app (ConsumeMouseDelta) instead of "
++                    "the right stick");
+ 
+ REXCVAR_DEFINE_STRING(keybind_a, "Semicolon,Space", "Input/Keybinds/Controller", "A button");
+ REXCVAR_DEFINE_STRING(keybind_b, "Quote,Backspace", "Input/Keybinds/Controller", "B button");
+@@ -62,6 +70,24 @@ namespace rex::input::mnk {
+ 
+ namespace {
+ 
++// NG2 ADDITION: wheel pseudo-keys (unassigned Win32 virtual key codes), see keybinds.cpp.
++constexpr uint16_t kVkWheelUp = 0x0E;
++constexpr uint16_t kVkWheelDown = 0x0F;
++constexpr int64_t kWheelPressMs = 80;
++
++int64_t SteadyNowMs() {
++  return std::chrono::duration_cast<std::chrono::milliseconds>(
++             std::chrono::steady_clock::now().time_since_epoch())
++      .count();
++}
++
++bool IsMouseVk(uint16_t idx) {
++  return idx == 0x01 || idx == 0x02 || idx == 0x04 || idx == 0x05 || idx == 0x06 ||
++         idx == kVkWheelUp || idx == kVkWheelDown;
++}
++
++bool MouseLookActiveNow();
++
+ // A single device, so its handle is a constant.
+ constexpr rex::input::DeviceId kMnkDevice = static_cast<rex::input::DeviceId>(0x4D4E4B00);
+ 
+@@ -124,7 +150,10 @@ std::string_view TrimSpaces(std::string_view s) {
+ 
+ bool TokenPressed(const bool (&key_down)[256], std::string_view token, uint8_t live_mods) {
+   uint8_t want = TakeModifiers(token);
+-  if (want != live_mods) {
++  // NG2 FIX: modifiers a bind names must be held, others are ignored. Exact matching made
++  // every unmodified bind (WASD) go silent while a modifier bound on its own (Shift = Block)
++  // was held, and made bare modifier binds impossible.
++  if ((live_mods & want) != want) {
+     return false;
+   }
+   rex::ui::VirtualKey vk = rex::ui::ParseVirtualKey(token);
+@@ -132,11 +161,25 @@ bool TokenPressed(const bool (&key_down)[256], std::string_view token, uint8_t l
+     return false;
+   }
+   uint16_t idx = static_cast<uint16_t>(vk);
++  // NG2 ADDITION: mouse buttons only drive the game while mouse look is active (gameplay);
++  // in menus the mouse is a pointer.
++  if (IsMouseVk(idx) && !MouseLookActiveNow()) {
++    return false;
++  }
+   return idx < 256 && key_down[idx];
+ }
+ 
+ std::atomic<bool> mouse_look_active{true};
+ 
++// NG2 ADDITION: raw mouse motion for the app (mnk_mouse_raw).
++std::mutex raw_mouse_mutex;
++float raw_mouse_dx = 0.0f;
++float raw_mouse_dy = 0.0f;
++
++bool MouseLookActiveNow() {
++  return mouse_look_active.load(std::memory_order_relaxed);
++}
++
+ }  // namespace
+ 
+ void SetMouseLookActive(bool active) {
+@@ -147,6 +190,14 @@ bool IsMouseLookActive() {
+   return mouse_look_active.load(std::memory_order_relaxed);
+ }
+ 
++void ConsumeMouseDelta(float& dx, float& dy) {
++  std::lock_guard lock(raw_mouse_mutex);
++  dx = raw_mouse_dx;
++  dy = raw_mouse_dy;
++  raw_mouse_dx = 0.0f;
++  raw_mouse_dy = 0.0f;
++}
++
+ using rex::ui::VirtualKey;
+ 
+ MnkInputDriver::MnkInputDriver(rex::ui::Window* window, size_t window_z_order)
+@@ -274,6 +325,12 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
+ 
+   std::lock_guard lock(state_mutex_);
+ 
++  {  // NG2 ADDITION: wheel pseudo-keys
++    const int64_t now = SteadyNowMs();
++    key_down_[kVkWheelUp] = now < wheel_up_until_ms_;
++    key_down_[kVkWheelDown] = now < wheel_down_until_ms_;
++  }
++
+   uint16_t buttons = 0;
+   if (IsBindPressed(key_down_, REXCVAR_GET(keybind_a)))
+     buttons |= X_INPUT_GAMEPAD_A;
+@@ -331,11 +388,13 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
+   if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_down)))
+     ry -= INT16_MAX;
+ 
+-  if (REXCVAR_GET(mnk_mouse) && IsMouseLookActive()) {
++  if (REXCVAR_GET(mnk_mouse) && IsMouseLookActive() && !REXCVAR_GET(mnk_mouse_raw)) {
+     double sensitivity = REXCVAR_GET(mnk_sensitivity);
++    double sensitivity_y = REXCVAR_GET(mnk_sensitivity_y);  // NG2 ADDITION
++    double invert_y = REXCVAR_GET(mnk_invert_y) ? -1.0 : 1.0;
+     constexpr double kBaseScale = 200.0;
+     rx += static_cast<int32_t>(double(mouse_dx_) * sensitivity * kBaseScale);
+-    ry += static_cast<int32_t>(double(-mouse_dy_) * sensitivity * kBaseScale);
++    ry += static_cast<int32_t>(double(-mouse_dy_) * sensitivity_y * invert_y * kBaseScale);
+   }
+   // Drained unconditionally: deltas keep accumulating in OnMouseMove while the
+   // mouse is off, and toggling it on would otherwise dump the whole backlog
+@@ -510,6 +569,12 @@ void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
+     case rex::ui::MouseEvent::Button::kMiddle:
+       SetKeyState(static_cast<uint16_t>(VirtualKey::kMButton), true);
+       break;
++    case rex::ui::MouseEvent::Button::kX1:  // NG2 ADDITION
++      SetKeyState(static_cast<uint16_t>(VirtualKey::kXButton1), true);
++      break;
++    case rex::ui::MouseEvent::Button::kX2:
++      SetKeyState(static_cast<uint16_t>(VirtualKey::kXButton2), true);
++      break;
+     default:
+       break;
+   }
+@@ -529,6 +594,12 @@ void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
+     case rex::ui::MouseEvent::Button::kMiddle:
+       SetKeyState(static_cast<uint16_t>(VirtualKey::kMButton), false);
+       break;
++    case rex::ui::MouseEvent::Button::kX1:  // NG2 ADDITION
++      SetKeyState(static_cast<uint16_t>(VirtualKey::kXButton1), false);
++      break;
++    case rex::ui::MouseEvent::Button::kX2:
++      SetKeyState(static_cast<uint16_t>(VirtualKey::kXButton2), false);
++      break;
+     default:
+       break;
+   }
+@@ -541,13 +612,21 @@ void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
+   int32_t y = e.y();
+   {
+     std::lock_guard lock(state_mutex_);
++    float mdx, mdy;
+     if (relative_mouse_mode_) {
+       // The pointer is locked, so the absolute position no longer moves.
+-      mouse_dx_ += e.dx();
+-      mouse_dy_ += e.dy();
++      mdx = e.dx();
++      mdy = e.dy();
+     } else {
+-      mouse_dx_ += float(x - prev_mouse_x_);
+-      mouse_dy_ += float(y - prev_mouse_y_);
++      mdx = float(x - prev_mouse_x_);
++      mdy = float(y - prev_mouse_y_);
++    }
++    mouse_dx_ += mdx;
++    mouse_dy_ += mdy;
++    if (mouse_captured_ && REXCVAR_GET(mnk_mouse_raw)) {  // NG2 ADDITION
++      std::lock_guard raw_lock(raw_mouse_mutex);
++      raw_mouse_dx += mdx;
++      raw_mouse_dy += mdy;
+     }
+   }
+   prev_mouse_x_ = x;
+@@ -558,6 +637,15 @@ void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
+   }
+ }
+ 
++// NG2 ADDITION: a wheel tick reads as a short press of WheelUp / WheelDown.
++void MnkInputDriver::OnMouseWheel(rex::ui::MouseEvent& e) {
++  if (!IsEnabled() || !has_focus_ || !e.scroll_y()) {
++    return;
++  }
++  std::lock_guard lock(state_mutex_);
++  (e.scroll_y() > 0 ? wheel_up_until_ms_ : wheel_down_until_ms_) = SteadyNowMs() + kWheelPressMs;
++}
++
+ void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
+   has_focus_ = false;
+   // Withdraw the request too, or an update queued before the focus loss grabs
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_io.cpp b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
 index 3f1a852..1bebf23 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_io.cpp
@@ -1993,6 +2227,22 @@ index f270f3c..069b05f 100644
      // Repaint (and handle input) continuously if still active. In detached mode
      // there is no presenter; the app drives repaint via its own present loop.
      if (presenter_) {
+diff --git a/src/ui/keybinds.cpp b/src/ui/keybinds.cpp
+index 9822f3b..34f0e31 100644
+--- a/src/ui/keybinds.cpp
++++ b/src/ui/keybinds.cpp
+@@ -141,6 +141,11 @@ static const std::unordered_map<std::string, VirtualKey> kKeyNames = {
+     {"LMB", VirtualKey::kLButton},
+     {"RMB", VirtualKey::kRButton},
+     {"MMB", VirtualKey::kMButton},
++    // NG2 ADDITION: side buttons and wheel pseudo-keys (mnk_input_driver.cpp).
++    {"Mouse4", VirtualKey::kXButton1},
++    {"Mouse5", VirtualKey::kXButton2},
++    {"WheelUp", VirtualKey(0x0E)},
++    {"WheelDown", VirtualKey(0x0F)},
+ };
+ 
+ VirtualKey ParseVirtualKey(std::string_view name) {
 diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
 index 7360ed9..fb4f4ce 100644
 --- a/src/ui/presenter.cpp

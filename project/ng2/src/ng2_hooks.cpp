@@ -17,6 +17,7 @@
 #include <vector>
 
 #include <rex/cvar.h>
+#include <rex/input/mnk/mnk_input_driver.h>
 #include <rex/kernel/file_read_hook.h>
 #include <rex/logging.h>
 #include <rex/memory/utils.h>
@@ -344,7 +345,12 @@ struct BucketStat {
 };
 BucketStat g_bucket_stats[kBucketCount];
 int64_t g_bucket_log_ms = 0;
+// Keyboard & mouse: true while the player is in control (HUD up, no pause / inventory /
+// in-game menu over it). Written by the render pass, read by the UI thread.
+std::atomic<bool> g_in_gameplay{false};
 }  // namespace
+
+bool Ng2InGameplay() { return g_in_gameplay.load(std::memory_order_relaxed); }
 
 void Ng2IngameMenuFrame(bool drawn);
 void Ng2DrainSystemSounds(PPCContext& ctx, uint8_t* base);
@@ -353,6 +359,7 @@ extern "C" REX_FUNC(sub_8368E2D8) {
   g_item_bucket.clear();
   g_hud_active = false;
   bool ingame_menu_drawn = false;
+  bool menu_over_hud = false;  // pause / inventory (49-50) or in-game menu (70-72)
   const uint32_t parity = GuestLoadU32(kBuckets + 1456) ^ 1;
   const uint32_t heads = kBuckets + parity * 728;
   for (int i = 0; i < kBucketCount; ++i) {
@@ -368,6 +375,10 @@ extern "C" REX_FUNC(sub_8368E2D8) {
       if (i >= 70 && i <= 72 && GuestLoadU32(GuestLoadU32(item) + 4) != 0x83705C98) {
         ingame_menu_drawn = true;
       }
+      if (((i >= 49 && i <= 50) || (i >= 70 && i <= 72)) &&
+          GuestLoadU32(GuestLoadU32(item) + 4) != 0x83705C98) {
+        menu_over_hud = true;
+      }
       if (REXCVAR_GET(ng2_bucket_dump)) {
         static std::unordered_map<uint64_t, int> seen_methods;
         const uint32_t method = GuestLoadU32(GuestLoadU32(item) + 4);
@@ -377,6 +388,7 @@ extern "C" REX_FUNC(sub_8368E2D8) {
       }
     }
   }
+  g_in_gameplay.store(g_hud_active && !menu_over_hud, std::memory_order_relaxed);
   Ng2IngameMenuFrame(ingame_menu_drawn);
   // Menu sounds requested by the Recomp Settings panel opened from the in-game menu (the
   // main Options update, which plays them otherwise, doesn't run in gameplay).
@@ -818,4 +830,201 @@ void Ng2SkipCutsceneFrame() {
   }
   rex::memory::store_and_swap<uint32_t>(mem->TranslateVirtual(kFadeOut), 30);
   REXLOG_INFO("NG2 skip cutscene: movie {} skipped", GuestLoadU32(0x84A69C74));
+}
+
+// ---- Keyboard & mouse: mouse camera ----------------------------------------------------
+// The input update sub_822F2E38 (once per game frame) polls XInput and writes each pad's
+// current stick floats at 0x83C07FF0 + pad*68 + 20..40 (lx, ly, rx, ry, lt, rt; clamped to
+// [-1, 1], game deadzone applied) and the previous frame's at +44..64 (findings #52).
+// Adding mouse motion to the right stick there was tried first: the camera's response curve
+// turns large values back, and the auto-follow pulled against it. Mouse motion (SDK
+// mnk_mouse_raw) now orbits the camera directly (below).
+namespace ng2 {
+struct MouseCameraParams {
+  bool enabled;
+  float sens_x, sens_y;
+  bool invert_y;
+  bool auto_center;  // let the game swing the camera back behind Ryu between mouse moves
+};
+MouseCameraParams GetMouseCameraParams();
+}  // namespace ng2
+
+// Camera update sub_823053F0(r3 = camera): reads the active pad's right stick (record +28/+32,
+// pad index byte 0x84C3DA3E), applies a deadzone and the curve y = c*x^3 - x^4 (made for
+// |x| <= 1; larger values turn back), then turns the camera by rebuilding its two points
+// at camera+64 / camera+80 from atan2 of their difference. There are no stored yaw/pitch
+// angles, and the follow-behind-Ryu logic moves the same points (findings #52).
+// Mouse look orbits camera+64 around camera+80 by the mouse motion after the update, and
+// while the mouse is in use it raises the "stick in use" flags the update sets for the pad
+// (input block camera+816: +180, +192, +196) so the auto-follow holds off.
+REXCVAR_DEFINE_BOOL(ng2_mouse_cam_log, false, "NG2", "Log mouse camera points once a second");
+REXCVAR_DEFINE_INT32(ng2_mouse_yaw_sign, -1, "NG2", "Mouse camera yaw direction (1 or -1)");
+REXCVAR_DEFINE_INT32(ng2_mouse_pitch_sign, 1, "NG2", "Mouse camera pitch direction (1 or -1)");
+
+namespace {
+struct GuestVec {
+  float x, y, z;
+};
+float LoadF(uint8_t* p) {
+  uint32_t b = rex::memory::load_and_swap<uint32_t>(p);
+  float f;
+  std::memcpy(&f, &b, 4);
+  return f;
+}
+void StoreF(uint8_t* p, float f) {
+  uint32_t b;
+  std::memcpy(&b, &f, 4);
+  rex::memory::store_and_swap<uint32_t>(p, b);
+}
+GuestVec LoadVec(uint8_t* p) { return {LoadF(p), LoadF(p + 4), LoadF(p + 8)}; }
+void StoreVec(uint8_t* p, const GuestVec& v) {
+  StoreF(p, v.x);
+  StoreF(p + 4, v.y);
+  StoreF(p + 8, v.z);
+}
+int64_t g_mouse_used_ms = 0;
+bool g_mouse_has_camera = false;  // set by the camera update below (game thread)
+}  // namespace
+
+extern "C" REX_FUNC(__imp__sub_823053F0);
+extern "C" REX_FUNC(sub_823053F0) {
+  const uint32_t cam = ctx.r3.u32;
+  float dx = 0.0f, dy = 0.0f;
+  rex::input::mnk::ConsumeMouseDelta(dx, dy);
+  const ng2::MouseCameraParams p = ng2::GetMouseCameraParams();
+  const bool active = p.enabled && Ng2InGameplay() && cam;
+  auto* mem = REX_KERNEL_STATE()->memory();
+  const int64_t now = GetTickCount64();
+  if (active && (dx != 0.0f || dy != 0.0f)) g_mouse_used_ms = now;
+  if (active && g_mouse_used_ms) {
+    // Right stick in use (record values are after the game's deadzone): the controller
+    // has the camera again, so the game's normal follow returns.
+    uint32_t pad = *mem->TranslateVirtual<uint8_t*>(0x84C3DA3E);
+    if (pad > 3) pad = 0;
+    uint8_t* rec = mem->TranslateVirtual<uint8_t*>(0x83C07FF0 + pad * 68);
+    if (LoadF(rec + 28) != 0.0f || LoadF(rec + 32) != 0.0f) g_mouse_used_ms = 0;
+  }
+  // Auto-center Off: hold the game's auto-follow off for as long as the mouse has the
+  // camera; On: only for a moment after each mouse movement.
+  const bool recent = active && g_mouse_used_ms &&
+                      (!p.auto_center || now - g_mouse_used_ms < 1500);
+  g_mouse_has_camera = recent;
+  if (recent) {
+    uint8_t* in = mem->TranslateVirtual<uint8_t*>(cam + 816);
+    rex::memory::store_and_swap<uint32_t>(in + 180, 1);
+    rex::memory::store_and_swap<uint32_t>(in + 192, 1);
+    rex::memory::store_and_swap<uint32_t>(in + 196, 1);
+  }
+  __imp__sub_823053F0(ctx, base);
+  if (!active) {
+    g_mouse_has_camera = false;
+    return;
+  }
+  uint8_t* eye_p = mem->TranslateVirtual<uint8_t*>(cam + 64);
+  uint8_t* tgt_p = mem->TranslateVirtual<uint8_t*>(cam + 80);
+  uint8_t* eye2_p = mem->TranslateVirtual<uint8_t*>(cam + 2432);
+  const GuestVec eye = LoadVec(eye_p), tgt = LoadVec(tgt_p), eye2 = LoadVec(eye2_p);
+  const float ox = eye.x - tgt.x, oy = eye.y - tgt.y, oz = eye.z - tgt.z;
+  const float r = std::sqrt(ox * ox + oy * oy + oz * oz);
+  static int64_t last_log = 0;
+  if (REXCVAR_GET(ng2_mouse_cam_log) && now - last_log > 1000) {
+    last_log = now;
+    REXLOG_INFO("NG2 mouse cam: +64 ({:.2f} {:.2f} {:.2f}) +80 ({:.2f} {:.2f} {:.2f}) "
+                "+2432 ({:.2f} {:.2f} {:.2f}) dist {:.2f} mouse {}",
+                eye.x, eye.y, eye.z, tgt.x, tgt.y, tgt.z, eye2.x, eye2.y, eye2.z, r, recent);
+  }
+  // While the mouse has the camera, its direction is ours: whatever the game's follow logic
+  // turned this frame is undone (the game's distance is kept: it pulls in for walls).
+  static bool have_dir = false;
+  static float yaw_state = 0.0f, elev_state = 0.0f;
+  if (!recent || !(r > 1e-3f) || !std::isfinite(r)) {
+    have_dir = false;
+    return;
+  }
+  if (!have_dir) {
+    yaw_state = std::atan2(ox, oz);
+    elev_state = std::atan2(oy, std::sqrt(ox * ox + oz * oz));
+    have_dir = true;
+  }
+  constexpr float kRadPerPixel = 0.0025f;  // at sensitivity 1.0
+  yaw_state += dx * p.sens_x * kRadPerPixel * float(REXCVAR_GET(ng2_mouse_yaw_sign));
+  elev_state += dy * p.sens_y * kRadPerPixel * (p.invert_y ? -1.0f : 1.0f) *
+                float(REXCVAR_GET(ng2_mouse_pitch_sign));
+  elev_state = std::clamp(elev_state, -1.40f, 1.40f);
+  const float h = r * std::cos(elev_state);
+  const GuestVec out{tgt.x + h * std::sin(yaw_state), tgt.y + r * std::sin(elev_state),
+                     tgt.z + h * std::cos(yaw_state)};
+  StoreVec(eye_p, out);
+  // +2432 trails +64 slightly (a smoothed / previous-frame eye, 0.01-0.08 units behind in
+  // mouselook-4); set it too so nothing eases toward the old direction.
+  StoreVec(eye2_p, out);
+}
+
+// NG2 DIAG (ng2_cam_diag): log when the render camera's source fields or the gameplay
+// camera's early-exit state change, to find what marks scripted cameras (executions).
+REXCVAR_DEFINE_BOOL(ng2_cam_diag, false, "NG2", "Log camera source changes");
+// After all cameras updated: log small-integer fields (modes, states) that change in the
+// gameplay camera (slot 0, 5024 bytes) and the player object ([[0x83B28400]+1632], 1 KB).
+extern "C" REX_FUNC(__imp__sub_822F7318);
+extern "C" REX_FUNC(sub_822F7318) {
+  if (REXCVAR_GET(ng2_cam_diag)) {
+    const uint32_t mgr = ctx.r3.u32;
+    const uint32_t cam = GuestLoadU32(mgr + 1604);
+    const uint32_t world = GuestLoadU32(0x83B28400);
+    const uint32_t player = world ? GuestLoadU32(world + 1632) : 0;
+    struct Region {
+      const char* name;
+      uint32_t base, size;
+      std::vector<uint32_t>* prev;
+    };
+    static std::vector<uint32_t> prev_cam, prev_player;
+    static uint32_t prev_player_addr = 0;
+    if (player != prev_player_addr) {
+      prev_player.clear();
+      prev_player_addr = player;
+    }
+    Region regions[] = {{"cam", cam, 5024, &prev_cam}, {"player", player, 1024, &prev_player}};
+    for (auto& r : regions) {
+      if (!r.base) continue;
+      const uint32_t words = r.size / 4;
+      std::vector<uint32_t> cur(words);
+      for (uint32_t w = 0; w < words; ++w) cur[w] = GuestLoadU32(r.base + w * 4);
+      if (r.prev->size() == words) {
+        for (uint32_t w = 0; w < words; ++w) {
+          const uint32_t a = (*r.prev)[w], b = cur[w];
+          if (a != b && a < 4096 && b < 4096) {
+            REXLOG_INFO("NG2 cam diag: {} {:08X} +{} {} -> {}", r.name, r.base, w * 4, a, b);
+          }
+        }
+      }
+      *r.prev = std::move(cur);
+    }
+  }
+  __imp__sub_822F7318(ctx, base);
+}
+
+// Per-camera update sub_822FA8B8(r3 = camera; the camera manager runs it for 8 slots, slot 0
+// = gameplay camera 0x84C569F0). Executions (player action 114 -> 111) switch the gameplay
+// camera's mode (camera+4716, copy +2496) from 1 to 8 with flag +4640 = 1, and back when they
+// end (camdiag-3, findings #52). While the mouse has the camera (gameplay, HUD up), any
+// special mode (executions, Ultimate Techniques, ...) is turned back into the normal mode 1
+// before the update, so the mouse keeps the camera. Cutscenes hide the HUD, so they keep
+// their cameras.
+extern "C" REX_FUNC(__imp__sub_822FA8B8);
+extern "C" REX_FUNC(sub_822FA8B8) {
+  const uint32_t c = ctx.r3.u32;
+  const uint32_t mode = c == 0x84C569F0 ? GuestLoadU32(c + 4716) : 1;
+  if (g_mouse_has_camera && Ng2InGameplay() && mode != 1 && mode < 64) {
+    static uint64_t logged = 0;
+    if (!(logged & (1ull << mode))) {
+      logged |= 1ull << mode;
+      REXLOG_INFO("NG2 mouse cam: overriding camera mode {} (player action {})", mode,
+                  GuestLoadU32(GuestLoadU32(GuestLoadU32(0x83B28400) + 1632) + 336));
+    }
+    auto* mem = REX_KERNEL_STATE()->memory();
+    rex::memory::store_and_swap<uint32_t>(mem->TranslateVirtual<uint8_t*>(c + 4716), 1);
+    rex::memory::store_and_swap<uint32_t>(mem->TranslateVirtual<uint8_t*>(c + 2496), 1);
+    rex::memory::store_and_swap<uint32_t>(mem->TranslateVirtual<uint8_t*>(c + 4640), 0);
+  }
+  __imp__sub_822FA8B8(ctx, base);
 }
