@@ -579,8 +579,7 @@ extern "C" REX_FUNC(sub_8368EFE8) {
       }
     }
   }
-  if (REXCVAR_GET(ng2_prompt_diag) &&
-      ((g_draw_bucket >= 49 && g_draw_bucket <= 50) || (g_draw_bucket >= 70 && g_draw_bucket <= 72))) {
+  if (REXCVAR_GET(ng2_prompt_diag) && g_draw_bucket >= 0) {
     auto* m = REX_KERNEL_STATE()->memory();
     float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f, u0 = 1e9f, u1 = -1e9f, v0 = 1e9f, v1 = -1e9f;
     for (uint32_t i = 0; i < 4; ++i) {
@@ -592,8 +591,8 @@ extern "C" REX_FUNC(sub_8368EFE8) {
     }
     static std::unordered_map<std::string, int> seen;
     char key[160];
-    std::snprintf(key, sizeof(key), "%d %08X uv %.4f %.4f %.4f %.4f", g_draw_bucket,
-                  GuestLoadU32(ctx.r3.u32 + 8), u0, v0, u1, v1);
+    std::snprintf(key, sizeof(key), "%d %.0f %.0f %.0f %.0f v %.4f %.4f", g_draw_bucket, x0, y0,
+                  x1 - x0, y1 - y0, v0, v1);
     if (seen[key]++ == 0) {
       REXLOG_INFO("NG2 prompt diag: bucket {} sprite {:08X} tex {:08X} rect ({:.0f},{:.0f})-({:.0f},{:.0f}) "
                   "uv ({:.4f},{:.4f})-({:.4f},{:.4f}) lr {:08X}",
