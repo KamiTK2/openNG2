@@ -419,7 +419,20 @@ void InstallRecompInputFilters() {
     }
     // Keyboard in the game's menus: fixed PC keys (arrows, Enter = A, Esc / Backspace = B).
     // In gameplay Esc is the Pause binding (Start); in menus it must not reach Start.
-    if (g_mnk_enabled && !Ng2InGameplay() && OurWindowFocused() &&
+    // Esc acts only in the context it was pressed in: held across a switch (pause menu opens
+    // while it is still down, or closes), it does nothing until released, otherwise one press
+    // opened and closed the pause menu.
+    const bool gameplay_now = Ng2InGameplay();
+    static int esc_context = -1;  // -1 up, 0 pressed in a menu, 1 pressed in gameplay
+    {
+      const bool esc_down = OurWindowFocused() && (GetAsyncKeyState(VK_ESCAPE) & 0x8000);
+      if (!esc_down) esc_context = -1;
+      else if (esc_context < 0) esc_context = gameplay_now ? 1 : 0;
+    }
+    if (g_mnk_enabled && gameplay_now && esc_context == 0) {
+      g.buttons = uint16_t(uint16_t(g.buttons) & ~XINPUT_GAMEPAD_START);
+    }
+    if (g_mnk_enabled && !gameplay_now && OurWindowFocused() &&
         !RecompSettingsBlocksGameInput()) {
       auto down = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
       uint16_t b = uint16_t(g.buttons);
@@ -428,7 +441,8 @@ void InstallRecompInputFilters() {
       if (down(VK_LEFT)) b |= XINPUT_GAMEPAD_DPAD_LEFT;
       if (down(VK_RIGHT)) b |= XINPUT_GAMEPAD_DPAD_RIGHT;
       if (down(VK_RETURN)) b |= XINPUT_GAMEPAD_A;
-      if (down(VK_ESCAPE)) b = uint16_t((b & ~XINPUT_GAMEPAD_START) | XINPUT_GAMEPAD_B);
+      if (esc_context >= 0) b = uint16_t(b & ~XINPUT_GAMEPAD_START);
+      if (esc_context == 0) b |= XINPUT_GAMEPAD_B;
       if (down(VK_BACK)) b |= XINPUT_GAMEPAD_B;
       g.buttons = b;
     }

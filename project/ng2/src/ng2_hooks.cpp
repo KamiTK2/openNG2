@@ -202,6 +202,10 @@ REXCVAR_DEFINE_DOUBLE(ng2_aspect_ratio, 0.0, "NG2",
 
 namespace {
 constexpr uint32_t kAspectConstant = 0x8228EBDC;
+// Wide aspect for the camera (0 = native 16:9). The constant itself stays 16:9 except while a
+// camera builds its projection (WideAspectScope in sub_822FA8B8): every other reader (screen
+// effects that size themselves from it showed black bands, findings #37/#53) sees 16:9.
+std::atomic<float> g_wide_aspect{0.0f};
 void ApplyAspectOverride() {
   // 0 (or anything up to 16:9) = the game's own 16:9: restore the constant and the
   // presenter, so the setting can be switched back live.
@@ -213,19 +217,10 @@ void ApplyAspectOverride() {
     presented = wide ? aspect : 0.0;
     rex::cvar::SetFlagByName("present_aspect_ratio", std::to_string(presented));
   }
-  auto* mem = REX_KERNEL_STATE()->memory();
-  auto* p = mem->TranslateVirtual<uint8_t*>(kAspectConstant);
-  const float want = wide ? float(aspect) : 16.0f / 9.0f;
-  if (rex::memory::load_and_swap<float>(p) != want) {
-    // The constant is in the image's read-only data: unprotect the host page briefly.
-    DWORD old_protect = 0;
-    if (!VirtualProtect(p, sizeof(float), PAGE_READWRITE, &old_protect)) {
-      REXLOG_WARN("NG2 ultrawide: cannot unprotect the aspect constant");
-      return;
-    }
-    rex::memory::store_and_swap<float>(p, want);
-    VirtualProtect(p, sizeof(float), old_protect, &old_protect);
-    REXLOG_INFO("NG2 ultrawide: aspect constant {:08X} set to {:.4f}", kAspectConstant, want);
+  const float want = wide ? float(aspect) : 0.0f;
+  if (g_wide_aspect.exchange(want) != want) {
+    REXLOG_INFO("NG2 ultrawide: camera aspect {:.4f} (constant {:08X} stays 16:9 elsewhere)",
+                wide ? want : 16.0f / 9.0f, kAspectConstant);
   }
 }
 }  // namespace
@@ -243,14 +238,20 @@ void WriteAspectConstant(float value) {
   rex::memory::store_and_swap<float>(p, value);
   VirtualProtect(p, sizeof(float), old_protect, &old_protect);
 }
-struct NativeAspectScope {
-  float saved;
-  NativeAspectScope() {
-    saved = rex::memory::load_and_swap<float>(
-        REX_KERNEL_STATE()->memory()->TranslateVirtual<uint8_t*>(kAspectConstant));
-    WriteAspectConstant(16.0f / 9.0f);
+// Effects used to switch the constant back to 16:9 while they ran; it is 16:9 by default now,
+// so this only documents which readers must not see the wide value.
+struct NativeAspectScope {};
+// The camera's projection is the one reader that gets the wide value (Hor+).
+struct WideAspectScope {
+  bool active;
+  WideAspectScope() {
+    const float wide = g_wide_aspect.load();
+    active = wide > 0.0f;
+    if (active) WriteAspectConstant(wide);
   }
-  ~NativeAspectScope() { WriteAspectConstant(saved); }
+  ~WideAspectScope() {
+    if (active) WriteAspectConstant(16.0f / 9.0f);
+  }
 };
 }  // namespace
 extern "C" REX_FUNC(__imp__sub_82347700);
@@ -1012,6 +1013,7 @@ extern "C" REX_FUNC(sub_822F7318) {
 // their cameras.
 extern "C" REX_FUNC(__imp__sub_822FA8B8);
 extern "C" REX_FUNC(sub_822FA8B8) {
+  WideAspectScope wide_projection;  // Hor+ for this camera's projection only
   const uint32_t c = ctx.r3.u32;
   const uint32_t mode = c == 0x84C569F0 ? GuestLoadU32(c + 4716) : 1;
   if (g_mouse_has_camera && Ng2InGameplay() && mode != 1 && mode < 64) {
@@ -1027,4 +1029,83 @@ extern "C" REX_FUNC(sub_822FA8B8) {
     rex::memory::store_and_swap<uint32_t>(mem->TranslateVirtual<uint8_t*>(c + 4640), 0);
   }
   __imp__sub_822FA8B8(ctx, base);
+}
+
+// NG2 DIAG (ng2_aspect_diag): per-second call counts of the 16:9 constant's readers, to find
+// the one that sizes effects showing black bars on ultrawide.
+REXCVAR_DEFINE_BOOL(ng2_aspect_diag, false, "NG2", "Log calls of 16:9 constant readers");
+namespace {
+std::atomic<uint32_t> g_aspect_calls[7];
+const char* const kAspectReaders[] = {"82330E98","82346DA8","82830448","82845BD8","837EC688","83889098","822FB368"};
+void AspectDiagTick() {
+  static int64_t last = 0;
+  const int64_t now = GetTickCount64();
+  if (now - last < 1000) return;
+  last = now;
+  std::string line;
+  for (size_t i = 0; i < std::size(kAspectReaders); ++i) {
+    line += std::string(" ") + kAspectReaders[i] + "=" + std::to_string(g_aspect_calls[i].exchange(0));
+  }
+  REXLOG_INFO("NG2 aspect diag:{}", line);
+}
+}  // namespace
+extern "C" REX_FUNC(__imp__sub_82330E98);
+extern "C" REX_FUNC(sub_82330E98) {
+  if (REXCVAR_GET(ng2_aspect_diag)) {
+    g_aspect_calls[0].fetch_add(1);
+    AspectDiagTick();
+  }
+  __imp__sub_82330E98(ctx, base);
+}
+extern "C" REX_FUNC(__imp__sub_82346DA8);
+extern "C" REX_FUNC(sub_82346DA8) {
+  if (REXCVAR_GET(ng2_aspect_diag)) {
+    g_aspect_calls[1].fetch_add(1);
+    AspectDiagTick();
+  }
+  __imp__sub_82346DA8(ctx, base);
+}
+extern "C" REX_FUNC(__imp__sub_82830448);
+extern "C" REX_FUNC(sub_82830448) {
+  if (REXCVAR_GET(ng2_aspect_diag)) {
+    g_aspect_calls[2].fetch_add(1);
+    AspectDiagTick();
+  }
+  __imp__sub_82830448(ctx, base);
+}
+extern "C" REX_FUNC(__imp__sub_82845BD8);
+// sub_82845BD8 (1.0 sub_828205F8) builds a projection from the 16:9 constant for effects:
+// silent in normal play, bursts during projectile hits and Ultimate Technique charges
+// (aspectdiag-1), which showed black bands with the wide value. It runs with 16:9 (#37, #53).
+extern "C" REX_FUNC(sub_82845BD8) {
+  NativeAspectScope native;
+  if (REXCVAR_GET(ng2_aspect_diag)) {
+    g_aspect_calls[3].fetch_add(1);
+    AspectDiagTick();
+  }
+  __imp__sub_82845BD8(ctx, base);
+}
+extern "C" REX_FUNC(__imp__sub_837EC688);
+extern "C" REX_FUNC(sub_837EC688) {
+  if (REXCVAR_GET(ng2_aspect_diag)) {
+    g_aspect_calls[4].fetch_add(1);
+    AspectDiagTick();
+  }
+  __imp__sub_837EC688(ctx, base);
+}
+extern "C" REX_FUNC(__imp__sub_83889098);
+extern "C" REX_FUNC(sub_83889098) {
+  if (REXCVAR_GET(ng2_aspect_diag)) {
+    g_aspect_calls[5].fetch_add(1);
+    AspectDiagTick();
+  }
+  __imp__sub_83889098(ctx, base);
+}
+extern "C" REX_FUNC(__imp__sub_822FB368);
+extern "C" REX_FUNC(sub_822FB368) {
+  if (REXCVAR_GET(ng2_aspect_diag)) {
+    g_aspect_calls[6].fetch_add(1);
+    AspectDiagTick();
+  }
+  __imp__sub_822FB368(ctx, base);
 }
