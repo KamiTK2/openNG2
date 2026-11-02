@@ -115,8 +115,6 @@ int MonitorCount() {
   return std::max(n, 1);
 }
 
-constexpr int kBaseWidth = 1280;
-constexpr int kBaseHeight = 720;
 
 // ---- fonts -------------------------------------------------------------------------
 
@@ -1222,8 +1220,41 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
       break;
     }
     case 1: {  // Graphics
-      std::snprintf(buf, sizeof(buf), "%d x %d", kBaseWidth * s.resolution_scale,
-                    kBaseHeight * s.resolution_scale);
+      {
+        // Presets set the image rows below together (not the Framerate Cap); "Custom" when
+        // they match none of them.
+        struct Preset { const char* name; int res, aa, upscaler, sharpness; };
+        static const Preset kPresets[] = {
+            {"Low", 1, 0, 1, 8},
+            {"Medium", 2, 1, 1, 8},
+            {"High", 3, 1, 1, 8},
+            {"Ultra", 4, 2, 1, 8},
+        };
+        int match = -1;
+        for (int i = 0; i < 4; ++i) {
+          const Preset& p = kPresets[i];
+          if (s.resolution_scale == p.res && s.anti_aliasing == p.aa && s.upscaler == p.upscaler &&
+              s.sharpness == p.sharpness) {
+            match = i;
+          }
+        }
+        // From Custom, Left / Right start at the preset nearest the current resolution.
+        const int cur = match >= 0 ? match : std::clamp(s.resolution_scale, 1, 4) - 1;
+        rows.push_back({"Preset", Kind::kStepper, match >= 0 ? kPresets[match].name : "Custom",
+                        match < 0 || cur > 0, match < 0 || cur < 3, nullptr, nullptr, false,
+                        [&s, cur, match](int dir, bool) {
+                          if (!dir) return false;
+                          const int v = match < 0 ? cur : std::clamp(cur + dir, 0, 3);
+                          if (v == match) return false;
+                          const Preset& p = kPresets[v];
+                          s.resolution_scale = p.res;
+                          s.anti_aliasing = p.aa;
+                          s.upscaler = p.upscaler;
+                          s.sharpness = p.sharpness;
+                          return true;
+                        }});
+      }
+      std::snprintf(buf, sizeof(buf), "%dx", s.resolution_scale);
       step_row("Internal Resolution", buf, s.resolution_scale, 1, 5, 1,
                [&s](int v) { s.resolution_scale = v; });
       const char* aa[] = {"Off", "FXAA", "FXAA Extreme"};
@@ -1554,6 +1585,12 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
     fy += note_px * 1.5f;
   }
   // Hint for the row under the cursor.
+  if (focused_ && row_ >= 0 && row_ < int(rows.size()) &&
+      std::strcmp(rows[row_].label, "Preset") == 0) {
+    text_at(X(L.label_x), fy, kGrey,
+            "Low suits weaker PCs. Ultra renders at 4x and needs a strong GPU.", false, note_px);
+    fy += note_px * 1.5f;
+  }
   if (focused_ && row_ >= 0 && row_ < int(rows.size()) &&
       std::strcmp(rows[row_].label, "Internal Resolution") == 0) {
     text_at(X(L.label_x), fy, kGrey,

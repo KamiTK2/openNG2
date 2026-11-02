@@ -250,10 +250,10 @@ index d54df86..4542853 100644
                   ui::WindowedAppContext* app_context, bool with_presentation) {
 diff --git a/include/rex/ui/d3d12/d3d12_frame_interpolator.h b/include/rex/ui/d3d12/d3d12_frame_interpolator.h
 new file mode 100644
-index 0000000..5124869
+index 0000000..a3fe6d0
 --- /dev/null
 +++ b/include/rex/ui/d3d12/d3d12_frame_interpolator.h
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,113 @@
 +/**
 + * @file        ui/d3d12/d3d12_frame_interpolator.h
 + * @brief       NG2 ADDITION: vendor-neutral frame generation for the D3D12 presenter.
@@ -296,8 +296,13 @@ index 0000000..5124869
 +
 +  // Copies a new guest frame (in D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) into the
 +  // history and builds its luma pyramid. Records commands on the paint command list.
++  // NG2 ADDITION: frames larger than max_width x max_height (the swap chain) are
++  // area-downscaled to fit first, so generation costs the same at any internal resolution.
 +  bool PushFrame(ID3D12GraphicsCommandList* command_list, ID3D12Resource* guest_frame,
-+                 uint64_t paint_submission);
++                 uint64_t paint_submission, uint32_t max_width, uint32_t max_height);
++  // Size of current() / interpolated().
++  uint32_t width() const { return width_; }
++  uint32_t height() const { return height_; }
 +  // Generates the frame halfway between the previous and the current pushed frames.
 +  bool Interpolate(ID3D12GraphicsCommandList* command_list, uint64_t paint_submission);
 +
@@ -318,7 +323,7 @@ index 0000000..5124869
 +
 + private:
 +  static constexpr uint32_t kLevels = 5;
-+  enum Pass { kPassLuma, kPassDown, kPassRefine, kPassSmooth, kPassSynth, kPassCount };
++  enum Pass { kPassLuma, kPassDown, kPassRefine, kPassSmooth, kPassSynth, kPassResample, kPassCount };
 +  // Per dispatch: t0..t3, u0, u1 (unused), written into a ring of the shader-visible heap.
 +  static constexpr uint32_t kTableSize = 6;
 +  static constexpr uint32_t kHeapDescriptors = 32768;
@@ -2362,10 +2367,10 @@ index 5bd3dc5..a8d5edc 100644
          d3d12/d3d12_submission_tracker.cpp
 diff --git a/src/ui/d3d12/d3d12_frame_interpolator.cpp b/src/ui/d3d12/d3d12_frame_interpolator.cpp
 new file mode 100644
-index 0000000..71c1819
+index 0000000..8318afb
 --- /dev/null
 +++ b/src/ui/d3d12/d3d12_frame_interpolator.cpp
-@@ -0,0 +1,608 @@
+@@ -0,0 +1,653 @@
 +/**
 + * @file        ui/d3d12/d3d12_frame_interpolator.cpp
 + * @brief       NG2 ADDITION: vendor-neutral frame generation (see the header).
@@ -2431,6 +2436,23 @@ index 0000000..71c1819
 +    }
 +  }
 +  u0[id] = float4(s * 0.25, 0, 0, 0);
++}
++
++// NG2 ADDITION: area-filtered downscale of the guest frame to the working size.
++// c0.xy = dst size, c0.zw = src size; a grid of bilinear taps covers each footprint.
++[numthreads(8, 8, 1)] void CSResample(uint2 id : SV_DispatchThreadID) {
++  if (any(id >= c0.xy)) return;
++  float2 scale = float2(c0.zw) / float2(c0.xy);
++  float2 inv = 1.0 / float2(c0.zw);
++  int2 taps = clamp(int2(ceil(scale)), int2(1, 1), int2(4, 4));
++  float4 s = 0.0;
++  for (int y = 0; y < taps.y; ++y) {
++    for (int x = 0; x < taps.x; ++x) {
++      float2 pos = (float2(id) + (float2(x, y) + 0.5) / float2(taps)) * scale;
++      s += t0.SampleLevel(sLinear, pos * inv, 0);
++    }
++  }
++  u0[id] = s / float(taps.x * taps.y);
 +}
 +
 +// 2x2 average (one bilinear tap at the centre of the 2x2 footprint).
@@ -2642,7 +2664,8 @@ index 0000000..71c1819
 +}
 +)HLSL";
 +
-+const char* const kEntryPoints[] = {"CSLuma", "CSDown", "CSRefine", "CSSmooth", "CSSynth"};
++const char* const kEntryPoints[] = {"CSLuma",   "CSDown",  "CSRefine",
++                                    "CSSmooth", "CSSynth", "CSResample"};
 +
 +uint32_t DivUp(uint32_t a, uint32_t b) { return (a + b - 1) / b; }
 +uint32_t AsUint(float f) {
@@ -2798,7 +2821,7 @@ index 0000000..71c1819
 +  }
 +  bool ok = true;
 +  for (int i = 0; i < 2; ++i) {
-+    ok &= create(width, height, kColorFormat, false, kAllShaderResource, history_[i]);
++    ok &= create(width, height, kColorFormat, true, kAllShaderResource, history_[i]);
 +  }
 +  for (uint32_t l = 0; l < kLevels; ++l) {
 +    for (int i = 0; i < 2; ++i) {
@@ -2859,30 +2882,57 @@ index 0000000..71c1819
 +}
 +
 +bool D3D12FrameInterpolator::PushFrame(ID3D12GraphicsCommandList* command_list,
-+                                       ID3D12Resource* guest_frame, uint64_t paint_submission) {
++                                       ID3D12Resource* guest_frame, uint64_t paint_submission,
++                                       uint32_t max_width, uint32_t max_height) {
 +  if (!initialized_ || !guest_frame) return false;
 +  D3D12_RESOURCE_DESC desc = guest_frame->GetDesc();
 +  if (desc.Format != kColorFormat) return false;
-+  if (!EnsureTextures(uint32_t(desc.Width), desc.Height)) return false;
++  // Working size: the guest frame, or fitted inside the swap chain if it is larger.
++  const uint32_t guest_width = uint32_t(desc.Width), guest_height = desc.Height;
++  uint32_t width = guest_width, height = guest_height;
++  if (max_width && max_height && (guest_width > max_width || guest_height > max_height)) {
++    const double scale = std::min(double(max_width) / guest_width, double(max_height) / guest_height);
++    width = std::max(1u, uint32_t(std::lround(guest_width * scale)));
++    height = std::max(1u, uint32_t(std::lround(guest_height * scale)));
++  }
++  if (!EnsureTextures(width, height)) return false;
 +  last_usage_ = paint_submission;
 +
 +  const uint32_t n = frame_count_ ? (current_ ^ 1) : current_;
-+  D3D12_RESOURCE_BARRIER b[2] = {
-+      Transition(guest_frame, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-+                 D3D12_RESOURCE_STATE_COPY_SOURCE),
-+      Transition(history_[n].Get(), kAllShaderResource, D3D12_RESOURCE_STATE_COPY_DEST)};
-+  command_list->ResourceBarrier(2, b);
-+  command_list->CopyResource(history_[n].Get(), guest_frame);
-+  b[0] = Transition(guest_frame, D3D12_RESOURCE_STATE_COPY_SOURCE,
-+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-+  b[1] = Transition(history_[n].Get(), D3D12_RESOURCE_STATE_COPY_DEST, kAllShaderResource);
-+  command_list->ResourceBarrier(2, b);
-+
 +  ID3D12DescriptorHeap* heap = heap_.Get();
-+  command_list->SetDescriptorHeaps(1, &heap);
-+  command_list->SetComputeRootSignature(root_signature_.Get());
-+
 +  uint32_t c[kConstantCount] = {};
++  if (width == guest_width && height == guest_height) {
++    D3D12_RESOURCE_BARRIER b[2] = {
++        Transition(guest_frame, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
++                   D3D12_RESOURCE_STATE_COPY_SOURCE),
++        Transition(history_[n].Get(), kAllShaderResource, D3D12_RESOURCE_STATE_COPY_DEST)};
++    command_list->ResourceBarrier(2, b);
++    command_list->CopyResource(history_[n].Get(), guest_frame);
++    b[0] = Transition(guest_frame, D3D12_RESOURCE_STATE_COPY_SOURCE,
++                      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
++    b[1] = Transition(history_[n].Get(), D3D12_RESOURCE_STATE_COPY_DEST, kAllShaderResource);
++    command_list->ResourceBarrier(2, b);
++    command_list->SetDescriptorHeaps(1, &heap);
++    command_list->SetComputeRootSignature(root_signature_.Get());
++  } else {
++    D3D12_RESOURCE_BARRIER b = Transition(guest_frame, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
++                                          kAllShaderResource);
++    command_list->ResourceBarrier(1, &b);
++    command_list->SetDescriptorHeaps(1, &heap);
++    command_list->SetComputeRootSignature(root_signature_.Get());
++    Binding resample;
++    resample.srv[0] = guest_frame;
++    resample.uav = history_[n].Get();
++    resample.uav_state = kAllShaderResource;
++    c[0] = width;
++    c[1] = height;
++    c[2] = guest_width;
++    c[3] = guest_height;
++    Run(command_list, kPassResample, resample, width, height, c);
++    b = Transition(guest_frame, kAllShaderResource, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
++    command_list->ResourceBarrier(1, &b);
++  }
++
 +  Binding bind;
 +  bind.srv[0] = history_[n].Get();
 +  bind.uav = pyramid_[n][0].Get();
@@ -2975,7 +3025,7 @@ index 0000000..71c1819
 +
 +}  // namespace rex::ui::d3d12
 diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
-index 306118e..803e78d 100644
+index 306118e..ed49411 100644
 --- a/src/ui/d3d12/d3d12_presenter.cpp
 +++ b/src/ui/d3d12/d3d12_presenter.cpp
 @@ -10,7 +10,9 @@
@@ -3017,7 +3067,7 @@ index 306118e..803e78d 100644
    // Await completion of the usage of everything before destroying anything.
    // From most likely the latest to most likely the earliest to be signaled, so
    // just one sleep will likely be needed.
-@@ -601,6 +618,123 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+@@ -601,6 +618,132 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
      // (and multiple threads can't paint the main target at the same time).
    }
  
@@ -3068,7 +3118,9 @@ index 306118e..803e78d 100644
 +          frame_interpolator_->set_debug_split(dbg == 2 ? 1u : dbg == 3 ? 2u : 0u);
 +        }
 +        if (!frame_interpolator_->PushFrame(command_list, guest_output_resource.Get(),
-+                                            current_paint_submission)) {
++                                            current_paint_submission,
++                                            paint_context_.swap_chain_width,
++                                            paint_context_.swap_chain_height)) {
 +          frame_interpolator_->Reset();
 +          diag_c = 'F';
 +          ++diag_f;
@@ -3133,6 +3185,13 @@ index 306118e..803e78d 100644
 +        diag_len = diag_g = diag_n = diag_f = diag_r = diag_x = 0;
 +        diag_last = now;
 +      }
++      // The frames shown come from the interpolator, at its (possibly downscaled) size.
++      if (frame_interpolator_->width() && frame_interpolator_->height() &&
++          (guest_output_resource.Get() == frame_interpolator_->current() ||
++           guest_output_resource.Get() == frame_interpolator_->interpolated())) {
++        guest_output_properties.frontbuffer_width = frame_interpolator_->width();
++        guest_output_properties.frontbuffer_height = frame_interpolator_->height();
++      }
 +    }
 +  } else if (frame_interpolator_) {
 +    frame_interpolator_->Reset();
@@ -3141,7 +3200,7 @@ index 306118e..803e78d 100644
    if (guest_output_resource) {
      GuestOutputPaintFlow guest_output_flow = GetGuestOutputPaintFlow(
          guest_output_properties, paint_context_.swap_chain_width, paint_context_.swap_chain_height,
-@@ -1155,9 +1289,12 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+@@ -1155,9 +1298,12 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
    // fullscreen is ever used in, the allow tearing flag must not be passed in
    // fullscreen, but DXGI fullscreen is largely unneeded with the flip
    // presentation model used in Direct3D 12).
