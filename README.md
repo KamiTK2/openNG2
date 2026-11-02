@@ -44,7 +44,7 @@ with System > Check for Updates.
 - If the GPU can't hold 60 FPS (e.g. 5x resolution) the game slows down, as on the console.
 - Only tested through the early chapters and Mission Mode so far.
 - Menus can't be used with the mouse (keyboard and controller work).
-- Not yet checked: bow aiming with the mouse; the Show Karma key has no keyboard binding yet.
+- The Show Karma key has no keyboard binding yet.
 - Only the original disc release with Title Update #2 is supported.
 
 ## Future plans

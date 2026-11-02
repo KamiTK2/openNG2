@@ -116,6 +116,7 @@ struct RecompSettings {
   bool mouse_camera = true;     // mnk_mouse (camera from the mouse in gameplay)
   int mouse_sens = 10;          // 1..50 = 0.1..5.0 (mnk_sensitivity)
   int mouse_sens_y = 10;        // 1..50 (mnk_sensitivity_y)
+  int aim_sens = 10;            // 1..50 = 0.1..5.0, projectile aim (ng2_bow_aim_gain)
   bool invert_mouse_y = false;  // mnk_invert_y
   bool mouse_auto_center = false;  // game swings the camera back behind Ryu between mouse moves
   std::array<std::string, kBindCount> binds = DefaultBinds();

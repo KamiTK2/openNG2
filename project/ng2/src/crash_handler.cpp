@@ -442,6 +442,8 @@ void InstallCrashHandler_Watch() {
 }
 
 }  // namespace
+// F9 marker count, for diagnostics elsewhere (camera history dump in ng2_hooks.cpp).
+int Ng2F9Presses() { return g_f9_presses.load(); }
 
 // NG2 DIAG: grab a burst of frames from our own window (PrintWindow, full content), saved as
 // downscaled BMPs next to ng2.exe: effect_<tag>_<n>.bmp. For effects too short to screenshot.

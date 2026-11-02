@@ -331,6 +331,7 @@ void PublishMnk(const RecompSettings& s) {
   g_mouse_camera = s.mouse_camera;
   g_mouse_sens_x = s.mouse_sens / 10.0f;
   g_mouse_sens_y = s.mouse_sens_y / 10.0f;
+  rex::cvar::SetFlagByName("ng2_bow_aim_gain", std::to_string(s.aim_sens / 10.0));
   g_mouse_invert_y = s.invert_mouse_y;
   g_mouse_auto_center = s.mouse_auto_center;
   // Mouse camera: motion goes straight into the game's stick floats (ng2_hooks.cpp), not
@@ -425,12 +426,14 @@ void ApplyDeadzone(rex::be<int16_t>& x, rex::be<int16_t>& y, float dz) {
 
 // ---- input -------------------------------------------------------------------------
 
+REXCVAR_DEFINE_BOOL(ng2_input_log, false, "NG2", "Diagnostic: log every pad state change the game gets");
+
 bool RecompSettingsBlocksGameInput() {
   return g_pane_focused.load() || g_block_until_release.load();
 }
 
 void InstallRecompInputFilters() {
-  rex::input::SetStateFilter([](uint32_t, rex::input::X_INPUT_STATE* st) {
+  rex::input::SetStateFilter([](uint32_t user_index, rex::input::X_INPUT_STATE* st) {
     auto& g = st->gamepad;
     // In-game menu, cursor on Recomp Settings (the old NINJA CINEMA row): Left/Right/A would
     // change the hidden NINJA CINEMA value; A opens our panel instead (read directly by
@@ -481,7 +484,13 @@ void InstallRecompInputFilters() {
           move_key = true;
         }
       }
-      if (move_key) {
+      // The SDK keyboard driver sees a key go up a frame later than GetAsyncKeyState, so right
+      // after a release it still reports the stick pushed for a frame and the menu moved a
+      // second time (findings #73: L 0 -32767 one frame after the D-pad dropped). Keep the
+      // stick blanked for a moment after the last movement key went up.
+      static int64_t move_key_until_ms = 0;
+      if (move_key) move_key_until_ms = NowMs() + 150;
+      if (move_key || NowMs() < move_key_until_ms) {
         g.thumb_lx = int16_t(0);
         g.thumb_ly = int16_t(0);
       }
@@ -517,6 +526,30 @@ void InstallRecompInputFilters() {
     // NG2's camera is on the right stick.
     if (g_invert_x) g.thumb_rx = int16_t(std::clamp(-int(int16_t(g.thumb_rx)), -32767, 32767));
     if (g_invert_y) g.thumb_ry = int16_t(std::clamp(-int(int16_t(g.thumb_ry)), -32767, 32767));
+    if (REXCVAR_GET(ng2_input_log)) {
+      // NG2 DIAG (findings #73, double keyboard inputs): every change of what the game gets,
+      // per user index, with the game frame and the number of polls since the last change.
+      struct Seen {
+        uint16_t buttons = 0;
+        int16_t lx = 0, ly = 0, rx = 0, ry = 0;
+        uint8_t lt = 0, rt = 0;
+        uint32_t polls = 0;
+      };
+      static std::mutex m;
+      static Seen seen[4];
+      std::lock_guard<std::mutex> lock(m);
+      Seen& o = seen[user_index & 3];
+      ++o.polls;
+      const Seen n{uint16_t(g.buttons), int16_t(g.thumb_lx), int16_t(g.thumb_ly), int16_t(g.thumb_rx),
+                   int16_t(g.thumb_ry), uint8_t(g.left_trigger), uint8_t(g.right_trigger), 0};
+      if (n.buttons != o.buttons || n.lx != o.lx || n.ly != o.ly || n.rx != o.rx || n.ry != o.ry ||
+          n.lt != o.lt || n.rt != o.rt) {
+        REXLOG_INFO("NG2 input: user {} buttons {:04X} L {} {} R {} {} T {} {} (frame {}, {} polls, gameplay {})",
+                    user_index, n.buttons, n.lx, n.ly, n.rx, n.ry, n.lt, n.rt,
+                    g_game_frames.load(std::memory_order_relaxed), o.polls, gameplay_now);
+        o = n;
+      }
+    }
   });
   rex::input::SetVibrationFilter([](uint32_t, rex::input::X_INPUT_VIBRATION* v) {
     const int pct = g_vibration_pct.load();
@@ -633,6 +666,7 @@ bool RecompSettings::Load(const std::filesystem::path& path) {
     else if (k == "mnk_mouse") mouse_camera = ParseBool(v, mouse_camera);
     else if (k == "ng2_mouse_sens") mouse_sens = ParseInt(v, mouse_sens, 1, 50);
     else if (k == "ng2_mouse_sens_y") mouse_sens_y = ParseInt(v, mouse_sens_y, 1, 50);
+    else if (k == "ng2_aim_sens") aim_sens = ParseInt(v, aim_sens, 1, 50);
     else if (k == "mnk_invert_y") invert_mouse_y = ParseBool(v, invert_mouse_y);
     else if (k == "ng2_mouse_auto_center") mouse_auto_center = ParseBool(v, mouse_auto_center);
     else if (k == "ng2_bind_layout") bind_layout = ParseInt(v, 0, 0, 1000);
@@ -697,6 +731,7 @@ bool RecompSettings::Save(const std::filesystem::path& path) const {
       << "mnk_mouse = " << b(mouse_camera) << "\n"
       << "ng2_mouse_sens = " << mouse_sens << "\n"
       << "ng2_mouse_sens_y = " << mouse_sens_y << "\n"
+      << "ng2_aim_sens = " << aim_sens << "\n"
       << "mnk_sensitivity = " << mouse_sens / 10.0 << "\n"
       << "mnk_sensitivity_y = " << mouse_sens_y / 10.0 << "\n"
       << "mnk_invert_y = " << b(invert_mouse_y) << "\n"
@@ -1625,6 +1660,8 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
                [&s](int v) { s.mouse_sens = v; });
       step_row("Vertical Sensitivity", FormatSens(s.mouse_sens_y), s.mouse_sens_y, 1, 50, 1,
                [&s](int v) { s.mouse_sens_y = v; });
+      step_row("Aim Sensitivity", FormatSens(s.aim_sens), s.aim_sens, 1, 50, 1,
+               [&s](int v) { s.aim_sens = v; });
       pair_row("Invert Mouse Y", "On", "Off", s.invert_mouse_y,
                [&s](bool a) { s.invert_mouse_y = a; });
       pair_row("Camera Auto-Center", "On", "Off", s.mouse_auto_center,

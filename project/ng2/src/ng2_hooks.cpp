@@ -444,9 +444,18 @@ extern "C" REX_FUNC(sub_836D6F38) {
 constexpr uint32_t kBuckets = 0x85325ED8;
 constexpr int kBucketCount = 91;
 REXCVAR_DEFINE_BOOL(ng2_bucket_dump, false, "NG2", "Diagnostic: log 2D draws per render bucket");
+REXCVAR_DEFINE_BOOL(ng2_bar_diag, false, "NG2", "Diagnostic: log boss bar quads and rects");
 namespace {
 std::unordered_map<uint32_t, int> g_item_bucket;  // game thread only (render pass)
 int g_draw_bucket = -1;                           // bucket of the item being drawn
+uint32_t g_draw_item = 0;                         // the item being drawn
+// Per-item x extent of everything an item drew (1280 space): this frame and the previous one.
+// Shared buckets (39-41) are anchored per item from the previous frame's extent (issue #1).
+struct ItemExtent {
+  float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
+  bool rect = false;  // untextured rectangle (sub_8368E4F0)
+};
+std::unordered_map<uint32_t, ItemExtent> g_item_x_cur, g_item_x_prev;
 // The gameplay HUD is on screen this frame: buckets 57-59 (health bar fill) have items. Main
 // menu screens reuse buckets 60/61 (main Options), so pinning is limited to HUD frames.
 bool g_hud_active = false;
@@ -468,6 +477,8 @@ void Ng2DrainSystemSounds(PPCContext& ctx, uint8_t* base);
 extern "C" REX_FUNC(__imp__sub_8368E2D8);
 extern "C" REX_FUNC(sub_8368E2D8) {
   g_item_bucket.clear();
+  g_item_x_prev.swap(g_item_x_cur);
+  g_item_x_cur.clear();
   g_hud_active = false;
   bool ingame_menu_drawn = false;
   bool menu_over_hud = false;  // pause / inventory (49-50) or in-game menu (70-72)
@@ -539,10 +550,64 @@ REXCVAR_DEFINE_BOOL(ng2_hud_anchor, true, "NG2",
                     "Ultrawide: pin the HUD to the screen edges (off = centred 16:9 HUD)");
 namespace {
 enum class Anchor { kCenter, kLeft, kRight };
-Anchor BucketAnchor(int bucket) {
-  if (!REXCVAR_GET(ng2_hud_anchor) || !g_hud_active) return Anchor::kCenter;
-  if (bucket == 40 || (bucket >= 57 && bucket <= 61)) return Anchor::kLeft;
+// Buckets 39-41 are shared by many HUD widgets (karma / combo panel, hit counter and its
+// shadow layer, boss bar, projectile stock, ...; diag-hud-bow-1: bucket 40 spans x -23..1347),
+// so each item is anchored by where it draws: wholly in the left half = left edge, wholly in
+// the right half = right edge, across the centre = centred. [x0, x1] is the quad being drawn.
+Anchor AnchorOfExtent(float x0, float x1) {
+  if (x1 <= 640.0f) return Anchor::kLeft;
+  if (x0 >= 640.0f) return Anchor::kRight;
   return Anchor::kCenter;
+}
+// Pieces of a widget (the boss bar's blue damage rectangle and purple lost-health sprite lie in
+// the right half on their own) follow the widest textured item of the last frame that
+// contains them, so the whole widget moves together.
+Anchor BucketAnchor(int bucket, float x0 = 640.0f, float x1 = 640.0f, float y0 = 360.0f,
+                    float y1 = 360.0f, bool rect = false) {
+  if (!REXCVAR_GET(ng2_hud_anchor) || !g_hud_active) return Anchor::kCenter;
+  if (bucket >= 57 && bucket <= 61) return Anchor::kLeft;
+  if (bucket < 39 || bucket > 41) return Anchor::kCenter;
+  if (g_draw_item) {
+    auto& cur = g_item_x_cur[g_draw_item];
+    cur.x0 = std::min(cur.x0, x0), cur.x1 = std::max(cur.x1, x1);
+    cur.y0 = std::min(cur.y0, y0), cur.y1 = std::max(cur.y1, y1);
+    cur.rect = rect;
+    {
+      // This piece's extent (last frame's when known, it is the whole item).
+      float ex0 = x0, ex1 = x1, ey0 = y0, ey1 = y1;
+      if (auto own = g_item_x_prev.find(g_draw_item); own != g_item_x_prev.end() && !rect) {
+        ex0 = own->second.x0, ex1 = own->second.x1, ey0 = own->second.y0, ey1 = own->second.y1;
+      }
+      const float cx = (ex0 + ex1) * 0.5f, cy = (ey0 + ey1) * 0.5f;
+      const ItemExtent* best = nullptr;
+      for (const auto& [item, e] : g_item_x_prev) {
+        if (item == g_draw_item || e.rect || e.x1 - e.x0 <= ex1 - ex0) continue;
+        if (cx < e.x0 || cx > e.x1 || cy < e.y0 - 12.0f || cy > e.y1 + 12.0f) continue;
+        if (e.x1 - e.x0 >= 1200.0f) continue;  // screen-wide overlays are no widget
+        // Widest container = the whole widget (the boss bar frame), not one of its pieces
+        // (its purple lost-health part alone lies in the right half).
+        if (!best || e.x1 - e.x0 > best->x1 - best->x0) best = &e;
+      }
+      if (REXCVAR_GET(ng2_bucket_dump) && best) {
+        static std::unordered_map<uint64_t, int> seen;
+        const uint64_t key = (uint64_t(int(ex0) / 16) << 32) | uint32_t(int(ey0) / 16 * 1000 + bucket);
+        if (seen[key]++ == 0) {
+          REXLOG_INFO("NG2 HUD piece{}: bucket {} x {:.0f}-{:.0f} y {:.0f}-{:.0f} -> container {}",
+                      rect ? " (rect)" : "", bucket, ex0, ex1, ey0, ey1,
+                      best ? fmt::format("x {:.0f}-{:.0f} y {:.0f}-{:.0f}", best->x0, best->x1,
+                                         best->y0, best->y1)
+                           : std::string("none"));
+        }
+      }
+      if (best) return AnchorOfExtent(best->x0, best->x1);
+    }
+    auto it = g_item_x_prev.find(g_draw_item);
+    if (it != g_item_x_prev.end()) {
+      x0 = std::min(x0, it->second.x0);
+      x1 = std::max(x1, it->second.x1);
+    }
+  }
+  return AnchorOfExtent(x0, x1);
 }
 // x in 1280-wide space -> pre-stretch x. Centre: squeeze around 640; left/right: keep the
 // 16:9 distance to that screen edge.
@@ -559,6 +624,7 @@ namespace {
 void SetDrawBucket(uint32_t item) {
   auto it = g_item_bucket.find(item);
   g_draw_bucket = it == g_item_bucket.end() ? -1 : it->second;
+  g_draw_item = item;
 }
 }  // namespace
 extern "C" REX_FUNC(__imp__sub_8368FDA0);
@@ -592,14 +658,34 @@ extern "C" REX_FUNC(sub_8368E878) {
 extern "C" REX_FUNC(__imp__sub_8368E4F0);
 extern "C" REX_FUNC(sub_8368E4F0) {
   const double aspect = REXCVAR_GET(ng2_aspect_ratio);
-  const Anchor anchor = BucketAnchor(g_draw_bucket);
-  if (aspect <= 16.0 / 9.0 + 1e-4 || anchor == Anchor::kCenter) {
+  const uint32_t vertices = ctx.r4.u32;
+  auto* mem = REX_KERNEL_STATE()->memory();
+  float rx0 = 1e9f, rx1 = -1e9f, ry0 = 1e9f, ry1 = -1e9f;
+  for (uint32_t i = 0; i < 4; ++i) {
+    const float x = rex::memory::load_and_swap<float>(mem->TranslateVirtual(vertices + i * 16));
+    const float y = rex::memory::load_and_swap<float>(mem->TranslateVirtual(vertices + i * 16 + 4));
+    rx0 = std::min(rx0, x), rx1 = std::max(rx1, x);
+    ry0 = std::min(ry0, y), ry1 = std::max(ry1, y);
+  }
+  const Anchor anchor = BucketAnchor(g_draw_bucket, rx0, rx1, ry0, ry1, true);
+  if (REXCVAR_GET(ng2_bar_diag) && g_hud_active && ry0 >= 600.0f && ry1 <= 700.0f) {
+    static int64_t last = 0;
+    const int64_t t = NowMs();
+    if (t - last > 250) {
+      last = t;
+      REXLOG_INFO("NG2 bar rect: bucket {} item {:08X} x {:.1f}-{:.1f} y {:.0f}-{:.0f} anchor {}",
+                  g_draw_bucket, g_draw_item, rx0, rx1, ry0, ry1, int(anchor));
+    }
+  }
+  // Centred rects stay full-width (fades) except in the shared HUD buckets, where they are
+  // pieces of a centred widget (the boss bar's damage strips) and get its 16:9 squeeze.
+  const bool hud_piece = g_hud_active && REXCVAR_GET(ng2_hud_anchor) && g_draw_bucket >= 39 &&
+                         g_draw_bucket <= 41 && rx1 - rx0 < 1200.0f;
+  if (aspect <= 16.0 / 9.0 + 1e-4 || (anchor == Anchor::kCenter && !hud_piece)) {
     __imp__sub_8368E4F0(ctx, base);
     return;
   }
   const float inv_k = float((16.0 / 9.0) / aspect);
-  const uint32_t vertices = ctx.r4.u32;
-  auto* mem = REX_KERNEL_STATE()->memory();
   float original[4];
   for (uint32_t i = 0; i < 4; ++i) {
     auto* px = mem->TranslateVirtual<uint8_t*>(vertices + i * 16);
@@ -612,6 +698,44 @@ extern "C" REX_FUNC(sub_8368E4F0) {
                                        original[i]);
   }
 }
+// Scissor items (GitHub issue #1, boss bar): sub_8369FBA8(r3 = item) enables the scissor test
+// with the rectangle at item +24/+28 (left, top) and +16/+20 (width, height), 1280x720 space;
+// sub_8369FC88 disables it. The boss bar's red fill is a full-length sprite clipped this way,
+// so the rectangle gets the same squeeze as the sprites it clips (it ran too wide before).
+extern "C" REX_FUNC(__imp__sub_8369FBA8);
+extern "C" REX_FUNC(sub_8369FBA8) {
+  const double aspect = REXCVAR_GET(ng2_aspect_ratio);
+  const uint32_t item = ctx.r3.u32;
+  if (aspect <= 16.0 / 9.0 + 1e-4 || !item) {
+    __imp__sub_8369FBA8(ctx, base);
+    return;
+  }
+  auto* mem = REX_KERNEL_STATE()->memory();
+  uint8_t* px = mem->TranslateVirtual<uint8_t*>(item + 24);
+  uint8_t* pw = mem->TranslateVirtual<uint8_t*>(item + 16);
+  const float x0 = rex::memory::load_and_swap<float>(px), w = rex::memory::load_and_swap<float>(pw);
+  const float y0 = rex::memory::load_and_swap<float>(mem->TranslateVirtual<uint8_t*>(item + 28));
+  const float h = rex::memory::load_and_swap<float>(mem->TranslateVirtual<uint8_t*>(item + 20));
+  SetDrawBucket(item);
+  const Anchor anchor = BucketAnchor(g_draw_bucket, x0, x0 + w, y0, y0 + h);
+  const float inv_k = float((16.0 / 9.0) / aspect);
+  const float nx0 = MapX(x0, inv_k, anchor), nx1 = MapX(x0 + w, inv_k, anchor);
+  if (REXCVAR_GET(ng2_bar_diag) && g_hud_active) {
+    static int64_t last = 0;
+    if (NowMs() - last > 500) {
+      last = NowMs();
+      REXLOG_INFO("NG2 scissor: bucket {} x {:.1f}+{:.1f} -> {:.1f}-{:.1f} y {:.0f}+{:.0f} anchor {}",
+                  g_draw_bucket, x0, w, nx0, nx1, y0, h, int(anchor));
+    }
+  }
+  rex::memory::store_and_swap<float>(px, nx0);
+  rex::memory::store_and_swap<float>(pw, nx1 - nx0);
+  __imp__sub_8369FBA8(ctx, base);
+  rex::memory::store_and_swap<float>(px, x0);
+  rex::memory::store_and_swap<float>(pw, w);
+  g_draw_bucket = -1;
+}
+
 extern "C" REX_FUNC(__imp__sub_8368EA48);
 extern "C" REX_FUNC(sub_8368EA48) {
   SetDrawBucket(ctx.r3.u32);
@@ -712,7 +836,30 @@ extern "C" REX_FUNC(sub_8368EFE8) {
   }
   const float inv_k = float((16.0 / 9.0) / aspect);
   auto* mem = REX_KERNEL_STATE()->memory();
-  const Anchor anchor = BucketAnchor(g_draw_bucket);
+  float qx0 = 1e9f, qx1 = -1e9f, qy0 = 1e9f, qy1 = -1e9f;
+  for (uint32_t i = 0; i < 4; ++i) {
+    const float x = rex::memory::load_and_swap<float>(mem->TranslateVirtual(vertices + i * 24));
+    const float y = rex::memory::load_and_swap<float>(mem->TranslateVirtual(vertices + i * 24 + 4));
+    qx0 = std::min(qx0, x), qx1 = std::max(qx1, x);
+    qy0 = std::min(qy0, y), qy1 = std::max(qy1, y);
+  }
+  const Anchor anchor = BucketAnchor(g_draw_bucket, qx0, qx1, qy0, qy1);
+  if (REXCVAR_GET(ng2_bar_diag) && g_hud_active && qy0 >= 600.0f && qy1 <= 700.0f) {
+    // NG2 DIAG (boss bar): every bottom-bar quad of one whole frame per second, with the
+    // squeezed result, so the piece that maps differently shows.
+    static uint32_t log_frame = ~0u;
+    static int64_t last = 0;
+    const uint32_t frame = GuestLoadU32(kBuckets + 1456);
+    const int64_t t = NowMs();
+    if (frame != log_frame && t - last > 1000) { last = t; log_frame = frame; }
+    if (frame == log_frame) {
+      const double asp = REXCVAR_GET(ng2_aspect_ratio);
+      const float ik = asp > 16.0 / 9.0 ? float((16.0 / 9.0) / asp) : 1.0f;
+      REXLOG_INFO("NG2 bar quad: bucket {} item {:08X} method {:08X} x {:.1f}-{:.1f} -> {:.1f}-{:.1f} y {:.0f}-{:.0f} anchor {} lr {:08X}",
+                  g_draw_bucket, g_draw_item, GuestLoadU32(GuestLoadU32(g_draw_item) + 4), qx0, qx1,
+                  MapX(qx0, ik, anchor), MapX(qx1, ik, anchor), qy0, qy1, int(anchor), uint32_t(ctx.lr));
+    }
+  }
   // Squeeze for the draw, then restore: some callers keep their vertices across frames.
   float original[4];
   for (uint32_t i = 0; i < 4; ++i) {
@@ -821,10 +968,20 @@ extern "C" REX_FUNC(sub_8370DD20) {
       std::memcpy(&bits, &v, 4);
       r.u64 = (uint64_t(bits) << 32) | (r.u64 & 0xFFFFFFFFull);
     };
+    float tx;
+    {
+      const uint32_t bits = uint32_t(ctx.r10.u64 >> 32);
+      std::memcpy(&tx, &bits, 4);  // m30: the string's x position
+    }
+    float ty;
+    {
+      const uint32_t bits = uint32_t(ctx.r10.u64 & 0xFFFFFFFFull);
+      std::memcpy(&ty, &bits, 4);  // m31: the string's y position
+    }
+    const Anchor anchor = BucketAnchor(g_draw_bucket, tx, tx, ty, ty);
     scale_hi(ctx.r4, 0.0f);
     scale_hi(ctx.r6, 0.0f);
     scale_hi(ctx.r8, 0.0f);
-    const Anchor anchor = BucketAnchor(g_draw_bucket);
     // m30' = MapX(m30): MapX is affine (x * inv_k + c), c = MapX(0).
     scale_hi(ctx.r10, MapX(0.0f, inv_k, anchor));
   }
@@ -1077,6 +1234,11 @@ float g_zoom = 1.0f;         // camera distance factor in use (applied in sub_82
 float g_zoom_target = 1.0f;  // set by the mouse wheel; g_zoom eases toward it  // set by the camera update below (game thread)
 }  // namespace
 
+// Off by default: boss grabs use the same mode 8 / action 114 -> 111 as executions, and taking
+// that camera made the game swing it 60-180 deg every frame (cam-follow-1, user 2026-11-02).
+REXCVAR_DEFINE_BOOL(ng2_mouse_cam_take_scripted, false, "NG2",
+                    "Mouse look takes over scripted cameras (executions, grabs: mode 8)");
+int Ng2F9Presses();  // crash_handler.cpp
 extern "C" REX_FUNC(__imp__sub_823053F0);
 extern "C" REX_FUNC(sub_823053F0) {
   const uint32_t cam = ctx.r3.u32;
@@ -1119,9 +1281,47 @@ extern "C" REX_FUNC(sub_823053F0) {
     // eye back clipped through walls).
     if (steps) g_zoom_target = std::clamp(g_zoom_target * std::pow(0.9f, float(steps)), 0.4f, 1.5f);
   }
+  const GuestVec pre_eye = cam ? LoadVec(mem->TranslateVirtual<uint8_t*>(cam + 64)) : GuestVec{0, 0, 0};
+  const GuestVec pre_tgt = cam ? LoadVec(mem->TranslateVirtual<uint8_t*>(cam + 80)) : GuestVec{0, 0, 0};
   __imp__sub_823053F0(ctx, base);
+  if (REXCVAR_GET(ng2_mouse_cam_log) && cam) {
+    // NG2 DIAG: per-frame camera history; F9 dumps the last 4 s (boss camera vs mouse look).
+    struct CamFrame {
+      int64_t ms;
+      uint32_t mode, action, flag4640;
+      bool mouse;
+      float dx, dy;
+      GuestVec pre_eye, pre_tgt, game_eye, game_tgt, player;
+    };
+    static CamFrame ring[240];
+    static size_t head = 0;
+    static int seen_f9 = 0;
+    const uint32_t pl = GuestLoadU32(0x83B28400) ? GuestLoadU32(GuestLoadU32(0x83B28400) + 1632) : 0;
+    CamFrame& f = ring[head++ % 240];
+    f = {now, GuestLoadU32(cam + 4716), pl ? GuestLoadU32(pl + 336) : 0, GuestLoadU32(cam + 4640),
+         g_mouse_has_camera, dx, dy, pre_eye, pre_tgt,
+         LoadVec(mem->TranslateVirtual<uint8_t*>(cam + 64)), LoadVec(mem->TranslateVirtual<uint8_t*>(cam + 80)),
+         pl ? LoadVec(mem->TranslateVirtual<uint8_t*>(pl + 48)) : GuestVec{0, 0, 0}};
+    const int f9 = Ng2F9Presses();
+    if (f9 != seen_f9) {
+      seen_f9 = f9;
+      REXLOG_INFO("NG2 cam history (F9 #{}): last {} frames", f9, std::min<size_t>(head, 240));
+      for (size_t i = head > 240 ? head - 240 : 0; i < head; ++i) {
+        const CamFrame& c = ring[i % 240];
+        REXLOG_INFO("NG2 cam h {} mode {} act {} f {} mouse {} d {:.0f} {:.0f} pre e({:.2f} {:.2f} {:.2f}) "
+                    "t({:.2f} {:.2f} {:.2f}) game e({:.2f} {:.2f} {:.2f}) t({:.2f} {:.2f} {:.2f}) pl({:.2f} {:.2f} {:.2f})",
+                    c.ms, c.mode, c.action, c.flag4640, c.mouse, c.dx, c.dy, c.pre_eye.x, c.pre_eye.y,
+                    c.pre_eye.z, c.pre_tgt.x, c.pre_tgt.y, c.pre_tgt.z, c.game_eye.x, c.game_eye.y,
+                    c.game_eye.z, c.game_tgt.x, c.game_tgt.y, c.game_tgt.z, c.player.x, c.player.y,
+                    c.player.z);
+      }
+    }
+  }
   if (first_person) return;  // the game's first-person look (mouse fed as the stick above)
-  if (!active) {
+  // Scripted cameras (grabs, executions: any mode but 1) play as on a console; mouse look
+  // resumes from wherever they leave the camera.
+  const bool scripted = cam && GuestLoadU32(cam + 4716) != 1 && !REXCVAR_GET(ng2_mouse_cam_take_scripted);
+  if (!active || scripted) {
     g_mouse_has_camera = false;
     return;
   }
@@ -1138,12 +1338,85 @@ extern "C" REX_FUNC(sub_823053F0) {
                 "+2432 ({:.2f} {:.2f} {:.2f}) dist {:.2f} mouse {}",
                 eye.x, eye.y, eye.z, tgt.x, tgt.y, tgt.z, eye2.x, eye2.y, eye2.z, r, recent);
   }
+  {
+    // NG2 DIAG (boss / grab camera fights the mouse): frames where the camera target jumps.
+    static GuestVec last_tgt{0, 0, 0};
+    static float last_r = 0.0f;
+    const float jx = tgt.x - last_tgt.x, jy = tgt.y - last_tgt.y, jz = tgt.z - last_tgt.z;
+    const float jump = std::sqrt(jx * jx + jy * jy + jz * jz);
+    if (REXCVAR_GET(ng2_mouse_cam_log) && last_r > 0.0f && (jump > 0.15f * last_r || std::abs(r - last_r) > 0.3f * last_r)) {
+      static int n = 0;
+      if (n++ < 400) {
+        const uint32_t pla = GuestLoadU32(0x83B28400) ? GuestLoadU32(GuestLoadU32(0x83B28400) + 1632) : 0;
+        uint8_t* pl = mem->TranslateVirtual<uint8_t*>((pla ? pla : 0x84C56000) + 48);
+        REXLOG_INFO("NG2 mouse cam jump: target ({:.2f} {:.2f} {:.2f}) moved {:.2f}, dist {:.2f} -> {:.2f}, "
+                    "player ({:.2f} {:.2f} {:.2f}) mode {} action {} mouse {}",
+                    tgt.x, tgt.y, tgt.z, jump, last_r, r, LoadF(pl), LoadF(pl + 4), LoadF(pl + 8),
+                    GuestLoadU32(cam + 4716),
+                    GuestLoadU32(GuestLoadU32(GuestLoadU32(0x83B28400) + 1632) + 336), recent);
+      }
+    }
+    last_tgt = tgt;
+    last_r = r;
+  }
+  if (REXCVAR_GET(ng2_mouse_cam_log)) {
+    // NG2 DIAG: where is Ryu's position? Vec3s in the player object region (below the camera
+    // block) near the camera target, once every 2 s.
+    static int64_t last_scan = 0;
+    if (now - last_scan > 2000) {
+      last_scan = now;
+      std::string hits;
+      for (uint32_t off = 0; off + 12 <= 0x9F0; off += 4) {
+        uint8_t* v = mem->TranslateVirtual<uint8_t*>(0x84C56000 + off);
+        const float x = LoadF(v), y = LoadF(v + 4), z = LoadF(v + 8);
+        if (!std::isfinite(x) || std::abs(x - tgt.x) > 2.5f || std::abs(z - tgt.z) > 2.5f ||
+            std::abs(y - tgt.y) > 3.0f) continue;
+        char b[64];
+        std::snprintf(b, sizeof(b), " +%X(%.2f %.2f %.2f)", off, x, y, z);
+        hits += b;
+      }
+      REXLOG_INFO("NG2 pos scan: target ({:.2f} {:.2f} {:.2f}) mode {}:{}", tgt.x, tgt.y, tgt.z,
+                  GuestLoadU32(cam + 4716), hits);
+    }
+  }
   // While the mouse has the camera, its direction is ours: whatever the game's follow logic
   // turned this frame is undone (the game's distance is kept: it pulls in for walls).
   static bool have_dir = false;
   static float yaw_state = 0.0f, elev_state = 0.0f;
+  static GuestVec last_out{0, 0, 0};
   if (!recent || !(r > 1e-3f) || !std::isfinite(r)) {
     have_dir = false;
+    return;
+  }
+  static int64_t game_owns_until = 0;
+  if (have_dir) {
+    // Another part of the game turned the camera since our last write: forced lock-ons (boss
+    // fights turn it toward the boss between frames: 150-210 deg jumps with the mouse still,
+    // cam-hist-1). Fighting it made the camera flicker; the game keeps the camera until it has
+    // left it alone for a moment, then the mouse continues from there (user: "always allow
+    // the lock-on for the enemies that force it").
+    const float ax = last_out.x - pre_tgt.x, ay = last_out.y - pre_tgt.y, az = last_out.z - pre_tgt.z;
+    const float bx = pre_eye.x - pre_tgt.x, by = pre_eye.y - pre_tgt.y, bz = pre_eye.z - pre_tgt.z;
+    const float la = std::sqrt(ax * ax + ay * ay + az * az), lb = std::sqrt(bx * bx + by * by + bz * bz);
+    if (la > 1e-3f && lb > 1e-3f) {
+      const float cosang = (ax * bx + ay * by + az * bz) / (la * lb);
+      if (cosang < 0.9986f) {  // > 3 deg
+        have_dir = false;
+        if (REXCVAR_GET(ng2_mouse_cam_log) && now >= game_owns_until) {
+          REXLOG_INFO("NG2 mouse cam: game turned the camera {:.0f} deg, lock-on has it",
+                      std::acos(std::clamp(cosang, -1.0f, 1.0f)) * 57.2958f);
+        }
+        game_owns_until = now + 400;
+      }
+    }
+  }
+  if (now < game_owns_until) {
+    // Lock-on: the game's camera as is; track where it is so the next frame compares with it.
+    last_out = pre_eye;
+    have_dir = true;
+    yaw_state = std::atan2(ox, oz);
+    elev_state = std::atan2(oy, std::sqrt(ox * ox + oz * oz));
+    last_out = eye;
     return;
   }
   if (!have_dir) {
@@ -1160,6 +1433,7 @@ extern "C" REX_FUNC(sub_823053F0) {
   const GuestVec out{tgt.x + h * std::sin(yaw_state), tgt.y + r * std::sin(elev_state),
                      tgt.z + h * std::cos(yaw_state)};
   StoreVec(eye_p, out);
+  last_out = out;
   // +2432 trails +64 slightly (a smoothed / previous-frame eye, 0.01-0.08 units behind in
   // mouselook-4); set it too so nothing eases toward the old direction.
   StoreVec(eye2_p, out);
@@ -1227,7 +1501,9 @@ extern "C" REX_FUNC(sub_822FA8B8) {
   const uint32_t mode = c == 0x84C569F0 ? GuestLoadU32(c + 4716) : 1;
   // Mode 4 = first-person view (held 1st-Person View): left alone, or moving the mouse would
   // pull the player out of it.
-  if (g_mouse_has_camera && Ng2InGameplay() && mode != 1 && mode != 4 && mode < 64) {
+  // Only executions (mode 8) are taken over: grabs use mode 7 (diag-hud-bow-3), and forcing it
+  // back to 1 left the camera flickering wildly after the grab (user report 2026-11-02).
+  if (REXCVAR_GET(ng2_mouse_cam_take_scripted) && g_mouse_has_camera && Ng2InGameplay() && mode == 8) {
     static uint64_t logged = 0;
     if (!(logged & (1ull << mode))) {
       logged |= 1ull << mode;
@@ -1480,14 +1756,168 @@ extern "C" REX_FUNC(sub_822FADB8) {
 // look code instead of sub_823053F0 and reads the right stick. The input update sub_822F2E38
 // writes the stick floats every frame (record 0x83C07FF0 + pad*68, +28/+32); in first person
 // the mouse motion is added there, clamped to the stick range.
+REXCVAR_DEFINE_BOOL(ng2_bow_aim_direct, true, "NG2",
+                    "Mouse turns the bow aim directly (off = mouse acts as the left stick)");
+REXCVAR_DEFINE_DOUBLE(ng2_bow_aim_gain, 1.0, "NG2", "Bow aim: mouse speed factor (Aim Sensitivity)");
+REXCVAR_DEFINE_BOOL(ng2_bow_manual_aim, true, "NG2",
+                    "Keyboard & mouse: aiming a projectile starts in manual aim (no stick tap needed)");
+namespace {
+int g_bow_mouse_frames = 0;  // frames the mouse still owns the aim (smoothed value reset after)
+float g_bow_pending_x = 0.0f, g_bow_pending_y = 0.0f;  // turn above the peak rate, for later frames
+}
+REXCVAR_DEFINE_BOOL(ng2_bow_aim_invert_curve, true, "NG2",
+                    "Bow aim: undo the stick curve so aim speed follows mouse speed");
+REXCVAR_DEFINE_BOOL(ng2_aim_diag, false, "NG2", "Diagnostic: search the bow aim angles while aiming");
+REXCVAR_DEFINE_BOOL(ng2_action_log, false, "NG2",
+                     "Diagnostic: log player action changes with camera mode and left stick");
 extern "C" REX_FUNC(__imp__sub_822F2E38);
 extern "C" REX_FUNC(sub_822F2E38) {
   __imp__sub_822F2E38(ctx, base);
+  if (REXCVAR_GET(ng2_aim_diag)) {
+    // NG2 DIAG (issue #3): find the bow aim angles. While aiming (action 115 / 184), compare
+    // the player + gameplay camera block (0x84C56000..+0x3000) frame to frame: values that
+    // change while the left stick is held and stay put while it is released.
+    constexpr uint32_t kBase = 0x84C56000, kWords = 0x3000 / 4;
+    static std::vector<uint32_t> prev(kWords);
+    static std::vector<int> moved(kWords), still(kWords);
+    static std::vector<double> corr_x(kWords), corr_y(kWords);
+    static bool was_aiming = false, have_prev = false;
+    static int frames_moving = 0, frames_still = 0;
+    const uint32_t pl = GuestLoadU32(0x83B28400) ? GuestLoadU32(GuestLoadU32(0x83B28400) + 1632) : 0;
+    const uint32_t act = pl ? GuestLoadU32(pl + 336) : 0;
+    const bool aiming = act == 115 || act == 184;
+    auto* mem = REX_KERNEL_STATE()->memory();
+    if (aiming) {
+      uint32_t pad = *mem->TranslateVirtual<uint8_t*>(0x84C3DA3E);
+      if (pad > 3) pad = 0;
+      uint8_t* rec = mem->TranslateVirtual<uint8_t*>(0x83C07FF0 + pad * 68);
+      const float lx = LoadF(rec + 20), ly = LoadF(rec + 24);
+      const bool moving = std::abs(lx) > 0.1f || std::abs(ly) > 0.1f;
+      (moving ? frames_moving : frames_still)++;
+      for (uint32_t i = 0; i < kWords; ++i) {
+        const uint32_t v = GuestLoadU32(kBase + i * 4);
+        if (have_prev && v != prev[i]) {
+          (moving ? moved : still)[i]++;
+          float a, b;
+          std::memcpy(&a, &v, 4);
+          std::memcpy(&b, &prev[i], 4);
+          const double d = std::isfinite(a) && std::isfinite(b) ? double(a) - double(b) : 0.0;
+          corr_x[i] += d * lx;
+          corr_y[i] += d * ly;
+        }
+        prev[i] = v;
+      }
+      have_prev = true;
+    } else if (was_aiming) {
+      std::vector<uint32_t> idx;
+      for (uint32_t i = 0; i < kWords; ++i) {
+        if (moved[i] >= std::max(5, frames_moving / 3) && still[i] * 4 <= frames_still) idx.push_back(i);
+      }
+      std::sort(idx.begin(), idx.end(), [&](uint32_t a, uint32_t b) { return moved[a] > moved[b]; });
+      REXLOG_INFO("NG2 aim diag: aim ended, {} frames moving / {} still, {} candidates", frames_moving,
+                  frames_still, idx.size());
+      for (size_t k = 0; k < idx.size() && k < 40; ++k) {
+        const uint32_t i = idx[k];
+        float v;
+        std::memcpy(&v, &prev[i], 4);
+        REXLOG_INFO("NG2 aim diag:   {:08X} (+{:X}) moved {} still {} corr x {:.3f} y {:.3f} value {}",
+                    kBase + i * 4, i * 4, moved[i], still[i], corr_x[i], corr_y[i], v);
+      }
+      std::fill(moved.begin(), moved.end(), 0);
+      std::fill(still.begin(), still.end(), 0);
+      std::fill(corr_x.begin(), corr_x.end(), 0.0);
+      std::fill(corr_y.begin(), corr_y.end(), 0.0);
+      frames_moving = frames_still = 0;
+      have_prev = false;
+    }
+    was_aiming = aiming;
+  }
+  if (REXCVAR_GET(ng2_action_log)) {
+    static uint32_t last_action = ~0u, last_mode = ~0u;
+    const uint32_t player = GuestLoadU32(0x83B28400) ? GuestLoadU32(GuestLoadU32(0x83B28400) + 1632) : 0;
+    const uint32_t action = player ? GuestLoadU32(player + 336) : ~1u;
+    const uint32_t mode = GuestLoadU32(0x84C569F0 + 4716);
+    if (action != last_action || mode != last_mode) {
+      auto* mem = REX_KERNEL_STATE()->memory();
+      uint32_t pad = *mem->TranslateVirtual<uint8_t*>(0x84C3DA3E);
+      if (pad > 3) pad = 0;
+      uint8_t* rec = mem->TranslateVirtual<uint8_t*>(0x83C07FF0 + pad * 68);
+      REXLOG_INFO("NG2 action: {} -> {} cam mode {} gameplay {} lstick {:.2f} {:.2f} player {:08X}",
+                  int32_t(last_action), int32_t(action), mode, Ng2InGameplay(), LoadF(rec + 20),
+                  LoadF(rec + 24), player);
+      last_action = action;
+      last_mode = mode;
+    }
+  }
   const ng2::MouseCameraParams p = ng2::GetMouseCameraParams();
-  if (!p.enabled || !Ng2InGameplay() || GuestLoadU32(0x84C569F0 + 4716) != 4) return;
+  {
+    // Holding the projectile button auto-aims; only tilting the left stick switches to manual
+    // aim, so keyboard players had to tap W first (user, 2026-11-02). On keyboard & mouse the
+    // aim starts manual: one frame of stick tilt when aiming begins, then the game's smoothed
+    // aim (+0x420/+0x424) is cleared so the tilt does not turn the aim.
+    // Holding the button: action 195 (bow drawn) -> 255 (auto-aim); a stick tilt then gives
+    // 115 (manual aim) (bow-manual-1).
+    static uint32_t prev_action = 0;
+    static int kick = 0;
+    const uint32_t pl = GuestLoadU32(0x83B28400) ? GuestLoadU32(GuestLoadU32(0x83B28400) + 1632) : 0;
+    const uint32_t act = pl ? GuestLoadU32(pl + 336) : 0;
+    // Auto-aim (255) is entered from many moves: drawing (195), landing (48, the jump-draw that
+    // absorbs essence), in the air (11), running (34), ... (bow-manual-2). A stick already held
+    // at entry does not switch to manual aim, so: one frame released, then tilted.
+    const bool auto_aim_start = act == 255 && prev_action != 255 && Ng2InGameplay();
+    prev_action = act;
+    auto* m = REX_KERNEL_STATE()->memory();
+    uint32_t pd = *m->TranslateVirtual<uint8_t*>(0x84C3DA3E);
+    if (pd > 3) pd = 0;
+    uint8_t* r = m->TranslateVirtual<uint8_t*>(0x83C07FF0 + pd * 68);
+    if (auto_aim_start && p.enabled && ng2::PromptsUseKeyboard() && REXCVAR_GET(ng2_bow_manual_aim)) {
+      kick = 5;
+    }
+    if (kick > 0) {
+      --kick;
+      if (act == 115 || act == 184) {
+        // Manual aim reached: drop what the tilt put into the smoothed aim.
+        uint8_t* smooth = m->TranslateVirtual<uint8_t*>(0x84C569F0 + 0x420);
+        StoreF(smooth, LoadF(r + 20));
+        StoreF(smooth + 4, LoadF(r + 24));
+        kick = 0;
+      } else if (act != 255) {
+        kick = 0;  // left auto-aim (a throw, not a held draw)
+      } else if (kick == 4) {
+        StoreF(r + 20, 0.0f);  // released
+        StoreF(r + 24, 0.0f);
+      } else {
+        StoreF(r + 20, 0.0f);  // tilted
+        StoreF(r + 24, 0.5f);
+      }
+    }
+  }
+  if (!p.enabled || !Ng2InGameplay() || GuestLoadU32(0x84C569F0 + 4716) != 4) {
+    g_bow_pending_x = g_bow_pending_y = 0.0f;
+    return;
+  }
   float dx = 0.0f, dy = 0.0f;
   rex::input::mnk::ConsumeMouseDelta(dx, dy);
-  if (dx == 0.0f && dy == 0.0f) return;
+  {
+    const uint32_t pl = GuestLoadU32(0x83B28400) ? GuestLoadU32(GuestLoadU32(0x83B28400) + 1632) : 0;
+    const uint32_t act = pl ? GuestLoadU32(pl + 336) : 0;
+    if (act != 115 && act != 184) g_bow_pending_x = g_bow_pending_y = 0.0f;  // not aiming
+  }
+  const bool carry = g_bow_pending_x != 0.0f || g_bow_pending_y != 0.0f;
+  if (dx == 0.0f && dy == 0.0f && !carry) {
+    if (g_bow_mouse_frames > 0 && --g_bow_mouse_frames == 0) {
+      // The mouse stopped: no easing back from the mouse rate (the aim would drift on);
+      // the smoothed aim takes the stick's (WASD's) value at once.
+      auto* m = REX_KERNEL_STATE()->memory();
+      uint32_t pd = *m->TranslateVirtual<uint8_t*>(0x84C3DA3E);
+      if (pd > 3) pd = 0;
+      uint8_t* r = m->TranslateVirtual<uint8_t*>(0x83C07FF0 + pd * 68);
+      uint8_t* smooth = m->TranslateVirtual<uint8_t*>(0x84C569F0 + 0x420);
+      StoreF(smooth, LoadF(r + 20));
+      StoreF(smooth + 4, LoadF(r + 24));
+    }
+    return;
+  }
   auto* mem = REX_KERNEL_STATE()->memory();
   uint32_t pad = *mem->TranslateVirtual<uint8_t*>(0x84C3DA3E);
   if (pad > 3) pad = 0;
@@ -1495,6 +1925,50 @@ extern "C" REX_FUNC(sub_822F2E38) {
   constexpr float kStickPerPixel = 0.12f;  // at sensitivity 1.0 (user: 1.5x of 0.08)
   const float sx = dx * p.sens_x * kStickPerPixel * -float(REXCVAR_GET(ng2_mouse_yaw_sign));
   const float sy = -dy * p.sens_y * kStickPerPixel * (p.invert_y ? -1.0f : 1.0f);
-  StoreF(rec + 28, std::clamp(LoadF(rec + 28) + sx, -1.0f, 1.0f));
-  StoreF(rec + 32, std::clamp(LoadF(rec + 32) + sy, -1.0f, 1.0f));
+  // Bow aiming also uses camera mode 4, but aims with the LEFT stick (WASD): player action
+  // 115 (aiming on the ground) / 184 (in the air) (diag-hud-bow-1, GitHub issue #3).
+  const uint32_t player = GuestLoadU32(0x83B28400) ? GuestLoadU32(GuestLoadU32(0x83B28400) + 1632) : 0;
+  const uint32_t action = player ? GuestLoadU32(player + 336) : 0;
+  const bool bow = action == 115 || action == 184;
+  if (bow && REXCVAR_GET(ng2_bow_aim_direct)) {
+    // Gameplay camera +0x420 / +0x424 are the game's smoothed aim stick (they ease toward the
+    // stick and fall back to 0 on release: aim-diag-1, aim-direct-1), which is the ramp-up the
+    // mouse felt through the stick. Setting the stick and the smoothed value to the same
+    // mouse rate leaves nothing to ease, and the rate is not capped at full stick.
+    // The aim goes through the stick curve y = 2x^3 - x^4 (as the camera, findings #52): it
+    // peaks at x = 1.5 (y = 1.6875) and turns back beyond, so fast mouse moves pushed past
+    // 1.5 jerked the aim backwards. The mouse asks for a turn rate; the stick value giving it
+    // is found by inverting the curve on [0, 1.5], capped at the peak rate.
+    // 0.35: the feel the user chose (2026-11-02) is Aim Sensitivity 1.0.
+    const float gain = 0.35f * float(REXCVAR_GET(ng2_bow_aim_gain));
+    g_bow_pending_x += sx * gain;
+    g_bow_pending_y += sy * gain;
+    auto emit = [](float& pending) {
+      constexpr float kPeak = 1.6875f;
+      // The excess is dropped, not carried: carried turn kept the aim going after the mouse
+      // stopped (user, 2026-11-02).
+      const float r = std::clamp(pending, -kPeak, kPeak);
+      pending = 0.0f;
+      if (!REXCVAR_GET(ng2_bow_aim_invert_curve)) return std::clamp(r, -1.5f, 1.5f);
+      float lo = 0.0f, hi = 1.5f;
+      const float want = std::abs(r);
+      for (int i = 0; i < 24; ++i) {
+        const float mid = (lo + hi) * 0.5f;
+        (2.0f * mid * mid * mid - mid * mid * mid * mid < want ? lo : hi) = mid;
+      }
+      return std::copysign((lo + hi) * 0.5f, r);
+    };
+    const float vx = std::clamp(LoadF(rec + 20) + emit(g_bow_pending_x), -1.5f, 1.5f);
+    const float vy = std::clamp(LoadF(rec + 24) + emit(g_bow_pending_y), -1.5f, 1.5f);
+    StoreF(rec + 20, vx);
+    StoreF(rec + 24, vy);
+    uint8_t* smooth = mem->TranslateVirtual<uint8_t*>(0x84C569F0 + 0x420);
+    StoreF(smooth, vx);
+    StoreF(smooth + 4, vy);
+    g_bow_mouse_frames = 1;
+    return;
+  }
+  const uint32_t stick = bow ? 20 : 28;
+  StoreF(rec + stick, std::clamp(LoadF(rec + stick) + sx, -1.0f, 1.0f));
+  StoreF(rec + stick + 4, std::clamp(LoadF(rec + stick + 4) + sy, -1.0f, 1.0f));
 }
