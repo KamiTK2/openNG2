@@ -600,6 +600,7 @@ bool RecompSettings::Load(const std::filesystem::path& path) {
     else if (k == "present_effect") upscaler = UpscalerFromCvar(v);
     else if (k == "ng2_sharpness") sharpness = ParseInt(v, sharpness, 0, 10);
     else if (k == "ng2_aspect_mode") aspect_mode = ParseInt(v, aspect_mode, 0, 3);
+    else if (k == "ng2_fov_percent") fov_percent = ParseInt(v, fov_percent, 70, 150);
     else if (k == "ng2_framerate_cap") {
       int cap = ParseInt(v, framerate_cap, 30, 120);
       framerate_cap = cap >= 120 ? 120 : cap <= 30 ? 30 : 60;
@@ -661,6 +662,7 @@ bool RecompSettings::Save(const std::filesystem::path& path) const {
       << "present_fsr_sharpness_reduction = " << FsrSharpnessReduction(sharpness) << "\n"
       << "present_cas_additional_sharpness = " << CasAdditionalSharpness(sharpness) << "\n"
       << "ng2_aspect_mode = " << aspect_mode << "\n"
+      << "ng2_fov_percent = " << fov_percent << "\n"
       << "ng2_framerate_cap = " << framerate_cap << "\n"
       << "frame_generation = " << b(framerate_cap == 120) << "\n"
       << "present_half_rate = " << b(framerate_cap == 30) << "\n"
@@ -713,6 +715,7 @@ void RecompSettings::ApplyStartup(const std::filesystem::path& path) {
   PublishInputSettings(s);
   PublishCheats(s);
   PublishMnk(s);  // also when the file predates these keys (PC defaults, not the SDK's)
+  rex::cvar::SetFlagByName("ng2_fov_percent", std::to_string(s.fov_percent));
   REXLOG_INFO("RECOMP SETTINGS loaded from {} (present_effect {})", path.string(),
               rex::cvar::GetFlagByName("present_effect"));
 }
@@ -835,6 +838,7 @@ void RecompOptionsPane::ApplyAndSave() {
     applied_monitor_ = settings_.monitor;
   }
   rex::cvar::SetFlagByName("swap_post_effect", AaCvarValue(settings_.anti_aliasing));
+  rex::cvar::SetFlagByName("ng2_fov_percent", std::to_string(settings_.fov_percent));
   rex::cvar::SetFlagByName("present_effect", UpscalerCvarValue(settings_.upscaler));
   rex::cvar::SetFlagByName("present_fsr_sharpness_reduction",
                            std::to_string(FsrSharpnessReduction(settings_.sharpness)));
@@ -1128,6 +1132,10 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
       const char* aspects[] = {"Auto", "16:9", "21:9", "32:9"};
       step_row("Aspect Ratio", aspects[s.aspect_mode], s.aspect_mode, 0, 3, 1,
                [&s](int v) { s.aspect_mode = v; });
+      if (s.fov_percent == 100) std::snprintf(buf, sizeof(buf), "Default");
+      else std::snprintf(buf, sizeof(buf), "%d%%", s.fov_percent);
+      step_row("Field of View", buf, s.fov_percent, 70, 150, 5,
+               [&s](int v) { s.fov_percent = v; });
       {
         // Window Size: presets that fit this monitor; a dragged size shows as-is.
         std::vector<SizePreset> fit;

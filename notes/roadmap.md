@@ -26,14 +26,14 @@ Hard = reverse-engineering + game patches.
 - [x] Internal resolution and anti-aliasing apply live, no restart (GPU context rebuild, findings #50)
 - [x] Framerate Cap 30 / 60 / 120 (Interpolation), default 60 (30 = display cap: NG2 is frame-locked, findings #30)
 - [x] Keyboard & mouse: rebinding (Recomp Settings > Keyboard & Mouse), free mouse look with sensitivity / invert / auto-center (findings #51/#52)
-      (dropped by user: mouse in menus / point and click; per-menu layout + selection RE for ~12 screens, too much work; the skull-marker cursor also crashed and was removed)   - [x] keyboard & mouse button prompts with the player's bindings (findings #54)   - [ ] Show Karma bind
+      (dropped by user: mouse in menus / point and click; per-menu layout + selection RE for ~12 screens, too much work; the skull-marker cursor also crashed and was removed)   - [x] keyboard & mouse button prompts with the player's bindings (findings #54)   - [ ] Show Karma bind   - [ ] final-playthrough check: bow aiming with the mouse (camera mode unknown until the bow is obtained; the special-mode reset may need it exempted like first person)
 - [ ] Audio: speaker setup (stereo/5.1), Music / SFX / Voice volumes if the mixer exposes them
 - [x] Skip intro logos: System > Skip Intro (default Off) skips the NinjaVI movie and Team NINJA logo; title in ~4 s (findings #47)
 
 ## Phase D: Hard (game patches)
 - [x] Ultrawide (Display > Aspect Ratio: Auto / 16:9 / 21:9 / 32:9, default Auto): Hor+ camera via the 16:9 constant, presenter stretch, HUD/menus/text/FMV kept at 16:9 (findings #31-#35)
       - [x] HUD pinned to the screen edges by render bucket (`ng2_hud_anchor`, default on); boss bar still to check
-- [ ] Aspect ratio selector + FOV slider (shares work with ultrawide)
+- [x] Aspect ratio selector + FOV slider (Display > Field of View 70-150 %), mouse wheel camera zoom (findings #56)
 - [ ] Quality toggles: 16x anisotropic, disable motion blur / DoF / film grain, shadow resolution
 - [x] Skip any cutscene (System > Skip Any Cutscene, default On): movies and real-time scenes, seen or not (findings #48)   - [ ] reduce artificial load waits
 - [ ] Frame rate above 60 (interpolation or timing patches; speed-up risk, do last)

@@ -202,9 +202,8 @@ REXCVAR_DEFINE_DOUBLE(ng2_aspect_ratio, 0.0, "NG2",
 
 namespace {
 constexpr uint32_t kAspectConstant = 0x8228EBDC;
-// Wide aspect for the camera (0 = native 16:9). The constant itself stays 16:9 except while a
-// camera builds its main projection (WideAspectScope in sub_822FB368): every other reader (screen
-// effects that size themselves from it showed black bands, findings #37/#53) sees 16:9.
+// Wide aspect for the camera (0 = native 16:9). Applied where g_aspect_scope_mode says (default:
+// everywhere; effects that must stay 16:9 use NativeAspectScope).
 std::atomic<float> g_wide_aspect{0.0f};
 void ApplyAspectOverride() {
   // 0 (or anything up to 16:9) = the game's own 16:9: restore the constant and the
@@ -238,14 +237,22 @@ void WriteAspectConstant(float value) {
   rex::memory::store_and_swap<float>(p, value);
   VirtualProtect(p, sizeof(float), old_protect, &old_protect);
 }
-// Effects used to switch the constant back to 16:9 while they ran; it is 16:9 by default now,
-// so this only documents which readers must not see the wide value.
-struct NativeAspectScope {};
+// Readers that size full-screen effects run with the native 16:9 value (findings #37/#53).
+struct NativeAspectScope {
+  float saved;
+  NativeAspectScope() {
+    saved = rex::memory::load_and_swap<float>(
+        REX_KERNEL_STATE()->memory()->TranslateVirtual<uint8_t*>(kAspectConstant));
+    WriteAspectConstant(16.0f / 9.0f);
+  }
+  ~NativeAspectScope() { WriteAspectConstant(saved); }
+};
 // The camera's projection is the one reader that gets the wide value (Hor+).
-// NG2 DIAG (ng2_aspect_cycle, F9): where the wide value applies. 0 = main projection only
-// (sub_822FB368), 1 = whole camera update (sub_822FA8B8), 2 = everywhere (constant stays wide),
-// 3 = nowhere (plain 16:9 view).
-std::atomic<int> g_aspect_scope_mode{0};
+// Where the wide value applies. 2 = everywhere (the constant stays wide; default): narrower
+// scopes made the game's visibility culling 16:9, so objects popped in at the sides
+// (popin-1, findings #56). NG2 DIAG (ng2_aspect_cycle, F9) cycles: 0 = main projection only
+// (sub_822FB368), 1 = whole camera update (sub_822FA8B8), 2 = everywhere, 3 = plain 16:9.
+std::atomic<int> g_aspect_scope_mode{2};
 }  // namespace
 REXCVAR_DEFINE_BOOL(ng2_aspect_cycle, false, "NG2", "Diagnostic: F9 cycles the ultrawide aspect scope");
 const char* Ng2AspectTestModeName() {
@@ -977,7 +984,9 @@ void StoreVec(uint8_t* p, const GuestVec& v) {
   StoreF(p + 8, v.z);
 }
 int64_t g_mouse_used_ms = 0;
-bool g_mouse_has_camera = false;  // set by the camera update below (game thread)
+bool g_mouse_has_camera = false;
+float g_zoom = 1.0f;         // camera distance factor in use (applied in sub_822FADB8)
+float g_zoom_target = 1.0f;  // set by the mouse wheel; g_zoom eases toward it  // set by the camera update below (game thread)
 }  // namespace
 
 extern "C" REX_FUNC(__imp__sub_823053F0);
@@ -996,7 +1005,10 @@ extern "C" REX_FUNC(sub_823053F0) {
     uint32_t pad = *mem->TranslateVirtual<uint8_t*>(0x84C3DA3E);
     if (pad > 3) pad = 0;
     uint8_t* rec = mem->TranslateVirtual<uint8_t*>(0x83C07FF0 + pad * 68);
-    if (LoadF(rec + 28) != 0.0f || LoadF(rec + 32) != 0.0f) g_mouse_used_ms = 0;
+    if (LoadF(rec + 28) != 0.0f || LoadF(rec + 32) != 0.0f) {
+      g_mouse_used_ms = 0;
+      g_zoom_target = 1.0f;  // the wheel zoom eases back out (no snap) when the pad takes over
+    }
   }
   // Auto-center Off: hold the game's auto-follow off for as long as the mouse has the
   // camera; On: only for a moment after each mouse movement.
@@ -1009,7 +1021,18 @@ extern "C" REX_FUNC(sub_823053F0) {
     rex::memory::store_and_swap<uint32_t>(in + 192, 1);
     rex::memory::store_and_swap<uint32_t>(in + 196, 1);
   }
+  // First-person view (camera mode 4) is updated elsewhere; the mouse goes to the stick there
+  // (sub_822F2E38 below) and the third-person orbit is skipped.
+  const bool first_person = cam && GuestLoadU32(cam + 4716) == 4;
+  {
+    const int steps = rex::input::mnk::ConsumeMouseWheel();  // + = wheel up = zoom in
+    // One wheel scale: below 1.0 the eye moves toward the target (stays on the path the game
+    // already checked against walls), above 1.0 the field of view widens instead (moving the
+    // eye back clipped through walls).
+    if (steps) g_zoom_target = std::clamp(g_zoom_target * std::pow(0.9f, float(steps)), 0.4f, 1.5f);
+  }
   __imp__sub_823053F0(ctx, base);
+  if (first_person) return;  // the game's first-person look (mouse fed as the stick above)
   if (!active) {
     g_mouse_has_camera = false;
     return;
@@ -1114,7 +1137,9 @@ extern "C" REX_FUNC(sub_822FA8B8) {
   WideAspectScope wide_update(1);  // NG2 DIAG mode B
   const uint32_t c = ctx.r3.u32;
   const uint32_t mode = c == 0x84C569F0 ? GuestLoadU32(c + 4716) : 1;
-  if (g_mouse_has_camera && Ng2InGameplay() && mode != 1 && mode < 64) {
+  // Mode 4 = first-person view (held 1st-Person View): left alone, or moving the mouse would
+  // pull the player out of it.
+  if (g_mouse_has_camera && Ng2InGameplay() && mode != 1 && mode != 4 && mode < 64) {
     static uint64_t logged = 0;
     if (!(logged & (1ull << mode))) {
       logged |= 1ull << mode;
@@ -1208,13 +1233,36 @@ extern "C" REX_FUNC(__imp__sub_822FB368);
 // constant (or 4:3 0x8228716C under some flag). It is the only code that gets the wide value:
 // the camera update sub_822FA8B8 also builds +688 (4:3) and +752 (16:9) projections, which
 // effects use; widening those gave explosion effects black bands (findings #53).
+REXCVAR_DEFINE_INT32(ng2_fov_percent, 100, "NG2", "Gameplay camera field of view, percent of the game's")
+    .range(50, 200);
 extern "C" REX_FUNC(sub_822FB368) {
   WideAspectScope wide_projection(0);
+  // Field of View setting: the gameplay camera's fov (camera+176, read here for the main
+  // projection) is scaled while the projection is built, then restored, so the game's own fov
+  // changes keep working. Cutscenes (HUD hidden) keep their framing.
+  const uint32_t fov_cam = ctx.r3.u32;
+  const int fov_pct = REXCVAR_GET(ng2_fov_percent);
+  // Mouse wheel zoom past 1.0 widens the view (see sub_822FADB8).
+  const float wheel_fov = GuestLoadU32(0x84C569F0 + 4716) == 4 ? 1.0f : std::max(1.0f, g_zoom);
+  const float fov_scale = float(fov_pct) / 100.0f * wheel_fov;
+  uint8_t* fov_p = nullptr;
+  float fov_saved = 0.0f;
+  if (fov_scale != 1.0f && fov_cam == 0x84C569F0 && Ng2InGameplay()) {
+    fov_p = REX_KERNEL_STATE()->memory()->TranslateVirtual<uint8_t*>(fov_cam + 176);
+    fov_saved = LoadF(fov_p);
+    StoreF(fov_p, fov_saved * fov_scale);
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      REXLOG_INFO("NG2 fov: gameplay camera fov {:.4f} scaled to {}%", fov_saved, fov_pct);
+    }
+  }
   if (REXCVAR_GET(ng2_aspect_diag)) {
     g_aspect_calls[6].fetch_add(1);
     AspectDiagTick();
   }
   __imp__sub_822FB368(ctx, base);
+  if (fov_p) StoreF(fov_p, fov_saved);
 }
 
 // ---- Keyboard & mouse prompts ------------------------------------------------------------
@@ -1310,4 +1358,55 @@ extern "C" REX_FUNC(sub_83706C20) {
     }
   }
   __imp__sub_83706C20(ctx, base);
+}
+
+// Mouse wheel zoom (findings #56). The render step of the camera update takes the gameplay
+// camera's direction but computes its own distance (smoothing, wall collision), then copies eye
+// and target to R+128 / R+144, runs sub_822FDDF8 and sub_822FADB8, and builds the view from them.
+// Zooming the gameplay camera (+64) therefore did nothing; here the final eye's distance from the
+// target is scaled after the game's own collision, right before the view is built.
+extern "C" REX_FUNC(__imp__sub_822FADB8);
+extern "C" REX_FUNC(sub_822FADB8) {
+  const uint32_t render_cam = ctx.r3.u32;
+  __imp__sub_822FADB8(ctx, base);
+  if (render_cam != 0x84C569F0) return;
+  {
+    // Ease toward the wheel's target (time constant ~70 ms) instead of snapping per notch.
+    static auto last = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    const float dt = std::min(0.1f, std::chrono::duration<float>(now - last).count());
+    last = now;
+    g_zoom += (g_zoom_target - g_zoom) * (1.0f - std::exp(-dt / 0.07f));
+    if (std::abs(g_zoom_target - g_zoom) < 1e-4f) g_zoom = g_zoom_target;
+  }
+  if (g_zoom >= 1.0f || !Ng2InGameplay() || GuestLoadU32(render_cam + 4716) == 4) return;
+  auto* mem = REX_KERNEL_STATE()->memory();
+  uint8_t* eye_p = mem->TranslateVirtual<uint8_t*>(render_cam + 128);
+  const GuestVec eye = LoadVec(eye_p);
+  const GuestVec tgt = LoadVec(mem->TranslateVirtual<uint8_t*>(render_cam + 144));
+  StoreVec(eye_p, {tgt.x + (eye.x - tgt.x) * g_zoom, tgt.y + (eye.y - tgt.y) * g_zoom,
+                   tgt.z + (eye.z - tgt.z) * g_zoom});
+}
+
+// First-person view (1st-Person View held; gameplay camera mode 4, findings #56) runs its own
+// look code instead of sub_823053F0 and reads the right stick. The input update sub_822F2E38
+// writes the stick floats every frame (record 0x83C07FF0 + pad*68, +28/+32); in first person
+// the mouse motion is added there, clamped to the stick range.
+extern "C" REX_FUNC(__imp__sub_822F2E38);
+extern "C" REX_FUNC(sub_822F2E38) {
+  __imp__sub_822F2E38(ctx, base);
+  const ng2::MouseCameraParams p = ng2::GetMouseCameraParams();
+  if (!p.enabled || !Ng2InGameplay() || GuestLoadU32(0x84C569F0 + 4716) != 4) return;
+  float dx = 0.0f, dy = 0.0f;
+  rex::input::mnk::ConsumeMouseDelta(dx, dy);
+  if (dx == 0.0f && dy == 0.0f) return;
+  auto* mem = REX_KERNEL_STATE()->memory();
+  uint32_t pad = *mem->TranslateVirtual<uint8_t*>(0x84C3DA3E);
+  if (pad > 3) pad = 0;
+  uint8_t* rec = mem->TranslateVirtual<uint8_t*>(0x83C07FF0 + pad * 68);
+  constexpr float kStickPerPixel = 0.12f;  // at sensitivity 1.0 (user: 1.5x of 0.08)
+  const float sx = dx * p.sens_x * kStickPerPixel * -float(REXCVAR_GET(ng2_mouse_yaw_sign));
+  const float sy = -dy * p.sens_y * kStickPerPixel * (p.invert_y ? -1.0f : 1.0f);
+  StoreF(rec + 28, std::clamp(LoadF(rec + 28) + sx, -1.0f, 1.0f));
+  StoreF(rec + 32, std::clamp(LoadF(rec + 32) + sy, -1.0f, 1.0f));
 }

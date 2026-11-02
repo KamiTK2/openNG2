@@ -100,6 +100,8 @@ struct RecompSettings {
   // 0 = Auto (match the window), 1 = 16:9, 2 = 21:9, 3 = 32:9. Drives cvar ng2_aspect_ratio
   // (ultrawide: Hor+ camera, 2D kept at 16:9; live).
   int aspect_mode = 0;
+  // Gameplay camera field of view, percent of the game's own (cvar ng2_fov_percent; live).
+  int fov_percent = 100;
   // Audio
   int master_volume = 100;  // 0..100
   bool mute_in_background = false;
