@@ -45,6 +45,16 @@ class Ng2App : public rex::ReXApp {
     ng2::RecompSettings::ApplyStartup(RecompSettingsPath());
   }
 
+  // Launcher installs put the game data in a "game" folder next to ng2.exe; use it when no
+  // --game_data_root is given, so the exe starts with a plain double-click.
+  void OnConfigurePaths(rex::PathConfig& paths) override {
+    if (paths.game_data_root.empty()) {
+      const auto local = rex::filesystem::GetExecutableFolder() / "game";
+      std::error_code ec;
+      if (std::filesystem::is_directory(local, ec)) paths.game_data_root = local;
+    }
+  }
+
   // Default to the Xenos GPU plugin (staged next to ng2.exe by CMake);
   // --gpu_plugin on the command line or in ng2.toml still overrides it.
   void OnPreSetup(rex::RuntimeConfig& config) override {

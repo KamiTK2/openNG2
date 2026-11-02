@@ -42,17 +42,12 @@ Hard = reverse-engineering + game patches.
 
 ## Distribution: easy launcher (end goal, user 2026-11-01)
 Players supply their own game; we never ship game data or game-derived code. A launcher:
-- [ ] Require Title Update #2 (player-supplied TU_...G4 package, media 69F555CB): extract `default.xexp` next to default.xex; openNG2 is built from 0.0.2.4 only (findings #45/#46). Mission Mode works with it (user confirmed 2026-11-01)
-- [ ] Pick the player's DLC packages too (copied to game\dlc; installed by the game on first launch, findings #43)
-- [ ] Pick the dump (GOD package, extracted folder or default.xex); verify the SHA-256 /
-      title ID / media ID (notes/findings.md target table) and extract (tools/god_extract.py).
-- [ ] Get the toolchain without manual setup: fetch ReXGlue v0.10.0 + apply
-      patches/rexglue-sdk-v0.10.0.patch (or ship our prebuilt SDK runtime DLLs, which contain no
-      game code), plus a portable clang/LLVM, CMake and Ninja, so no Visual Studio install is needed.
-- [ ] Run codegen against the player's xex, build ng2.exe, copy runtime DLLs + ng2.toml.
-- [ ] Progress UI, logs, retry; later: updates and launching the game from the launcher.
-- Open questions: build time / disk (the recompiled C++ is ~560 MB, a full build takes minutes);
-  whether the Windows SDK headers/libs can be fetched portably.
+- [x] Launcher `openNG2.exe` (launcher/, findings #68): native ImGui/D3D11 GUI; the player adds the game (GOD package C1200E9B558D04454FA6 + .data, .iso or extracted folder; default.xex SHA-256 checked), Title Update #2 (TU_1A461UL_000000G000000.00000000000G4; Title Update #3 and other games rejected with the reason) and optionally a DLC folder (the four packages listed by name); drag and drop or Browse
+- [x] Toolchain without Visual Studio: LLVM 19.1.5, CMake, Ninja (pinned SHA-256) + Microsoft CRT / Windows SDK via xwin after the player accepts the licence; kept in <install>uild-tools (findings #67)
+- [x] Extract the game, apply the TU, add DLC, codegen + build, install ng2.exe + DLLs into the install folder (ng2.exe finds game\ next to itself), remove the build files; VC++ runtime installed if missing; Play / Open folder / desktop shortcut
+- [x] Release folder: tools/make_release.py -> dist/openNG2 (launcher + payload: our project sources + SDK, no game data); icon tools/make_icon.py
+- [ ] Before release: licence review of the SDK's bundled third-party libraries (ffmpeg etc.) and a LICENSE / third-party notices file; test on a clean PC without Visual Studio; GitHub release upload
+- [ ] Later: updates, and launching the game from the launcher
 
 ## Version 1.1: native renderer (user 2026-11-02)
 Replace NG2's statically linked Xbox Direct3D layer with a D3D12 implementation (as Unleashed Recompiled does) instead of emulating the Xenos GPU: no PM4 interpretation, no EDRAM / ROV emulation, lower per-draw cost (weak machines). Estimate ~30-60 h of active work (findings #59-#63 for current costs):

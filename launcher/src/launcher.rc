@@ -1,0 +1,2 @@
+// openNG2 launcher icon (tools/make_icon.py). LoadIconW(inst, MAKEINTRESOURCEW(1)) in main.cpp.
+1 ICON "../../assets/openNG2.ico"

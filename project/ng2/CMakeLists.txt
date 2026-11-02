@@ -3,7 +3,7 @@
 # SDK boilerplate lives in generated/rexglue.cmake.
 
 cmake_minimum_required(VERSION 3.25)
-project(ng2 LANGUAGES CXX)
+project(ng2 LANGUAGES CXX RC)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -17,6 +17,7 @@ set(NG2_SOURCES
     src/ng2_hooks.cpp
     src/recomp_settings.cpp
     src/shader_precompile.cpp
+    src/ng2.rc
 )
 
 if(WIN32)

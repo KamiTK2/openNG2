@@ -1,0 +1,2 @@
+// openNG2 icon (tools/make_icon.py); SDL uses the first icon resource for the game window.
+1 ICON "openNG2.ico"
