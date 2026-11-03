@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #include <fstream>
 #include <regex>
 #include <sstream>
@@ -46,6 +47,11 @@ const Archive kXwin = {
     "xwin 0.10.0 (fetches Microsoft's C++ libraries)",
     "https://github.com/Jake-Shadle/xwin/releases/download/0.10.0/xwin-0.10.0-x86_64-pc-windows-msvc.tar.gz",
     "96E83665EF5C1406AABD0BE603A8D08E67E604F36FDA630B6807EE948A614E26", "xwin-0.10.0-x86_64-pc-windows-msvc"};
+// Windows 10 / older Windows 11 tar.exe (bsdtar without liblzma) can't read .tar.xz itself and
+// runs an external `xz -d -qq` instead, which Windows doesn't ship (findings #84). Fetched only then.
+const Archive kXz = {"xz 5.8.4 (unpacks LLVM on older Windows)",
+                     "https://github.com/tukaani-project/xz/releases/download/v5.8.4/xz-5.8.4-windows.zip",
+                     "F31AF7638391ECF286D48BC8555CE6E131691A1C52A9E44303BCE57069E9DE56", "xz"};
 constexpr char kToolchainMarker[] = "toolchain-v1.ok";
 
 enum StepIndex : size_t { kStepTools, kStepGame, kStepUpdate, kStepDlc, kStepBuild, kStepFinish };
@@ -64,6 +70,32 @@ fs::path FirstSubdir(const fs::path& dir) {
     if (e.is_directory()) return e.path();
   }
   return {};
+}
+
+// True when this tar.exe decompresses xz itself ("liblzma/x.y.z" in its version line).
+bool TarHasXz(const fs::path& tar) {
+  std::string out;
+  RunProcess(L"\"" + tar.wstring() + L"\" --version", {}, {}, [&](const std::string& l) { out += l; }, {});
+  return out.find("liblzma") != std::string::npos;
+}
+
+// The current environment with `dir` put first on PATH.
+std::vector<std::wstring> EnvWithPathFirst(const fs::path& dir) {
+  std::vector<std::wstring> env;
+  bool have_path = false;
+  if (wchar_t* block = GetEnvironmentStringsW()) {
+    for (const wchar_t* p = block; *p; p += std::wcslen(p) + 1) {
+      std::wstring e = p;
+      if (_wcsnicmp(e.c_str(), L"PATH=", 5) == 0) {
+        e = L"PATH=" + dir.wstring() + L";" + e.substr(5);
+        have_path = true;
+      }
+      env.push_back(std::move(e));
+    }
+    FreeEnvironmentStringsW(block);
+  }
+  if (!have_path) env.push_back(L"PATH=" + dir.wstring() + L";C:\\Windows\\System32");
+  return env;
 }
 
 // Copies a folder tree (overwriting).
@@ -237,8 +269,17 @@ bool Pipeline::Toolchain(const BuildRequest& r) {
                                 GiB(need) + " (" + GiB(FreeDiskBytes(dir)) + " free).");
   }
   const fs::path tar = fs::path(L"C:\\Windows\\System32\\tar.exe");
-  const Archive* archives[] = {&kLlvm, &kCmake, &kNinja, &kXwin};
-  for (size_t a = 0; a < 4; ++a) {
+  // OPENNG2_FORCE_XZ=1 takes the fallback path on any Windows (testing).
+  const bool force_xz = GetEnvironmentVariableW(L"OPENNG2_FORCE_XZ", nullptr, 0) > 0;
+  const bool need_xz = !(fs::is_directory(dir / kLlvm.folder, ec) && fs::exists(dir / kLlvm.folder / ".ok", ec)) &&
+                       (force_xz || !TarHasXz(tar));
+  if (need_xz) Log("This Windows tar.exe can't unpack .tar.xz by itself; fetching xz for it.");
+  std::vector<const Archive*> archives;
+  if (need_xz) archives.push_back(&kXz);  // first, so tar finds xz on PATH for LLVM
+  for (const Archive* ar : {&kLlvm, &kCmake, &kNinja, &kXwin}) archives.push_back(ar);
+  const std::vector<std::wstring> xz_env = need_xz ? EnvWithPathFirst(dir / "xz" / "bin_x86-64") : std::vector<std::wstring>{};
+  const float share = 1.0f / float(archives.size());
+  for (size_t a = 0; a < archives.size(); ++a) {
     const Archive& ar = *archives[a];
     if (fs::is_directory(dir / ar.folder, ec) && fs::exists(dir / ar.folder / ".ok", ec)) continue;
     const std::string url = ar.url;
@@ -251,7 +292,7 @@ bool Pipeline::Toolchain(const BuildRequest& r) {
           [&](uint64_t done, uint64_t total) {
             char t[160];
             std::snprintf(t, sizeof(t), "Downloading %s: %.0f / %.0f MB", ar.name, done / 1e6, total / 1e6);
-            SetDetail(kStepTools, t, total ? float(double(done) / double(total)) * 0.25f + 0.25f * a : -1.0f);
+            SetDetail(kStepTools, t, total ? (float(double(done) / double(total)) + float(a)) * share : -1.0f);
           },
           [this] { return Cancelled(); }, &err);
       if (!ok) return Fail(kStepTools, err);
@@ -263,12 +304,22 @@ bool Pipeline::Toolchain(const BuildRequest& r) {
     }
     SetDetail(kStepTools, std::string("Unpacking ") + ar.name + "...", -1.0f);
     Log(std::string("Unpacking ") + ar.name);
-    const fs::path target = (std::strcmp(ar.folder, "ninja") == 0) ? dir / "ninja" : dir;
+    // Flat zips (no top-level folder) go into their own folder.
+    const bool flat = std::strcmp(ar.folder, "ninja") == 0 || &ar == &kXz;
+    const fs::path target = flat ? dir / ar.folder : dir;
     fs::create_directories(target, ec);
     const std::wstring cmd = L"\"" + tar.wstring() + L"\" -xf \"" + file.wstring() + L"\" -C \"" +
                              target.wstring() + L"\"";
-    if (RunProcess(cmd, dir, {}, [this](const std::string& l) { Log(l); }, [this] { return Cancelled(); }) != 0) {
-      return Fail(kStepTools, std::string("Unpacking ") + ar.name + " failed.");
+    // bsdtar finds `xz` with SearchPath (current folder, then PATH), so give it both.
+    const bool use_xz = need_xz && &ar == &kLlvm;
+    if (RunProcess(cmd, use_xz ? dir / "xz" / "bin_x86-64" : dir, use_xz ? xz_env : std::vector<std::wstring>{},
+                   [this](const std::string& l) { Log(l); }, [this] { return Cancelled(); }) != 0) {
+      return Fail(kStepTools, std::string("Unpacking ") + ar.name +
+                                  " failed (see the log). Check that the drive has free space and that "
+                                  "antivirus software isn't blocking the launcher, then press Build again.");
+    }
+    if (&ar == &kXz && !fs::exists(dir / "xz" / "bin_x86-64" / "xz.exe", ec)) {
+      return Fail(kStepTools, "Unpacking xz failed: xz.exe is missing.");
     }
     std::ofstream(dir / ar.folder / ".ok") << "ok\n";
     fs::remove(file, ec);  // keep the disk use down
