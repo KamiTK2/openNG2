@@ -132,6 +132,7 @@ std::atomic<bool> g_invert_x{false};
 std::atomic<bool> g_invert_y{false};
 std::atomic<int> g_deadzone_pct{0};
 std::atomic<int> g_vibration_pct{100};
+std::atomic<int> g_button_prompts{0};
 std::atomic<bool> g_pause_in_background{false};
 std::atomic<uint64_t> g_game_frames{0};
 
@@ -148,6 +149,7 @@ void PublishInputSettings(const RecompSettings& s) {
   g_invert_y = s.invert_camera_y;
   g_deadzone_pct = s.stick_deadzone;
   g_vibration_pct = s.vibration;
+  g_button_prompts = s.button_prompts;
   g_pause_in_background = s.pause_in_background;
 }
 
@@ -678,6 +680,7 @@ bool RecompSettings::Load(const std::filesystem::path& path) {
     else if (k == "ng2_invert_camera_y") invert_camera_y = ParseBool(v, invert_camera_y);
     else if (k == "ng2_stick_deadzone") stick_deadzone = ParseInt(v, stick_deadzone, 0, 30);
     else if (k == "ng2_vibration") vibration = ParseInt(v, vibration, 0, 100);
+    else if (k == "ng2_button_prompts") button_prompts = ParseInt(v, button_prompts, 0, 3);
     else if (k == "ng2_check_updates") check_updates = ParseBool(v, check_updates);
     else if (k == "ng2_pause_in_background")
       pause_in_background = ParseBool(v, pause_in_background);
@@ -742,6 +745,7 @@ bool RecompSettings::Save(const std::filesystem::path& path) const {
       << "ng2_invert_camera_y = " << b(invert_camera_y) << "\n"
       << "ng2_stick_deadzone = " << stick_deadzone << "\n"
       << "ng2_vibration = " << vibration << "\n"
+      << "ng2_button_prompts = " << button_prompts << "\n"
       << "ng2_pause_in_background = " << b(pause_in_background) << "\n"
       << "ng2_check_updates = " << b(check_updates) << "\n"
       << "ng2_window_width = " << window_width << "\n"
@@ -1682,6 +1686,11 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
       if (s.vibration) std::snprintf(buf, sizeof(buf), "%d%%", s.vibration);
       else std::snprintf(buf, sizeof(buf), "Off");
       step_row("Vibration", buf, s.vibration, 0, 100, 10, [&s](int v) { s.vibration = v; });
+      {
+        const char* prompts[] = {"Auto", "Xbox 360", "PS4", "PS5"};
+        step_row("Button Prompts", prompts[std::clamp(s.button_prompts, 0, 3)], s.button_prompts, 0, 3,
+                 1, [&s](int v) { s.button_prompts = v; });
+      }
       break;
     }
     case 4: {  // Keyboard & Mouse
@@ -2041,6 +2050,13 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
     fy += note_px * 1.5f;
   }
   if (focused_ && row_ >= 0 && row_ < int(rows.size()) &&
+      std::strcmp(rows[row_].label, "Button Prompts") == 0) {
+    text_at(X(L.label_x), fy, kGrey,
+            "Auto matches the controller you use. Keyboard & mouse input still shows keys.", false,
+            note_px);
+    fy += note_px * 1.5f;
+  }
+  if (focused_ && row_ >= 0 && row_ < int(rows.size()) &&
       std::strncmp(rows[row_].label, "Update to", 9) == 0) {
     text_at(X(L.label_x), fy, kGrey,
             "Opens the openNG2 launcher, which updates and rebuilds the game. Keep playing until it asks.",
@@ -2129,7 +2145,10 @@ void UpdatePromptDevice(const ImGuiIO& io) {
           std::abs(int(g.sThumbRX)) > 12000 || std::abs(int(g.sThumbRY)) > 12000;
     if (pad) pad_family = families[i];
   }
-  UpdatePlayStationPrompts(std::max(pad_family, 0));
+  // Button Prompts setting: Auto follows the pad, otherwise fixed (0 Xbox, 1 PS4, 2 PS5).
+  // Keyboard & mouse input still switches to key prompts either way (g_prompts_keyboard).
+  const int forced = g_button_prompts.load();
+  UpdatePlayStationPrompts(forced == 0 ? std::max(pad_family, 0) : forced - 1);
   // Keyboard & mouse count only on a fresh key press or real mouse travel: a key that reads as
   // held all the time (stuck VK, a key-holding tool, or a held modifier) or sub-pixel / warp
   // mouse jitter must not keep flipping prompts back to keyboard while the pad is idle.

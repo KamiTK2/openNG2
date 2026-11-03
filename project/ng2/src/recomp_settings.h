@@ -111,6 +111,7 @@ struct RecompSettings {
   bool invert_camera_y = false;
   int stick_deadzone = 0;  // extra radial deadzone, percent 0..30
   int vibration = 100;     // percent 0..100
+  int button_prompts = 0;  // 0 Auto (pad in use), 1 Xbox 360, 2 PS4, 3 PS5 (keys still win on MnK input)
   // Keyboard & Mouse (SDK MnK driver cvars; live)
   bool mnk_enabled = true;      // mnk_mode
   bool mouse_camera = true;     // mnk_mouse (camera from the mouse in gameplay)
