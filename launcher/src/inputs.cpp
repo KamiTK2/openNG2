@@ -21,8 +21,8 @@ std::string Hex8(uint32_t v) {
 }
 
 const char* kWrongXex =
-    "This is not the supported game version. openNG2 needs the original Ninja Gaiden II disc "
-    "release (media ID 69F555CB), as a Games on Demand package, disc image or extracted folder.";
+    "This isn't a copy openNG2 supports. It needs Ninja Gaiden II for Xbox 360, World release "
+    "(media ID 69F555CB): the disc sold outside Japan, or its Games on Demand version.";
 
 Identified CheckXex(Identified r, const std::vector<uint8_t>& xex) {
   if (xex.size() < 4 || std::memcmp(xex.data(), "XEX2", 4) != 0) {
@@ -30,7 +30,25 @@ Identified CheckXex(Identified r, const std::vector<uint8_t>& xex) {
     return r;
   }
   if (Sha256(xex.data(), xex.size()) != kXexSha256) {
-    r.message = kWrongXex;
+    // Name the release when we can: the media ID is the last 4 bytes of the 16-byte media ID
+    // field at security info + 0x140 (World 69F555CB, Japanese 0E6FB1CE).
+    uint32_t media = 0;
+    if (xex.size() >= 0x14) {
+      const uint32_t sec = uint32_t(xex[0x10]) << 24 | xex[0x11] << 16 | xex[0x12] << 8 | xex[0x13];
+      if (size_t(sec) + 0x150 <= xex.size()) {
+        const uint8_t* p = xex.data() + sec + 0x14C;
+        media = uint32_t(p[0]) << 24 | p[1] << 16 | p[2] << 8 | p[3];
+      }
+    }
+    if (media == kJapanMediaId) {
+      r.message = "This is the Japanese release of Ninja Gaiden II (media ID 0E6FB1CE). openNG2 needs the World "
+                  "release (media ID 69F555CB), the version sold outside Japan.";
+    } else if (media == kDiscMediaId) {
+      r.message = "This is the right release (media ID 69F555CB) but default.xex has been modified or is "
+                  "damaged. Use an unmodified copy.";
+    } else {
+      r.message = kWrongXex;
+    }
     return r;
   }
   r.ok = true;
@@ -86,14 +104,25 @@ Identified FromPackage(const fs::path& path, const PackageInfo& info) {
                   "). You need " + kTu2FileName + ".";
       return r;
     }
-    if (info.media_id == kTu3MediaId) {
-      r.message = std::string("This is Title Update #3, which is for a different release of the game. "
-                              "openNG2 needs Title Update #2: ") + kTu2FileName + ".";
+    if (info.media_id == kJapanMediaId) {
+      r.message = std::string("This title update is for the Japanese release (\"Re-sign\" updates). openNG2 "
+                              "needs Title Update #2 for the World release: ") + kTu2FileName + ".";
       return r;
     }
     if (info.media_id != kDiscMediaId) {
       r.message = "This title update is for another version of the game (media ID " +
                   Hex8(info.media_id) + "). You need Title Update #2: " + kTu2FileName + ".";
+      return r;
+    }
+    // Same media ID as TU2: Title Update #3 for the World release, or a modified file. openNG2 is
+    // built against TU2's code exactly, so only that file is accepted.
+    if (Sha256File(path) != kTu2Sha256) {
+      const bool tu3 = info.display_name.find("#3") != std::string::npos ||
+                       _stricmp(path.filename().string().c_str(), "TU_1A461UL_000000G000000.00000000000O4") == 0;
+      r.message = tu3 ? std::string("This is Title Update #3. openNG2 is built for Title Update #2 (") +
+                            kTu2FileName + ") - use that file instead."
+                      : std::string("This isn't the original Title Update #2 file (it may be modified or "
+                                    "damaged). You need ") + kTu2FileName + ".";
       return r;
     }
     r.ok = true;

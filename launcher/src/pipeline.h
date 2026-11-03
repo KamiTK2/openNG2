@@ -38,6 +38,7 @@ class Pipeline {
   ~Pipeline();
   void Start(const BuildRequest& request);
   void Cancel() { cancel_ = true; }
+  bool cancelling() const { return cancel_ && running_; }
   // Back to the start (only when not running).
   void Reset();
   bool running() const { return running_; }
@@ -86,6 +87,7 @@ class Pipeline {
   std::vector<std::string> log_;
   std::string error_;
   std::filesystem::path exe_path_;
+  bool clean_retry_ = false;  // Build() is retrying from a clean build folder
   std::filesystem::path log_path_;
   std::thread thread_;
   std::atomic<bool> cancel_{false};

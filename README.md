@@ -9,16 +9,23 @@ launcher builds it from your own copy.
 ## Getting started
 
 1. Run `openNG2.exe` from the release.
-2. Add your files:
-   - **Game** (required): Games on Demand package `C1200E9B558D04454FA6` + its `.data` folder,
-     a disc image (`.iso`), or an extracted game folder
-   - **Title Update #2** (required): `TU_1A461UL_000000G000000.00000000000G4`
-   - **DLC folder** (optional): Mission Mode and the three costume packs
-3. Click **Build**, then **Play**.
+2. Follow the steps. The launcher explains each file and checks it when you add it:
+   - **Game** (required): Ninja Gaiden II for Xbox 360, **World release** (media ID 69F555CB:
+     the version sold everywhere except Japan). This can be the Games on Demand package
+     `C1200E9B558D04454FA6` with its `.data` folder, a disc image (`.iso`), or an extracted
+     game folder.
+   - **Title Update #2** (required): `TU_1A461UL_000000G000000.00000000000G4`. Title Update #3
+     won't work.
+   - **DLC** (optional): Mission Mode and the three costume packs
+3. Click **Build Ninja Gaiden II**, then **Play**.
+
+**Requirements:** 64-bit Windows 10 (version 1803 or newer) or 11, a Direct3D 12 graphics card,
+about 22 GB of free space and an internet connection for the first build.
 
 **Updates:** the launcher and the game check this repository for a new release. Click
-**Update now** in the launcher, or **Update** in Recomp Settings > System in the game: the
-launcher updates itself and rebuilds the game from the files already installed. You can keep
+**Update openNG2** in the launcher, or **Update to openNG2 x.y.z** in Recomp Settings > System
+in the game: the launcher updates itself and rebuilds the game from the files already
+installed. Only the parts that changed are rebuilt, so updates are quick, and you can keep
 playing while it builds. Saves and settings are kept. Turn the check off in the launcher or
 with System > Check for Updates.
 
@@ -27,11 +34,14 @@ with System > Check for Updates.
 - **Display:** any resolution and window mode, ultrawide (21:9 / 32:9) with the HUD pinned to
   the screen edges, field of view slider, internal resolution 1x–5x, FSR 1.0 / CAS upscaling,
   FXAA, graphics presets (Low–Ultra)
-- **Frame rate:** 120 FPS frame generation, smooth frame pacing
+- **Frame rate:** 120 FPS via built-in frame generation (an extra frame drawn between each pair
+  of real frames), smooth frame pacing
+- **Controllers:** Xbox and PS4/PS5 controllers, with matching button prompts (Auto / Xbox 360 /
+  PS4 / PS5) and stronger PlayStation rumble
 - **Keyboard & mouse:** full rebinding, free mouse look, mouse-wheel zoom, keyboard prompts in
   the game's own text and menus
 - **Convenience:** settings inside the game's own menus, fast loading, skip intro, skip any
-  cutscene, save backup / restore, pause when unfocused
+  cutscene, save backup / restore, pause when unfocused, Exit to Desktop from the main menu
 - **Content:** Mission Mode and DLC costumes, cheats (unlock all difficulties — including every
   Mission Mode difficulty — and costumes)
 - **Performance:** shader precompilation, lower GPU and CPU overhead than a straight emulation
@@ -40,12 +50,15 @@ with System > Check for Updates.
 
 ## Known issues
 
-- Game logic runs at 60 FPS; above 60 is frame generation, not real extra frames.
+- The game runs at 60 FPS. The 120 FPS setting adds a generated frame between each pair of real
+  frames.
 - If the GPU can't hold 60 FPS (e.g. 5x resolution) the game slows down, as on the console.
 - Only tested through the early chapters and Mission Mode so far.
 - Menus can't be used with the mouse (keyboard and controller work).
 - The Show Karma key has no keyboard binding yet.
-- Only the original disc release with Title Update #2 is supported.
+- Only the World release (media ID 69F555CB: the Xbox 360 disc sold outside Japan, or its Games on
+  Demand version) with Title Update #2 is supported - not the Japanese release, Title Update #3,
+  Ninja Gaiden Sigma 2 or the Master Collection.
 - Explosions could draw a band at the screen edge with Field of View above 100%; a fix was
   attempted in 1.0.5 - please report it if you still see it.
 
@@ -83,6 +96,8 @@ System > Open Log Folder** (or the `logs` folder in your install folder). Logs a
 - **Build tools used by the launcher:** [LLVM](https://llvm.org), [CMake](https://cmake.org),
   [Ninja](https://ninja-build.org), [xwin](https://github.com/Jake-Shadle/xwin) (Jake Shadle), and
   Microsoft's Visual C++ libraries and Windows SDK.
+- **[Xelu's Free Controller Prompts](https://thoseawesomeguys.com/prompts/)**: Nicolae "Xelu"
+  Berbece (CC0), the PlayStation button icons.
 - **Research tools:** [Ghidra](https://github.com/NationalSecurityAgency/ghidra) and
   [XEXLoaderWV](https://github.com/zeroKilo/XEXLoaderWV) (zeroKilo).
 

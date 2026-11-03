@@ -12,6 +12,7 @@
 #include <cstring>
 #include <cwchar>
 #include <fstream>
+#include <map>
 #include <regex>
 #include <sstream>
 
@@ -108,6 +109,84 @@ bool CopyTree(const fs::path& from, const fs::path& to, std::string* error) {
     return false;
   }
   return true;
+}
+
+// Incremental updates (findings #93): the build folder is kept between builds, and files are
+// only copied when their content changed, so unchanged sources and SDK headers keep their old
+// timestamps and ninja rebuilds only what an update touched.
+bool SameFile(const fs::path& a, const fs::path& b) {
+  std::error_code ec;
+  if (!fs::exists(b, ec) || fs::file_size(a, ec) != fs::file_size(b, ec)) return false;
+  std::ifstream fa(a, std::ios::binary), fb(b, std::ios::binary);
+  std::vector<char> ba(1 << 16), bb(1 << 16);
+  while (fa && fb) {
+    fa.read(ba.data(), ba.size());
+    fb.read(bb.data(), bb.size());
+    if (fa.gcount() != fb.gcount() || std::memcmp(ba.data(), bb.data(), size_t(fa.gcount())) != 0) return false;
+  }
+  return fa.eof() && fb.eof();
+}
+// Copies every file of `from` into `to` whose content differs (or is missing); returns the
+// number copied, or -1 on error.
+int SyncTree(const fs::path& from, const fs::path& to, std::string* error) {
+  std::error_code ec;
+  int copied = 0;
+  for (auto it = fs::recursive_directory_iterator(from, ec); !ec && it != fs::recursive_directory_iterator();
+       it.increment(ec)) {
+    if (!it->is_regular_file(ec)) continue;
+    const fs::path dst = to / fs::relative(it->path(), from, ec);
+    if (SameFile(it->path(), dst)) continue;
+    fs::create_directories(dst.parent_path(), ec);
+    fs::copy_file(it->path(), dst, fs::copy_options::overwrite_existing, ec);
+    if (ec) {
+      *error = "Copying " + PathText(it->path()) + " failed: " + ec.message();
+      return -1;
+    }
+    ++copied;
+  }
+  if (ec) {
+    *error = "Reading " + PathText(from) + " failed: " + ec.message();
+    return -1;
+  }
+  return copied;
+}
+
+// Last-write times of the files under dir with their SHA-256, to give regenerated files whose
+// content didn't change their old timestamp back (the recompiler rewrites everything).
+struct FileStamp {
+  std::string hash;
+  fs::file_time_type time;
+};
+std::map<fs::path, FileStamp> SnapshotTree(const fs::path& dir) {
+  std::map<fs::path, FileStamp> out;
+  std::error_code ec;
+  for (auto it = fs::recursive_directory_iterator(dir, ec); !ec && it != fs::recursive_directory_iterator();
+       it.increment(ec)) {
+    if (it->is_regular_file(ec)) out[it->path()] = {Sha256File(it->path()), fs::last_write_time(it->path(), ec)};
+  }
+  return out;
+}
+int RestoreUnchangedTimes(const std::map<fs::path, FileStamp>& before) {
+  int restored = 0;
+  std::error_code ec;
+  for (const auto& [p, s] : before) {
+    if (fs::exists(p, ec) && Sha256File(p) == s.hash) {
+      fs::last_write_time(p, s.time, ec);
+      if (!ec) ++restored;
+    }
+  }
+  return restored;
+}
+
+// What the recompiler's output depends on: the game image, its title update, the recompiler
+// and the project's recompiler config.
+std::string CodegenInputs(const fs::path& game, const fs::path& sdk, const fs::path& project) {
+  std::string s;
+  for (const fs::path& p : {game / "default.xex", game / "default.xexp", sdk / "bin" / "rexglue.exe",
+                            project / "ng2.toml", project / "ng2_manifest.toml"}) {
+    s += PathText(p.filename()) + "=" + Sha256File(p) + "\n";
+  }
+  return s;
 }
 
 }  // namespace
@@ -269,6 +348,12 @@ bool Pipeline::Toolchain(const BuildRequest& r) {
                                 GiB(need) + " (" + GiB(FreeDiskBytes(dir)) + " free).");
   }
   const fs::path tar = fs::path(L"C:\\Windows\\System32\\tar.exe");
+  // Windows 10 before 1803 has no tar.exe: every unpack below would fail with a misleading
+  // "free space / antivirus" message.
+  if (!fs::exists(tar, ec)) {
+    return Fail(kStepTools, "This Windows has no tar.exe (C:\\Windows\\System32\\tar.exe), which unpacking the "
+                            "build tools needs. openNG2 needs Windows 10 version 1803 or newer.");
+  }
   // OPENNG2_FORCE_XZ=1 takes the fallback path on any Windows (testing).
   const bool force_xz = GetEnvironmentVariableW(L"OPENNG2_FORCE_XZ", nullptr, 0) > 0;
   const bool need_xz = !(fs::is_directory(dir / kLlvm.folder, ec) && fs::exists(dir / kLlvm.folder / ".ok", ec)) &&
@@ -463,21 +548,51 @@ bool Pipeline::Build(const BuildRequest& r) {
   const fs::path tc = ToolchainDir(r.install_dir);
   const fs::path project = r.install_dir / "build" / "project" / "ng2";
   const fs::path out = r.install_dir / "build" / "out";
-  const fs::path sdk = r.payload_dir / "sdk";
-  if (!fs::exists(r.payload_dir / "project" / "ng2" / "CMakeLists.txt", ec) || !fs::exists(sdk, ec)) {
+  const fs::path payload_sdk = r.payload_dir / "sdk";
+  // The SDK is mirrored into the build folder (copy-if-changed): every recompiled file includes
+  // its headers, so a fresh copy with new timestamps would force a full rebuild each update.
+  const fs::path sdk = r.install_dir / "build" / "sdk";
+  const fs::path stamp_file = r.install_dir / "build" / "codegen.stamp";
+  if (!fs::exists(r.payload_dir / "project" / "ng2" / "CMakeLists.txt", ec) || !fs::exists(payload_sdk, ec)) {
     return Fail(kStepBuild, "The launcher's payload folder is missing or incomplete (" + PathText(r.payload_dir) +
                                 "). Re-download openNG2.");
   }
-  // Project sources, with the manifest pointing at <install>\game.
+  const bool incremental = fs::exists(out / "build.ninja", ec);
+  if (incremental) Log("Previous build found: only what changed is rebuilt");
+  // Project sources (changed files only), with the manifest pointing at <install>\game.
   SetDetail(kStepBuild, "Preparing the project...", -1.0f);
-  if (!CopyTree(r.payload_dir / "project" / "ng2", project, &err)) return Fail(kStepBuild, err);
   {
-    std::ifstream in(project / "ng2_manifest.toml", std::ios::binary);
+    const fs::path src = r.payload_dir / "project" / "ng2";
+    int copied = 0;
+    for (const auto& e : fs::directory_iterator(src, ec)) {
+      const fs::path name = e.path().filename();
+      if (name == "ng2_manifest.toml") continue;
+      if (e.is_directory(ec)) {
+        const int n = SyncTree(e.path(), project / name, &err);
+        if (n < 0) return Fail(kStepBuild, err);
+        copied += n;
+      } else if (!SameFile(e.path(), project / name)) {
+        fs::create_directories(project, ec);
+        fs::copy_file(e.path(), project / name, fs::copy_options::overwrite_existing, ec);
+        if (ec) return Fail(kStepBuild, "Copying " + PathText(e.path()) + " failed: " + ec.message());
+        ++copied;
+      }
+    }
+    std::ifstream in(src / "ng2_manifest.toml", std::ios::binary);
     std::string m((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     in.close();
     size_t pos;
     while ((pos = m.find("\"../../game")) != std::string::npos) m.replace(pos, 11, "\"../../../game");
-    std::ofstream(project / "ng2_manifest.toml", std::ios::binary | std::ios::trunc) << m;
+    std::ifstream cur_in(project / "ng2_manifest.toml", std::ios::binary);
+    const std::string cur((std::istreambuf_iterator<char>(cur_in)), std::istreambuf_iterator<char>());
+    cur_in.close();
+    if (cur != m) {
+      std::ofstream(project / "ng2_manifest.toml", std::ios::binary | std::ios::trunc) << m;
+      ++copied;
+    }
+    const int sdk_copied = SyncTree(payload_sdk, sdk, &err);
+    if (sdk_copied < 0) return Fail(kStepBuild, err);
+    Log("Project files updated: " + std::to_string(copied) + ", SDK files updated: " + std::to_string(sdk_copied));
   }
   // Clean build environment: only our toolchain (findings #67).
   const fs::path llvm = tc / kLlvm.folder, cmake = tc / kCmake.folder / "bin" / "cmake.exe";
@@ -505,6 +620,26 @@ bool Pipeline::Build(const BuildRequest& r) {
                 (lib / "um" / "x64").wstring());
 
   auto log_line = [this](const std::string& l) { Log(l); };
+  // A kept build can go stale in ways ninja can't see (install folder moved, toolchain
+  // replaced): on failure, start over once from a clean build folder.
+  auto retry_clean = [&](const std::string& message) {
+    if (Cancelled()) return false;
+    if (!incremental || clean_retry_) return Fail(kStepBuild, message);
+    Log("The quick rebuild failed: starting a clean build");
+    std::error_code rm;
+    fs::remove_all(r.install_dir / "build", rm);
+    if (rm || fs::exists(r.install_dir / "build" / "out" / "build.ninja", rm)) {
+      // Something still holds the build folder (another build, an antivirus scan): retrying on
+      // the same files fails the same way, so say what to do instead.
+      return Fail(kStepBuild, "Some build files in " + PathText(r.install_dir / "build") +
+                                  " are still in use - most likely another openNG2 build is still running. Wait a "
+                                  "few minutes (or restart your PC) and build again.");
+    }
+    clean_retry_ = true;
+    const bool ok = Build(r);
+    clean_retry_ = false;
+    return ok;
+  };
   SetDetail(kStepBuild, "Configuring...", -1.0f);
   const std::wstring configure = L"\"" + cmake.wstring() + L"\" -G Ninja -S \"" + project.wstring() + L"\" -B \"" +
                                  out.wstring() +
@@ -513,22 +648,44 @@ bool Pipeline::Build(const BuildRequest& r) {
                                  L"\"-Drexglue_DIR=" + (sdk / "lib" / "cmake" / "rexglue").wstring() + L"\" -DOPENNG2_VERSION=" +
                                  Widen(openng2::kVersion);
   if (RunProcess(configure, project, env, log_line, [this] { return Cancelled(); }) != 0) {
-    return Cancelled() ? false : Fail(kStepBuild, "Configuring the build failed (see the log).");
+    return retry_clean("Configuring the build failed (see the log).");
   }
   // The recompiled sources are only added to the build when generated/default/sources.cmake
-  // exists at configure time: run the recompiler first, then configure again.
-  SetDetail(kStepBuild, "Recompiling the game code (about a minute)...", -1.0f);
-  const std::wstring codegen = L"\"" + cmake.wstring() + L"\" --build \"" + out.wstring() + L"\" --target ng2_codegen";
-  if (RunProcess(codegen, project, env, log_line, [this] { return Cancelled(); }) != 0) {
-    return Cancelled() ? false : Fail(kStepBuild, "Recompiling the game code failed (see the log).");
+  // exists at configure time: run the recompiler first, then configure again. Skipped when
+  // nothing it reads changed since the last build (most updates only touch our own code).
+  const fs::path generated = project / "generated";
+  const std::string inputs = CodegenInputs(r.install_dir / "game", sdk, project);
+  std::string last_inputs;
+  {
+    std::ifstream f(stamp_file, std::ios::binary);
+    last_inputs.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
   }
-  if (RunProcess(configure, project, env, log_line, [this] { return Cancelled(); }) != 0) {
-    return Cancelled() ? false : Fail(kStepBuild, "Configuring the build failed (see the log).");
+  const bool codegen_current = inputs == last_inputs && fs::exists(generated / "default" / "sources.cmake", ec);
+  if (codegen_current) {
+    Log("Game code unchanged since the last build: recompiler skipped");
+  } else {
+    SetDetail(kStepBuild, "Recompiling the game code (about a minute)...", -1.0f);
+    // The recompiler rewrites every file; identical ones get their old timestamps back so they
+    // aren't compiled again.
+    const auto before = fs::exists(generated, ec) ? SnapshotTree(generated) : std::map<fs::path, FileStamp>{};
+    fs::remove(stamp_file, ec);
+    const std::wstring codegen = L"\"" + cmake.wstring() + L"\" --build \"" + out.wstring() + L"\" --target ng2_codegen";
+    if (RunProcess(codegen, project, env, log_line, [this] { return Cancelled(); }) != 0) {
+      return retry_clean("Recompiling the game code failed (see the log).");
+    }
+    if (!before.empty()) {
+      Log("Recompiled files unchanged: " + std::to_string(RestoreUnchangedTimes(before)) + " of " +
+          std::to_string(before.size()));
+    }
+    if (RunProcess(configure, project, env, log_line, [this] { return Cancelled(); }) != 0) {
+      return retry_clean("Configuring the build failed (see the log).");
+    }
   }
   std::error_code gen_ec;
   if (!fs::exists(project / "generated" / "default" / "sources.cmake", gen_ec)) {
     return Fail(kStepBuild, "The recompiler produced no code (see the log).");
   }
+  if (!codegen_current) std::ofstream(stamp_file, std::ios::binary | std::ios::trunc) << inputs;
   // Each compiler job on the recompiled code needs ~2.5 GB of RAM at most.
   const unsigned by_ram = unsigned(std::max<uint64_t>(1, TotalRamBytes() / 2'500'000'000ull));
   const unsigned jobs = std::max(1u, std::min(CpuThreads(), by_ram));
@@ -551,7 +708,8 @@ bool Pipeline::Build(const BuildRequest& r) {
         }
       },
       [this] { return Cancelled(); });
-  if (code != 0) return Cancelled() ? false : Fail(kStepBuild, "Building openNG2 failed (see the log).");
+  if (code != 0) return retry_clean("Building openNG2 failed (see the log).");
+
   End(kStepBuild, StepState::kDone);
   return true;
 }
@@ -596,9 +754,8 @@ bool Pipeline::Finish(const BuildRequest& r) {
   if (fs::is_directory(out / "shaders", ec) && !CopyTree(out / "shaders", r.install_dir / "shaders", &err)) {
     return Fail(kStepFinish, err);
   }
-  // The recompiled sources and objects are only needed to build (several GB).
-  SetDetail(kStepFinish, "Removing temporary build files...", -1.0f);
-  fs::remove_all(r.install_dir / "build", ec);
+  // The build folder (~2 GB: recompiled sources, objects, SDK mirror) is kept so the next
+  // update only rebuilds what changed (findings #93).
   exe_path_ = r.install_dir / "ng2.exe";
   if (!fs::exists(exe_path_, ec)) return Fail(kStepFinish, "ng2.exe was not produced.");
   if (!EnsureVcRuntime(r)) return false;

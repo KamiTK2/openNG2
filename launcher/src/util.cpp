@@ -80,6 +80,25 @@ std::string Sha256File(const fs::path& file, const std::function<bool()>& cancel
   return h.Hex();
 }
 
+namespace {
+// Every child (and its children: cmake -> ninja -> clang) runs in one job that is killed when the
+// launcher's last handle closes - i.e. when the launcher exits for any reason. Without it, a
+// closed or crashed launcher left its compilers running and holding the build folder (ninja
+// "failed recompaction: Permission denied" on the next build).
+HANDLE ChildJob() {
+  static HANDLE job = [] {
+    HANDLE j = CreateJobObjectW(nullptr, nullptr);
+    if (j) {
+      JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+      li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+      SetInformationJobObject(j, JobObjectExtendedLimitInformation, &li, sizeof(li));
+    }
+    return j;
+  }();
+  return job;
+}
+}  // namespace
+
 int RunProcess(const std::wstring& command_line, const fs::path& work_dir,
                const std::vector<std::wstring>& env,
                const std::function<void(const std::string&)>& on_line,
@@ -104,7 +123,7 @@ int RunProcess(const std::wstring& command_line, const fs::path& work_dir,
   PROCESS_INFORMATION pi{};
   std::wstring cmd = command_line;
   const BOOL ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE,
-                                 CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+                                 CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
                                  env.empty() ? nullptr : env_block.data(),
                                  work_dir.empty() ? nullptr : work_dir.c_str(), &si, &pi);
   CloseHandle(write_pipe);
@@ -112,6 +131,9 @@ int RunProcess(const std::wstring& command_line, const fs::path& work_dir,
     CloseHandle(read_pipe);
     return -1;
   }
+  // Into the job before it can start any children of its own, then let it run.
+  if (HANDLE job = ChildJob()) AssignProcessToJobObject(job, pi.hProcess);
+  ResumeThread(pi.hThread);
   // Reader thread: split the output into lines.
   std::thread reader([&] {
     std::string pending;
@@ -130,7 +152,21 @@ int RunProcess(const std::wstring& command_line, const fs::path& work_dir,
   bool cancelled = false;
   while (WaitForSingleObject(pi.hProcess, 200) == WAIT_TIMEOUT) {
     if (cancel && cancel()) {
-      // Ninja / compilers run as children: end the whole tree.
+      // Ninja / compilers run as children: end every process in the job (all levels, even ones
+      // whose parent already exited), then wait until none is left so the build folder is free.
+      if (HANDLE job = ChildJob()) {
+        TerminateJobObject(job, 1);
+        for (int i = 0; i < 100; ++i) {  // up to 10 s
+          JOBOBJECT_BASIC_ACCOUNTING_INFORMATION acc{};
+          if (!QueryInformationJobObject(job, JobObjectBasicAccountingInformation, &acc, sizeof(acc), nullptr) ||
+              acc.ActiveProcesses == 0)
+            break;
+          Sleep(100);
+        }
+        cancelled = true;
+        WaitForSingleObject(pi.hProcess, 10000);
+        break;
+      }
       std::wstring kill = L"taskkill /T /F /PID " + std::to_wstring(pi.dwProcessId);
       STARTUPINFOW ks{};
       ks.cb = sizeof(ks);

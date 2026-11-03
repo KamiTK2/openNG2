@@ -10,8 +10,14 @@
 namespace launcher {
 
 constexpr uint32_t kTitleId = 0x544307D5;      // Ninja Gaiden II
-constexpr uint32_t kDiscMediaId = 0x69F555CB;  // the disc version the port is built for
-constexpr uint32_t kTu3MediaId = 0x0E6FB1CE;   // "Re-sign" release (Title Update #3)
+// Releases (findings #94): World (sold outside Japan; disc and Games on Demand) = media ID
+// 69F555CB, the one openNG2 is built for; Japanese = 0E6FB1CE (its updates are "Re-sign").
+constexpr uint32_t kDiscMediaId = 0x69F555CB;  // World release
+constexpr uint32_t kTu3MediaId = 0x0E6FB1CE;   // Japanese release
+constexpr uint32_t kJapanMediaId = 0x0E6FB1CE;
+// Title Update #2 for the World release, exactly (2,387,968 bytes). Title Update #3 for the same
+// release (TU_1A461UL_000000G000000.00000000000O4) has the same media ID but different code.
+constexpr char kTu2Sha256[] = "F3CD64FF06765EB84CD578E0661ADF3128FF0A7E5E160CD453DE4EAC113C8B63";
 constexpr char kGodHeaderName[] = "C1200E9B558D04454FA6";
 constexpr char kTu2FileName[] = "TU_1A461UL_000000G000000.00000000000G4";
 constexpr char kXexSha256[] = "4E94213A502250F2B9186AB53867FE41AA5F5BA51BD30FC81EC35A77702FAE30";
