@@ -1,4 +1,4 @@
-﻿#include "recomp_settings.h"
+#include "recomp_settings.h"
 #include "shader_precompile.h"
 #include "update_check.h"
 
@@ -560,13 +560,33 @@ void InstallRecompInputFilters() {
 
 void RecompCountGameFrame() { g_game_frames.fetch_add(1, std::memory_order_relaxed); }
 
+// Every connected controller: SDL's view (Xbox, PS4 / PS5 DualShock / DualSense, Switch, ...)
+// plus XInput (the only source with the xinput backend; with SDL an Xbox pad shows up in both,
+// which is harmless for these OR-ed reads).
+static std::vector<XINPUT_GAMEPAD> ConnectedPads() {
+  std::vector<XINPUT_GAMEPAD> pads;
+  for (const auto& p : rex::input::ReadPhysicalPads()) {
+    XINPUT_GAMEPAD g{};
+    g.wButtons = uint16_t(p.gamepad.buttons);
+    g.bLeftTrigger = uint8_t(p.gamepad.left_trigger);
+    g.bRightTrigger = uint8_t(p.gamepad.right_trigger);
+    g.sThumbLX = int16_t(p.gamepad.thumb_lx);
+    g.sThumbLY = int16_t(p.gamepad.thumb_ly);
+    g.sThumbRX = int16_t(p.gamepad.thumb_rx);
+    g.sThumbRY = int16_t(p.gamepad.thumb_ry);
+    pads.push_back(g);
+  }
+  for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i) {
+    XINPUT_STATE st{};
+    if (XInputGetState(i, &st) == ERROR_SUCCESS) pads.push_back(st.Gamepad);
+  }
+  return pads;
+}
+
 void PadInput::Poll() {
   enum : uint32_t { kUp = 1, kDown = 2, kLeft = 4, kRight = 8, kAccept = 16, kBack = 32 };
   uint32_t cur = 0;
-  for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i) {
-    XINPUT_STATE st{};
-    if (XInputGetState(i, &st) != ERROR_SUCCESS) continue;
-    const auto& g = st.Gamepad;
+  for (const XINPUT_GAMEPAD& g : ConnectedPads()) {
     if ((g.wButtons & XINPUT_GAMEPAD_DPAD_UP) || g.sThumbLY > 16000) cur |= kUp;
     if ((g.wButtons & XINPUT_GAMEPAD_DPAD_DOWN) || g.sThumbLY < -16000) cur |= kDown;
     if ((g.wButtons & XINPUT_GAMEPAD_DPAD_LEFT) || g.sThumbLX < -16000) cur |= kLeft;
@@ -2086,10 +2106,9 @@ std::string PromptLabel(const std::string& tag, bool gameplay) {
 // Last input device: called once per frame from the pane (UI thread).
 void UpdatePromptDevice(const ImGuiIO& io) {
   bool pad = false;
-  for (DWORD i = 0; i < XUSER_MAX_COUNT && !pad; ++i) {
-    XINPUT_STATE st{};
-    if (XInputGetState(i, &st) != ERROR_SUCCESS) continue;
-    const auto& g = st.Gamepad;
+  const std::vector<XINPUT_GAMEPAD> pads = ConnectedPads();
+  for (const XINPUT_GAMEPAD& g : pads) {
+    if (pad) break;
     pad = g.wButtons != 0 || g.bLeftTrigger > 40 || g.bRightTrigger > 40 ||
           std::abs(int(g.sThumbLX)) > 12000 || std::abs(int(g.sThumbLY)) > 12000 ||
           std::abs(int(g.sThumbRX)) > 12000 || std::abs(int(g.sThumbRY)) > 12000;
@@ -2129,10 +2148,7 @@ void UpdatePromptDevice(const ImGuiIO& io) {
   static bool first = true;
   if (first) {  // start with keyboard prompts when no controller is connected
     first = false;
-    XINPUT_STATE st{};
-    bool any_pad = false;
-    for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i) any_pad |= XInputGetState(i, &st) == ERROR_SUCCESS;
-    g_prompts_keyboard = !any_pad;
+    g_prompts_keyboard = pads.empty();
   }
   if (REXCVAR_GET(ng2_prompt_device_diag) && ((pad && g_prompts_keyboard) || (!pad && kbm && !g_prompts_keyboard))) {
     if (pad) REXLOG_INFO("NG2 prompt device: controller");

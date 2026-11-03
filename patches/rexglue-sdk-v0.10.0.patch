@@ -119,10 +119,10 @@ index 4d85a2b..524e58e 100644
    // locked when checking or updating validity of pages/ranges and when firing
 diff --git a/include/rex/input/input_filter.h b/include/rex/input/input_filter.h
 new file mode 100644
-index 0000000..8943925
+index 0000000..040e480
 --- /dev/null
 +++ b/include/rex/input/input_filter.h
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,32 @@
 +#pragma once
 +// NG2 ADDITION: optional host-side filters on controller state and vibration, so the app
 +// can implement deadzones, camera inversion and vibration strength without touching
@@ -130,6 +130,7 @@ index 0000000..8943925
 +
 +#include <cstdint>
 +#include <functional>
++#include <vector>
 +
 +#include <rex/input/input.h>
 +
@@ -142,6 +143,16 @@ index 0000000..8943925
 +
 +void SetStateFilter(StateFilter filter);
 +void SetVibrationFilter(VibrationFilter filter);
++
++// NG2 ADDITION: the connected physical controllers as SDL sees them (Xbox, PlayStation 4/5,
++// Switch and others), without keyboard / mouse emulation and not blanked while the window is
++// unfocused. For app-side menus and prompt-device detection; empty with the xinput backend.
++enum class PadFamily : uint8_t { kXbox, kPlayStation, kNintendo, kOther };
++struct PhysicalPad {
++  X_INPUT_GAMEPAD gamepad;
++  PadFamily family;
++};
++std::vector<PhysicalPad> ReadPhysicalPads();
 +
 +}  // namespace rex::input
 diff --git a/include/rex/input/mnk/mnk_input_driver.h b/include/rex/input/mnk/mnk_input_driver.h
@@ -180,6 +191,28 @@ index c8751b7..6d5ba04 100644
  
    // UI thread only.
    int32_t prev_mouse_x_ = 0;
+diff --git a/include/rex/input/sdl/sdl_input_driver.h b/include/rex/input/sdl/sdl_input_driver.h
+index cf0e3d1..2a4a78e 100644
+--- a/include/rex/input/sdl/sdl_input_driver.h
++++ b/include/rex/input/sdl/sdl_input_driver.h
+@@ -17,6 +17,7 @@
+ #include <vector>
+ 
+ #include <rex/input/input_driver.h>
++#include <rex/input/input_filter.h>
+ 
+ #include <SDL3/SDL.h>
+ 
+@@ -43,6 +44,9 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener
+                               X_INPUT_KEYSTROKE* out_keystroke) override;
+   void OnWindowAvailable(rex::ui::Window* window) override;
+ 
++  // NG2 ADDITION: see rex/input/input_filter.h ReadPhysicalPads.
++  void ReadPhysicalPads(std::vector<rex::input::PhysicalPad>& out);
++
+  private:
+   enum class RepeatState {
+     Idle,       // no buttons pressed or repeating has ended
 diff --git a/include/rex/kernel/file_read_hook.h b/include/rex/kernel/file_read_hook.h
 new file mode 100644
 index 0000000..0b03c29
@@ -2683,6 +2716,116 @@ index 3f9422d..2b3579c 100644
  void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
    has_focus_ = false;
    // Withdraw the request too, or an update queued before the focus loss grabs
+diff --git a/src/input/sdl/sdl_input_driver.cpp b/src/input/sdl/sdl_input_driver.cpp
+index c7c440d..34d7091 100644
+--- a/src/input/sdl/sdl_input_driver.cpp
++++ b/src/input/sdl/sdl_input_driver.cpp
+@@ -30,8 +30,60 @@ namespace {
+ // SDL clamps to SDL_MAX_RUMBLE_DURATION_MS, which is not a public constant.
+ constexpr uint32_t kRumbleDurationMs = 0xFFFF;
+ 
++// NG2 ADDITION: the live driver for rex::input::ReadPhysicalPads (lock order: this, then
++// controllers_mutex_).
++std::mutex g_physical_driver_mutex;
++SDLInputDriver* g_physical_driver = nullptr;
++
+ }  // namespace
+ 
++void SDLInputDriver::ReadPhysicalPads(std::vector<rex::input::PhysicalPad>& out) {
++  if (!sdl_events_initialized_ || !SDL_Gamepad_initialized_ || !attached_window_) return;
++  QueueControllerUpdate();
++  auto guard = DrainAndLock();
++  for (const auto& c : controllers_) {
++    rex::input::PhysicalPad pad{};
++    pad.gamepad = c.state.gamepad;
++    switch (SDL_GetGamepadType(c.sdl)) {
++      case SDL_GAMEPAD_TYPE_XBOX360:
++      case SDL_GAMEPAD_TYPE_XBOXONE:
++        pad.family = rex::input::PadFamily::kXbox;
++        break;
++      case SDL_GAMEPAD_TYPE_PS3:
++      case SDL_GAMEPAD_TYPE_PS4:
++      case SDL_GAMEPAD_TYPE_PS5:
++        pad.family = rex::input::PadFamily::kPlayStation;
++        break;
++      case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO:
++      case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
++      case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
++      case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:
++        pad.family = rex::input::PadFamily::kNintendo;
++        break;
++      default:
++        // XInput-only pads (no HID details) report as standard: they're Xbox-style.
++        pad.family = SDL_GetGamepadType(c.sdl) == SDL_GAMEPAD_TYPE_STANDARD
++                         ? rex::input::PadFamily::kXbox
++                         : rex::input::PadFamily::kOther;
++        break;
++    }
++    out.push_back(pad);
++  }
++}
++
++}  // namespace rex::input::sdl
++
++namespace rex::input {
++std::vector<PhysicalPad> ReadPhysicalPads() {
++  std::vector<PhysicalPad> out;
++  std::lock_guard<std::mutex> lock(sdl::g_physical_driver_mutex);
++  if (sdl::g_physical_driver) sdl::g_physical_driver->ReadPhysicalPads(out);
++  return out;
++}
++}  // namespace rex::input
++
++namespace rex::input::sdl {
++
+ SDLInputDriver::SDLInputDriver(rex::ui::Window* window, size_t window_z_order)
+     : InputDriver(window, window_z_order),
+       sdl_events_initialized_(false),
+@@ -41,7 +93,10 @@ SDLInputDriver::SDLInputDriver(rex::ui::Window* window, size_t window_z_order)
+       controllers_(),
+       controllers_mutex_() {}
+ 
+-SDLInputDriver::~SDLInputDriver() {}
++SDLInputDriver::~SDLInputDriver() {
++  std::lock_guard<std::mutex> lock(g_physical_driver_mutex);
++  if (g_physical_driver == this) g_physical_driver = nullptr;
++}
+ 
+ X_STATUS SDLInputDriver::Setup() {
+   if (!TestSDLVersion()) {
+@@ -94,6 +149,10 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
+         return;
+       }
+       SDL_Gamepad_initialized_ = true;
++      {
++        std::lock_guard<std::mutex> lock(g_physical_driver_mutex);
++        g_physical_driver = this;
++      }
+ 
+       // Load custom controller mappings if available
+       if (!REXCVAR_GET(hid_mappings_file).empty()) {
+@@ -118,6 +177,10 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
+ }
+ 
+ void SDLInputDriver::OnClosing(rex::ui::UIEvent&) {
++  {
++    std::lock_guard<std::mutex> lock(g_physical_driver_mutex);
++    if (g_physical_driver == this) g_physical_driver = nullptr;
++  }
+   if (attached_window_) {
+     attached_window_->RemoveListener(this);
+     if (sdl_pumpevents_queued_) {
+@@ -554,8 +617,8 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
+           X_INPUT_GAMEPAD_B,
+           X_INPUT_GAMEPAD_X,
+           X_INPUT_GAMEPAD_A,
+-          // PS touchpad button
+-          X_INPUT_GAMEPAD_GUIDE,
++          // PS4 / PS5 touchpad click: Back (Select), as PlayStation ports map it. NG2 EXP
++          X_INPUT_GAMEPAD_BACK,
+       };
+   static_assert(SDL_GAMEPAD_BUTTON_SOUTH == 0);
+   static_assert(SDL_GAMEPAD_BUTTON_DPAD_RIGHT == 14);
 diff --git a/src/kernel/xboxkrnl/ng2_diag_stats.h b/src/kernel/xboxkrnl/ng2_diag_stats.h
 new file mode 100644
 index 0000000..6880031

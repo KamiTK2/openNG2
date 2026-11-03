@@ -135,7 +135,8 @@ struct RecompSettings {
   static void ApplyStartup(const std::filesystem::path& path);
 };
 
-// Edge-triggered menu input from XInput pads and the keyboard (game window focused).
+// Edge-triggered menu input from every controller (SDL: Xbox, PS4 / PS5, ...; plus XInput)
+// and the keyboard (game window focused).
 struct PadInput {
   bool up = false, down = false, left = false, right = false;  // with auto-repeat
   bool accept = false, back = false;                           // press edges
