@@ -541,8 +541,9 @@ void DrawFilesPage() {
   if (ImGui::Checkbox("##license", &g_license)) SaveSettings();
   ImGui::SameLine();
   ImGui::TextWrapped(
-      "I accept the Microsoft Visual Studio Build Tools licence terms. Building needs Microsoft's C++ libraries, "
-      "which are downloaded from Microsoft for you.");
+      "I accept the Microsoft Visual Studio Build Tools licence terms. Building needs Microsoft's C++ build "
+      "libraries and the Windows SDK (about 1 GB, downloaded once from Microsoft). These are not the Visual C++ "
+      "Redistributable: a normal PC doesn't have them, and the redistributable is skipped if you already have it.");
   if (ImGui::SmallButton("Read the licence terms")) {
     ShellExecuteW(nullptr, L"open", L"https://go.microsoft.com/fwlink/?LinkId=2086102", nullptr, nullptr, SW_SHOW);
   }

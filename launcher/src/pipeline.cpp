@@ -44,7 +44,7 @@ const Archive kNinja = {"Ninja 1.13.2",
                         "https://github.com/ninja-build/ninja/releases/download/v1.13.2/ninja-win.zip",
                         "07FC8261B42B20E71D1720B39068C2E14FFCEE6396B76FB7A795FB460B78DC65", "ninja"};
 const Archive kXwin = {
-    "xwin 0.10.0 (fetches Microsoft's C++ libraries)",
+    "xwin 0.10.0 (fetches Microsoft's C++ build libraries)",
     "https://github.com/Jake-Shadle/xwin/releases/download/0.10.0/xwin-0.10.0-x86_64-pc-windows-msvc.tar.gz",
     "96E83665EF5C1406AABD0BE603A8D08E67E604F36FDA630B6807EE948A614E26", "xwin-0.10.0-x86_64-pc-windows-msvc"};
 // Windows 10 / older Windows 11 tar.exe (bsdtar without liblzma) can't read .tar.xz itself and
@@ -326,7 +326,10 @@ bool Pipeline::Toolchain(const BuildRequest& r) {
   }
   // Microsoft's C++ runtime + Windows SDK (the player accepted the licence in the UI).
   if (!fs::exists(dir / "winsdk" / ".ok", ec)) {
-    SetDetail(kStepTools, "Downloading Microsoft's C++ libraries and Windows SDK (about 1 GB)...", -1.0f);
+    SetDetail(kStepTools,
+              "Downloading Microsoft's C++ build libraries and Windows SDK (about 1 GB, needed to compile; "
+              "not the Visual C++ Redistributable)...",
+              -1.0f);
     Log("Running xwin");
     fs::remove_all(dir / "winsdk", ec);
     const fs::path xwin = dir / kXwin.folder / "xwin.exe";
@@ -336,7 +339,7 @@ bool Pipeline::Toolchain(const BuildRequest& r) {
                              L"--disable-symlinks --output \"" +
                              (dir / "winsdk").wstring() + L"\"";
     if (RunProcess(cmd, dir, {}, [this](const std::string& l) { Log(l); }, [this] { return Cancelled(); }) != 0) {
-      return Fail(kStepTools, "Downloading Microsoft's C++ libraries failed (see the log). Check your "
+      return Fail(kStepTools, "Downloading Microsoft's C++ build libraries failed (see the log). Check your "
                               "internet connection and try again.");
     }
     fs::remove_all(dir / "xwin-cache", ec);
