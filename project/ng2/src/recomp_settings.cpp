@@ -1459,7 +1459,7 @@ static void DrawShaderProgress(ImGuiIO& io) {
 void RecompOptionsPane::OnDraw(ImGuiIO& io) {
   pad_.Poll();
   DrawShaderProgress(io);
-  UpdatePromptDevice(io);
+  UpdatePromptDevice(io, window_);
   DrawPromptGlyphs(io);
   if (const char* aspect_test = Ng2AspectTestModeName()) {  // NG2 DIAG (ng2_aspect_cycle)
     ImFont* f = g_serif_font ? g_serif_font : ImGui::GetFont();
@@ -1850,6 +1850,20 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
                           return false;
                         }});
       }
+      // GitHub #7: a way out without the window's close button (fullscreen, controller).
+      // A twice, like Restore Backup; unsaved progress is lost as with the game's Quit Game.
+      action_row("Quit to Desktop", [this] {
+        if (NowMs() < quit_armed_until_ms_) {
+          REXLOG_INFO("RECOMP SETTINGS: quit to desktop");
+          HWND h = window_ ? static_cast<HWND>(window_->GetNativeWindowHandle()) : nullptr;
+          if (h) PostMessageW(h, WM_CLOSE, 0, 0);
+        } else {
+          quit_armed_until_ms_ = NowMs() + 4000;
+          status_ = "Press A again to quit to the desktop (unsaved progress is lost).";
+          status_until_ms_ = quit_armed_until_ms_;
+        }
+        return false;
+      });
       break;
     }
   }
@@ -2176,7 +2190,7 @@ std::string PromptLabel(const std::string& tag, bool gameplay) {
 void UpdatePlayStationPrompts(int want);  // ps_prompts.cpp
 
 // Last input device: called once per frame from the pane (UI thread).
-void UpdatePromptDevice(const ImGuiIO& io) {
+void UpdatePromptDevice(const ImGuiIO& io, rex::ui::Window* window) {
   bool pad = false;
   std::vector<int> families;
   const std::vector<XINPUT_GAMEPAD> pads = ConnectedPads(&families);
@@ -2240,6 +2254,21 @@ void UpdatePromptDevice(const ImGuiIO& io) {
   }
   if (pad) g_prompts_keyboard = false;
   else if (kbm) g_prompts_keyboard = true;
+  // Mouse pointer: hidden while the controller is in use, back on mouse / key input
+  // (GitHub #7: the pointer stayed on screen when playing with a pad).
+  if (window) {
+    using Vis = rex::ui::Window::CursorVisibility;
+    static bool hidden_by_pad = false;
+    static Vis saved = Vis::kAutoHidden;
+    if (pad && !hidden_by_pad && window->GetCursorVisibility() != Vis::kHidden) {
+      saved = window->GetCursorVisibility();
+      window->SetCursorVisibility(Vis::kHidden);
+      hidden_by_pad = true;
+    } else if (!pad && kbm && hidden_by_pad) {
+      if (window->GetCursorVisibility() == Vis::kHidden) window->SetCursorVisibility(saved);
+      hidden_by_pad = false;
+    }
+  }
 }
 
 // Button icons the game draws as sprites (pause / inventory menu) are replaced by key caps

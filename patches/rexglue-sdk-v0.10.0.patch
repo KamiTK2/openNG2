@@ -71,6 +71,25 @@ index 96d362b..7be7ec3 100644
   private:
    static constexpr uint32_t kQueueFrames = 3;
  
+diff --git a/include/rex/graphics/frame_stats.h b/include/rex/graphics/frame_stats.h
+new file mode 100644
+index 0000000..19b599e
+--- /dev/null
++++ b/include/rex/graphics/frame_stats.h
+@@ -0,0 +1,13 @@
++#pragma once
++// NG2 ADDITION: per-frame GPU command stream statistics for the app. Stored in rexruntime (the
++// app links only that DLL); the command processor (rexgpu) sets them once per guest swap.
++
++#include <cstdint>
++
++namespace rex::graphics {
++
++// Draw calls the command processor issued in the last guest frame (between two swaps).
++uint32_t LastFrameDrawCount();
++void SetLastFrameDrawCount(uint32_t draws);
++
++}  // namespace rex::graphics
 diff --git a/include/rex/graphics/graphics_system.h b/include/rex/graphics/graphics_system.h
 index ac6b056..a7c79ee 100644
 --- a/include/rex/graphics/graphics_system.h
@@ -715,7 +734,7 @@ index 240bcb0..7553e43 100644
      auto entry_display = make_display_name(targeted[0].config.filePath);
      RecompilerConfig cfg = std::move(targeted[0].config);
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index a744375..e89c343 100644
+index a744375..306836d 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
 @@ -10,10 +10,15 @@
@@ -734,11 +753,12 @@ index a744375..e89c343 100644
  
  #include <fmt/format.h>
  
-@@ -35,7 +40,31 @@
+@@ -35,7 +40,32 @@
  #include <rex/system/kernel_state.h>
  #include <rex/system/user_module.h>
  
-+#include "ng2_cpu_prof.h"  // NG2 DIAG
++#include "ng2_cpu_prof.h"
++#include <rex/graphics/frame_stats.h>  // NG2 DIAG
 +
  REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 +// NG2 DIAG: research logging (command stream, fences, threads, pacing); off for players.
@@ -766,7 +786,7 @@ index a744375..e89c343 100644
  
  REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                      "Refresh page-valid state from GPU-written memory at frame end. "
-@@ -154,17 +183,71 @@ void CommandProcessor::Shutdown() {
+@@ -154,17 +184,71 @@ void CommandProcessor::Shutdown() {
    worker_thread_.reset();
  }
  
@@ -840,7 +860,7 @@ index a744375..e89c343 100644
  void CommandProcessor::ClearCaches() {}
  
  void CommandProcessor::InvalidateGpuMemory() {}
-@@ -204,19 +287,32 @@ void CommandProcessor::WorkerThreadMain() {
+@@ -204,19 +288,32 @@ void CommandProcessor::WorkerThreadMain() {
    }
  
    while (worker_running_) {
@@ -877,7 +897,7 @@ index a744375..e89c343 100644
        uint32_t loop_count = 0;
        do {
          // If we spin around too much, revert to a "low-power" state.
-@@ -228,18 +324,36 @@ void CommandProcessor::WorkerThreadMain() {
+@@ -228,18 +325,36 @@ void CommandProcessor::WorkerThreadMain() {
  
          rex::thread::MaybeYield();
          loop_count++;
@@ -918,7 +938,7 @@ index a744375..e89c343 100644
  
      // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
      //     that many indices.
-@@ -312,9 +426,18 @@ bool CommandProcessor::SetupContext() {
+@@ -312,9 +427,18 @@ bool CommandProcessor::SetupContext() {
  void CommandProcessor::ShutdownContext() {}
  
  void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
@@ -938,7 +958,7 @@ index a744375..e89c343 100644
  }
  
  void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) {
-@@ -328,6 +451,14 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_s
+@@ -328,6 +452,14 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_s
  }
  
  void CommandProcessor::UpdateWritePointer(uint32_t value) {
@@ -953,7 +973,7 @@ index a744375..e89c343 100644
    write_ptr_index_ = value;
    write_ptr_index_event_->Set();
  }
-@@ -355,7 +486,16 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+@@ -355,7 +487,16 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
  
    // Volatile for the WAIT_REG_MEM loop.
    const_cast<volatile uint32_t&>(regs.values[index]) = value;
@@ -971,7 +991,7 @@ index a744375..e89c343 100644
      REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
    }
  
-@@ -619,10 +759,24 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
+@@ -619,10 +760,24 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
    memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
    reader.set_read_offset(read_index * sizeof(uint32_t));
    reader.set_write_offset(write_index * sizeof(uint32_t));
@@ -996,7 +1016,7 @@ index a744375..e89c343 100644
        assert_always();
        break;
      }
-@@ -633,9 +787,66 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
+@@ -633,9 +788,66 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
    return write_index;
  }
  
@@ -1063,7 +1083,7 @@ index a744375..e89c343 100644
    // Execute commands!
    memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
    reader.set_write_offset(count * sizeof(uint32_t));
-@@ -643,6 +854,15 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
+@@ -643,6 +855,15 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
      if (!ExecutePacket(&reader)) {
        // Return up a level if we encounter a bad packet.
        REXGPU_ERROR("**** INDIRECT RINGBUFFER: Failed to execute packet.");
@@ -1079,7 +1099,7 @@ index a744375..e89c343 100644
        assert_always();
        break;
      }
-@@ -689,6 +909,7 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
+@@ -689,6 +910,7 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
  }
  
  bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet) {
@@ -1087,7 +1107,7 @@ index a744375..e89c343 100644
    // Type-0 packet.
    // Write count registers in sequence to the registers starting at
    // (base_index << 2).
-@@ -702,6 +923,10 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
+@@ -702,6 +924,10 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
  
    uint32_t base_index = (packet & 0x7FFF);
    uint32_t write_one_reg = (packet >> 15) & 0x1;
@@ -1098,7 +1118,7 @@ index a744375..e89c343 100644
    for (uint32_t m = 0; m < count; m++) {
      uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
      uint32_t target_index = write_one_reg ? base_index : base_index + m;
-@@ -730,6 +955,7 @@ bool CommandProcessor::ExecutePacketType2(memory::RingBuffer* reader, uint32_t p
+@@ -730,6 +956,7 @@ bool CommandProcessor::ExecutePacketType2(memory::RingBuffer* reader, uint32_t p
  }
  
  bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t packet) {
@@ -1106,7 +1126,7 @@ index a744375..e89c343 100644
    // Type-3 packet.
    uint32_t opcode = (packet >> 8) & 0x7F;
    uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
-@@ -960,6 +1186,14 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+@@ -960,6 +1187,14 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
  
    IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
  
@@ -1121,7 +1141,7 @@ index a744375..e89c343 100644
    ++counter_;
    return true;
  }
-@@ -971,6 +1205,20 @@ bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* re
+@@ -971,6 +1206,20 @@ bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* re
    uint32_t list_length = reader->ReadAndSwap<uint32_t>();
    assert_zero(list_length & ~0xFFFFF);
    list_length &= 0xFFFFF;
@@ -1142,7 +1162,7 @@ index a744375..e89c343 100644
    ExecuteIndirectBuffer(GpuToCpu(list_ptr), list_length);
    return true;
  }
-@@ -1032,6 +1280,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+@@ -1032,6 +1281,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
      if (!matched) {
        // Wait.
        if (wait >= 0x100) {
@@ -1150,7 +1170,7 @@ index a744375..e89c343 100644
          PrepareForWait();
          if (!REXCVAR_GET(vsync)) {
            // User wants it fast and dangerous.
-@@ -1047,6 +1296,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+@@ -1047,6 +1297,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
            return false;
          }
        } else {
@@ -1158,7 +1178,7 @@ index a744375..e89c343 100644
          rex::thread::MaybeYield();
        }
      }
-@@ -1102,6 +1352,13 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
+@@ -1102,6 +1353,13 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
  bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, uint32_t packet,
                                                      uint32_t count) {
    uint32_t write_addr = reader->ReadAndSwap<uint32_t>();
@@ -1172,7 +1192,7 @@ index a744375..e89c343 100644
    for (uint32_t i = 0; i < count - 1; i++) {
      uint32_t write_data = reader->ReadAndSwap<uint32_t>();
  
-@@ -1211,6 +1468,13 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
+@@ -1211,6 +1469,13 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
      // Write value.
      data_value = value;
    }
@@ -1186,7 +1206,7 @@ index a744375..e89c343 100644
    auto endianness = static_cast<xenos::Endian>(address & 0x3);
    address &= ~0x3;
    data_value = GpuSwap(data_value, endianness);
-@@ -1611,4 +1875,60 @@ bool CommandProcessor::ExecutePacketType3_VIZ_QUERY(memory::RingBuffer* reader,
+@@ -1611,4 +1876,62 @@ bool CommandProcessor::ExecutePacketType3_VIZ_QUERY(memory::RingBuffer* reader,
    return true;
  }
  
@@ -1195,6 +1215,8 @@ index a744375..e89c343 100644
 +namespace ng2prof {
 +State g;
 +void OnSwap() {
++  SetLastFrameDrawCount(g.frame_draws);  // NG2 ADDITION (rex/graphics/frame_stats.h)
++  g.frame_draws = 0;
 +  static uint64_t frames = 0, t0 = 0;
 +  static std::chrono::steady_clock::time_point c0;
 +  const int32_t every = REXCVAR_GET(diag_cpu_prof);
@@ -2191,10 +2213,10 @@ index 8f2fcb0..24aca99 100644
    if (!REXCVAR_GET(store_shaders)) {
 diff --git a/src/graphics/ng2_cpu_prof.h b/src/graphics/ng2_cpu_prof.h
 new file mode 100644
-index 0000000..dc4a202
+index 0000000..9291093
 --- /dev/null
 +++ b/src/graphics/ng2_cpu_prof.h
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,94 @@
 +// NG2 DIAG: CPU time of the GPU command processor thread, split by phase (cvar diag_cpu_prof).
 +// Uses rdtsc; ticks are converted to ms with a steady_clock calibration at each report.
 +// Nested scopes (e.g. EndSubmission inside a draw) are excluded from the enclosing phase.
@@ -2245,6 +2267,7 @@ index 0000000..dc4a202
 +  uint64_t acc[kCount] = {};
 +  uint64_t nested = 0;  // ticks already attributed by scopes (excluded from enclosing ones)
 +  uint64_t draws = 0, copies = 0;
++  uint32_t frame_draws = 0;  // NG2 ADDITION: draws since the last swap, always counted
 +};
 +extern State g;
 +
@@ -2268,6 +2291,7 @@ index 0000000..dc4a202
 +struct DrawTimer {
 +  uint64_t last, nested_last;
 +  DrawTimer() : last(g.enabled ? Now() : 0), nested_last(g.nested) {
++    ++g.frame_draws;
 +    if (last) ++g.draws;
 +  }
 +  void Mark(Phase p) {
@@ -3152,7 +3176,7 @@ index f4e0efd..0e91e60 100644
  
      uint64_t filetime = CurrentFileTime();
 diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
-index 76cc877..a06e5a3 100644
+index 76cc877..e8636d6 100644
 --- a/src/system/xmemory.cpp
 +++ b/src/system/xmemory.cpp
 @@ -656,6 +656,14 @@ bool Memory::TriggerPhysicalMemoryCallbacks(
@@ -3170,6 +3194,22 @@ index 76cc877..a06e5a3 100644
  void* Memory::RegisterPhysicalMemoryInvalidationCallback(
      PhysicalMemoryInvalidationCallback callback, void* callback_context) {
    auto entry = new std::pair<PhysicalMemoryInvalidationCallback, void*>(callback, callback_context);
+@@ -2358,3 +2366,15 @@ uint32_t PhysicalHeap::GetPhysicalAddress(uint32_t address) const {
+ }
+ 
+ }  // namespace rex::memory
++
++// NG2 ADDITION: frame statistics shared between the GPU DLL and the app (frame_stats.h). Lives
++// here because the app links only rexruntime.
++#include <atomic>
++#include <rex/graphics/frame_stats.h>
++namespace rex::graphics {
++namespace {
++std::atomic<uint32_t> g_last_frame_draws{0};
++}
++uint32_t LastFrameDrawCount() { return g_last_frame_draws.load(std::memory_order_relaxed); }
++void SetLastFrameDrawCount(uint32_t draws) { g_last_frame_draws.store(draws, std::memory_order_relaxed); }
++}  // namespace rex::graphics
 diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
 index 77bce25..00412cf 100644
 --- a/src/system/xthread.cpp

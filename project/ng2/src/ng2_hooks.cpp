@@ -17,6 +17,7 @@
 #include <vector>
 
 #include <rex/cvar.h>
+#include <rex/graphics/frame_stats.h>
 #include <rex/input/mnk/mnk_input_driver.h>
 #include <rex/kernel/file_read_hook.h>
 #include <rex/logging.h>
@@ -193,7 +194,9 @@ void Ng2RecompPaneDraw(PPCRegister& r3) {
 }
 
 // True while the Recomp Settings item is highlighted in Options (pane drawn recently).
-bool Ng2RecompPaneVisible() { return NowMs() - g_recomp_pane_last_ms.load() < 150; }
+// 80 ms: two frames at 30 fps. 150 ms left the pane up visibly after leaving Options (GitHub #7);
+// the pane's focus survives short gaps on its own (RecompOptionsPane::OnDraw, 400 ms).
+bool Ng2RecompPaneVisible() { return NowMs() - g_recomp_pane_last_ms.load() < 80; }
 
 // D3D present (0x8376A9F8) entry: one call per game frame, for the FPS counter.
 namespace ng2 {
@@ -338,9 +341,14 @@ void Ng2OnPresent() {
       latched = true;
       icon_seen_ms = now;
     }
+    // A 3D scene ends it too: a real-time cutscene right after a load has no HUD and no chapter
+    // screen, and ran unthrottled for up to 15 s (GitHub #6: Genshin vs Joe at double speed,
+    // odd audio). Loading screens draw 155-270 calls per frame, scenes 550+ (prof-route-4).
+    const bool scene_3d = rex::graphics::LastFrameDrawCount() >= 400;
     if (latched && !g_loading_screen.load() &&
-        (g_chapter_screen.load() || Ng2InGameplay() || now - icon_seen_ms > 15000 ||
+        (g_chapter_screen.load() || Ng2InGameplay() || scene_3d || now - icon_seen_ms > 15000 ||
          !REXCVAR_GET(ng2_fast_loading))) {
+      if (scene_3d) REXLOG_INFO("NG2 fast loading: 3D scene ({} draws), off", rex::graphics::LastFrameDrawCount());
       latched = false;
     }
     const bool turbo = latched;

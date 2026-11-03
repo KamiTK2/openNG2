@@ -73,7 +73,7 @@ std::array<std::string, kBindCount> DefaultBinds();
 bool PromptsUseKeyboard();
 uint32_t PromptLabelsVersion();  // changes when bindings change
 std::string PromptLabel(const std::string& tag, bool gameplay);  // "" = keep the icon
-void UpdatePromptDevice(const ImGuiIO& io);
+void UpdatePromptDevice(const ImGuiIO& io, rex::ui::Window* window);
 void PushPromptGlyph(float x0, float y0, float x1, float y1, const std::string& label);
 void DrawPromptGlyphs(const ImGuiIO& io);
 
@@ -200,6 +200,7 @@ class RecompOptionsPane : public rex::ui::ImGuiDialog {
   PadInput pad_;
   int64_t pane_since_ms_ = 0;
   int64_t pane_last_visible_ms_ = 0;  // last frame the pane was shown (gap tolerance)
+  int64_t quit_armed_until_ms_ = 0;   // Quit to Desktop: second A before this quits
   bool focused_ = false;
   int category_ = 0;
   int row_ = 0;
