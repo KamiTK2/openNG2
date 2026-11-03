@@ -37,7 +37,8 @@
 
 bool Ng2IngameRecompRowSelected();  // ng2_hooks.cpp
 int64_t Ng2IngameMenuHiddenMs();     // ng2_hooks.cpp
-bool Ng2MainMenuExitSelected();      // ng2_hooks.cpp: main menu up, cursor on EXIT TO DESKTOP
+bool Ng2MainMenuUp();                // ng2_hooks.cpp: the main menu (NEW GAME ...) is on screen
+int Ng2MainMenuCursor();             // ng2_hooks.cpp: its cursor 0..6, -1 when not up
 
 REXCVAR_DEFINE_BOOL(ng2_prompt_device_diag, false, "NG2",
                     "Log what switches button prompts between controller and keyboard");
@@ -139,7 +140,8 @@ std::atomic<bool> g_invert_y{false};
 std::atomic<int> g_deadzone_pct{0};
 std::atomic<int> g_vibration_pct{100};
 std::atomic<int> g_button_prompts{0};
-std::atomic<uint32_t> g_quit_presses{0};  // A presses on the main menu's EXIT TO DESKTOP item
+std::atomic<uint32_t> g_quit_presses{0};  // B presses on the main menu (Exit to Desktop)
+std::atomic<bool> g_main_menu_message{false};  // a message (Leaderboards / Marketplace) is over it
 std::atomic<bool> g_pause_in_background{false};
 std::atomic<uint64_t> g_game_frames{0};
 
@@ -527,16 +529,33 @@ void InstallRecompInputFilters() {
         }
       }
     }
-    // Main menu EXIT TO DESKTOP (the Xbox LIVE Marketplace item): the game never sees A on it,
-    // so it doesn't open Marketplace / the sign-in message; each new press is counted for the
-    // pane's confirm step (keyboard Enter is A here, added above).
-    if (Ng2MainMenuExitSelected() && !RecompSettingsBlocksGameInput()) {
-      static bool a_was_down[4] = {};
-      const bool a = (uint16_t(g.buttons) & XINPUT_GAMEPAD_A) != 0;
-      if (a && !a_was_down[user_index & 3]) g_quit_presses.fetch_add(1);
-      a_was_down[user_index & 3] = a;
-      g.buttons = uint16_t(uint16_t(g.buttons) & ~XINPUT_GAMEPAD_A);
+    // Main menu [B] Exit to Desktop (GitHub #7): B there is ours (the game would go back to the
+    // title screen); each new press is counted for the pane's confirm step. Keyboard Esc /
+    // Backspace are B in menus (added above).
+    // A on LEADERBOARDS (3) or Xbox LIVE Marketplace (6) opens a message over the menu (offline:
+    // "You must be signed in ..."), with the menu rows still drawn behind it; B there closes the
+    // message, so it goes to the game until that message is dismissed (next A or B; user report).
+    static bool b_was_down[4] = {}, a_was_down[4] = {};
+    static bool menu_message = false;
+    const int cursor = Ng2MainMenuCursor();
+    const bool b = (uint16_t(g.buttons) & XINPUT_GAMEPAD_B) != 0;
+    const bool a = (uint16_t(g.buttons) & XINPUT_GAMEPAD_A) != 0;
+    const bool a_edge = a && !a_was_down[user_index & 3], b_edge = b && !b_was_down[user_index & 3];
+    a_was_down[user_index & 3] = a;
+    b_was_down[user_index & 3] = b;
+    if (cursor < 0) {
+      menu_message = false;
+    } else if (!RecompSettingsBlocksGameInput()) {
+      if (menu_message) {
+        if (a_edge || b_edge) menu_message = false;  // this press closes the message
+      } else if (a_edge && (cursor == 3 || cursor == 6)) {
+        menu_message = true;
+      } else {
+        if (b_edge) g_quit_presses.fetch_add(1);
+        g.buttons = uint16_t(uint16_t(g.buttons) & ~XINPUT_GAMEPAD_B);
+      }
     }
+    g_main_menu_message = menu_message;
     const int dz = g_deadzone_pct.load();
     if (dz > 0) {
       ApplyDeadzone(g.thumb_lx, g.thumb_ly, dz / 100.0f);
@@ -1468,17 +1487,54 @@ static void DrawShaderProgress(ImGuiIO& io) {
   dl->AddText(f, ns, ImVec2((ds.x - nts.x) * 0.5f, b.y + ns), IM_COL32(150, 140, 130, 255), note);
 }
 
-// Main menu EXIT TO DESKTOP (GitHub #7; the Xbox LIVE Marketplace item, label swapped in
-// ps_prompts.cpp). First A asks, a second within 3 s closes the game like its close button.
+// The B / Back button in the current prompt style (Esc cap, Xbox B, PS4 / PS5 Circle) centred
+// at c with radius r; returns its right edge.
+float DrawBackButton(ImDrawList* dl, ImFont* font, ImVec2 c, float r) {
+  if (PromptsUseKeyboard()) {
+    const char* key = "Esc";
+    const float ks = r * 1.2f;
+    const ImVec2 t = font->CalcTextSizeA(ks, FLT_MAX, 0.0f, key);
+    const float w = t.x + r * 0.9f, h = r * 1.8f;
+    dl->AddRectFilled(ImVec2(c.x - w * 0.5f, c.y - h * 0.5f), ImVec2(c.x + w * 0.5f, c.y + h * 0.5f),
+                      IM_COL32(20, 14, 14, 200), h * 0.25f);
+    dl->AddRect(ImVec2(c.x - w * 0.5f, c.y - h * 0.5f), ImVec2(c.x + w * 0.5f, c.y + h * 0.5f),
+                IM_COL32(220, 210, 200, 230), h * 0.25f, 0, std::max(1.0f, h * 0.06f));
+    dl->AddText(font, ks, ImVec2(c.x - t.x * 0.5f, c.y - t.y * 0.5f), IM_COL32(245, 240, 232, 255), key);
+    return c.x + w * 0.5f;
+  }
+  const int style = CurrentPromptStyle();
+  if (style == 2) {  // PS5: light button, grey circle
+    dl->AddCircleFilled(c, r, IM_COL32(205, 205, 205, 255));
+    dl->AddCircle(c, r, IM_COL32(120, 120, 120, 255), 0, std::max(1.0f, r * 0.10f));
+    dl->AddCircle(c, r * 0.52f, IM_COL32(95, 95, 95, 255), 0, std::max(1.5f, r * 0.15f));
+  } else if (style == 1) {  // PS4: dark button, red circle
+    dl->AddCircleFilled(c, r, IM_COL32(32, 32, 34, 255));
+    dl->AddCircle(c, r, IM_COL32(90, 90, 95, 255), 0, std::max(1.0f, r * 0.10f));
+    dl->AddCircle(c, r * 0.52f, IM_COL32(232, 60, 72, 255), 0, std::max(1.5f, r * 0.15f));
+  } else {  // Xbox 360 B
+    dl->AddCircleFilled(c, r, IM_COL32(176, 22, 18, 255));
+    const ImVec2 t = font->CalcTextSizeA(r * 1.4f, FLT_MAX, 0.0f, "B");
+    dl->AddText(font, r * 1.4f, ImVec2(c.x - t.x * 0.5f, c.y - t.y * 0.5f), IM_COL32(255, 255, 255, 255), "B");
+  }
+  return c.x + r;
+}
+
+// Main menu [B] Exit to Desktop (GitHub #7): a prompt bottom right while the main menu is up;
+// the first B asks, a second within 3 s closes the game like its close button.
 void RecompOptionsPane::UpdateQuitToDesktop(const ImGuiIO& io) {
   static uint32_t seen = g_quit_presses.load();
   const uint32_t presses = g_quit_presses.load();
   const int64_t now = NowMs();
-  if (!Ng2MainMenuExitSelected()) quit_armed_until_ms_ = 0;  // moved off the item / left the menu
+  const bool menu = Ng2MainMenuUp() && !g_main_menu_message.load() && !overlay_open_ && !pane_visible_();
+  if (!menu) {
+    quit_armed_until_ms_ = 0;
+    seen = presses;
+    return;
+  }
   if (presses != seen) {
     seen = presses;
     if (now < quit_armed_until_ms_) {
-      REXLOG_INFO("RECOMP SETTINGS: quit to desktop (main menu)");
+      REXLOG_INFO("RECOMP SETTINGS: exit to desktop (main menu)");
       HWND h = window_ ? static_cast<HWND>(window_->GetNativeWindowHandle()) : nullptr;
       if (h) PostMessageW(h, WM_CLOSE, 0, 0);
       quit_armed_until_ms_ = 0;
@@ -1487,16 +1543,31 @@ void RecompOptionsPane::UpdateQuitToDesktop(const ImGuiIO& io) {
       Ng2QueueSystemSound(kSoundCursor);
     }
   }
-  if (now >= quit_armed_until_ms_) return;
-  const int style = PromptsUseKeyboard() ? -1 : CurrentPromptStyle();
-  const char* button = style < 0 ? "Enter" : style == 0 ? "A" : "Cross";
-  char text[96];
-  std::snprintf(text, sizeof(text), "Press %s again to quit to the desktop", button);
   ImFont* font = g_serif_font ? g_serif_font : ImGui::GetFont();
+  ImDrawList* dl = ImGui::GetForegroundDrawList();
+  const Viewport vp = GameViewport(io);
+  // Prompt, bottom right of the 16:9 frame.
+  {
+    const float size = vp.h * 0.030f, r = size * 0.45f;
+    const char* label = "Exit to Desktop";
+    const ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, 0.0f, label);
+    const float right = vp.x + vp.w * 0.95f, cy = vp.y + vp.h * 0.93f;
+    const float text_x = right - ts.x;
+    const float bx = text_x - size * 0.35f - (PromptsUseKeyboard() ? size * 0.9f : r);
+    DrawBackButton(dl, font, ImVec2(bx, cy), r);
+    dl->AddText(font, size, ImVec2(text_x + size * 0.04f, cy - ts.y * 0.5f + size * 0.04f),
+                IM_COL32(0, 0, 0, 200), label);
+    dl->AddText(font, size, ImVec2(text_x, cy - ts.y * 0.5f), IM_COL32(240, 232, 220, 255), label);
+  }
+  if (now >= quit_armed_until_ms_) return;
+  // Confirmation, centred.
+  const int style = PromptsUseKeyboard() ? -1 : CurrentPromptStyle();
+  const char* button = style < 0 ? "Esc" : style == 0 ? "B" : "Circle";
+  char text[96];
+  std::snprintf(text, sizeof(text), "Press %s again to exit to the desktop", button);
   const float size = io.DisplaySize.y * 0.032f;
   const ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, 0.0f, text);
   const ImVec2 c(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
-  ImDrawList* dl = ImGui::GetForegroundDrawList();
   dl->AddRectFilled(ImVec2(c.x - ts.x * 0.5f - size, c.y - ts.y * 0.5f - size * 0.6f),
                     ImVec2(c.x + ts.x * 0.5f + size, c.y + ts.y * 0.5f + size * 0.6f),
                     IM_COL32(10, 5, 12, 230), size * 0.3f);

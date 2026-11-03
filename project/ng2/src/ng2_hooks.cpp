@@ -1,4 +1,4 @@
-﻿// Host replacements for guest code that is unsafe under host scheduling.
+// Host replacements for guest code that is unsafe under host scheduling.
 // Wired up with [[entrypoint.midasm_hook]] entries in ng2_manifest.toml.
 #define NOMINMAX
 #include <windows.h>
@@ -772,8 +772,23 @@ void PushPromptGlyph(float x0, float y0, float x1, float y1, const std::string& 
 REXCVAR_DEFINE_BOOL(ng2_prompt_diag, false, "NG2",
                     "Log distinct sprites drawn in menu buckets (button icon search)");
 extern "C" REX_FUNC(__imp__sub_8368EFE8);
+extern std::atomic<int64_t> g_main_menu_rows_ms;
 extern "C" REX_FUNC(sub_8368EFE8) {
   const uint32_t vertices = ctx.r4.u32;
+  if (g_draw_bucket == 20) {  // main menu rows: see Ng2MainMenuUp
+    auto* m = REX_KERNEL_STATE()->memory();
+    float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
+    for (uint32_t i = 0; i < 4; ++i) {
+      const float x = rex::memory::load_and_swap<float>(m->TranslateVirtual(vertices + i * 24));
+      const float y = rex::memory::load_and_swap<float>(m->TranslateVirtual(vertices + i * 24 + 4));
+      x0 = std::min(x0, x), x1 = std::max(x1, x), y0 = std::min(y0, y), y1 = std::max(y1, y);
+    }
+    const float w = x1 - x0, h = y1 - y0;
+    if ((std::abs(w - 520.0f) < 2.0f && std::abs(h - 90.0f) < 2.0f) ||
+        (std::abs(w - 468.0f) < 2.0f && std::abs(h - 81.0f) < 2.0f)) {
+      g_main_menu_rows_ms = NowMs();
+    }
+  }
   // Pause / inventory menu button icons (bucket 49): 59x59 quads on one texture strip,
   // v = 0 X, .125 Y, .25 B, .375 A (pausediag-1, findings #54). With keyboard prompts the
   // icon is not drawn; the settings overlay draws the key in its place.
@@ -812,13 +827,14 @@ extern "C" REX_FUNC(sub_8368EFE8) {
     }
     static std::unordered_map<std::string, int> seen;
     char key[160];
-    std::snprintf(key, sizeof(key), "%d %.0f %.0f %.0f %.0f v %.4f %.4f", g_draw_bucket, x0, y0,
-                  x1 - x0, y1 - y0, v0, v1);
+    const uint32_t color = GuestLoadU32(vertices + 12);  // vertex 0 colour (ARGB)
+    std::snprintf(key, sizeof(key), "%d %.0f %.0f %.0f %.0f v %.4f %.4f c %08X", g_draw_bucket, x0, y0,
+                  x1 - x0, y1 - y0, v0, v1, color);
     if (seen[key]++ == 0) {
       REXLOG_INFO("NG2 prompt diag: bucket {} sprite {:08X} tex {:08X} rect ({:.0f},{:.0f})-({:.0f},{:.0f}) "
-                  "uv ({:.4f},{:.4f})-({:.4f},{:.4f}) lr {:08X}",
+                  "uv ({:.4f},{:.4f})-({:.4f},{:.4f}) color {:08X} lr {:08X}",
                   g_draw_bucket, ctx.r3.u32, GuestLoadU32(ctx.r3.u32 + 8), x0, y0, x1, y1, u0,
-                  v0, u1, v1, uint32_t(ctx.lr));
+                  v0, u1, v1, color, uint32_t(ctx.lr));
     }
   }
   if (REXCVAR_GET(ng2_bucket_dump) && g_draw_bucket < 0) {
@@ -1753,16 +1769,24 @@ uint32_t RewritePromptString(uint32_t src) {
 }  // namespace
 
 // Main menu (NEW GAME ... Xbox LIVE Marketplace): item count at 0x853A4A60 (7), cursor at
-// +4 (0..6, 6 = the Marketplace item, now EXIT TO DESKTOP), and a float at +8 that is 1.0
-// while the menu is up (0 at the title screen and in gameplay). Found by memory diffs with the
-// cursor on items 6, 5, 4 (mainmenu*.bin) against title.bin / options.bin.
-bool Ng2MainMenuExitSelected() {
+// +4 (0..6), and a float at +8 that is 1.0 while the menu is up (0 at the title screen and in
+// gameplay). Found by memory diffs with the cursor on items 6, 5, 4 (mainmenu*.bin) against
+// title.bin / options.bin. Used for the [B] Exit to Desktop prompt (recomp_settings.cpp).
+// Last time a main menu row was drawn (2D bucket 20, 520x90 highlighted / 468x81 others;
+// menu-tint*.log), so screens opened from the menu (Options, Load Game) don't count.
+std::atomic<int64_t> g_main_menu_rows_ms{0};
+// Main menu cursor (0..6), or -1 when the menu isn't up.
+int Ng2MainMenuCursor();
+bool Ng2MainMenuUp() { return Ng2MainMenuCursor() >= 0; }
+int Ng2MainMenuCursor() {
+  if (NowMs() - g_main_menu_rows_ms.load() > 100) return -1;
   constexpr uint32_t kMenu = 0x853A4A60;
-  if (GuestLoadU32(kMenu) != 7 || GuestLoadU32(kMenu + 4) != 6) return false;
+  const uint32_t cursor = GuestLoadU32(kMenu + 4);
+  if (GuestLoadU32(kMenu) != 7 || cursor > 6) return -1;
   const uint32_t up = GuestLoadU32(kMenu + 8);
   float f;
   std::memcpy(&f, &up, 4);
-  return f > 0.99f;
+  return f > 0.99f ? int(cursor) : -1;
 }
 
 extern "C" REX_FUNC(__imp__sub_83706C20);
