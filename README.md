@@ -46,6 +46,16 @@ with System > Check for Updates.
 - Menus can't be used with the mouse (keyboard and controller work).
 - The Show Karma key has no keyboard binding yet.
 - Only the original disc release with Title Update #2 is supported.
+- Explosions could draw a band at the screen edge with Field of View above 100%; a fix was
+  attempted in 1.0.5 - please report it if you still see it.
+
+## Reporting problems
+
+Open an [issue](https://github.com/KamiTK2/openNG2/issues) with your openNG2 version, GPU and
+CPU, and attach the game's log from the session where it happened: **Recomp Settings >
+System > Open Log Folder** (or the `logs` folder in your install folder). Logs are named
+`ng2_NNN.log`; the highest number is the latest session. If the build itself failed, attach
+`openNG2-build.log` from the install folder instead.
 
 ## Future plans
 

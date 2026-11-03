@@ -1590,8 +1590,29 @@ extern "C" REX_FUNC(__imp__sub_82845BD8);
 void Ng2CaptureBurst(const char* tag);  // crash_handler.cpp (NG2 DIAG)
 REXCVAR_DEFINE_BOOL(ng2_effect_capture, false, "NG2",
                     "Capture frame bursts when effect projection sub_82845BD8 runs");
+float GameplayFovScale();  // below (Field of View setting x mouse wheel zoom)
 extern "C" REX_FUNC(sub_82845BD8) {
   NativeAspectScope native;
+  // Same Field of View as the main projection: this builds from the render camera's fov
+  // (0x84C56320 + 240, = the unscaled 0.8727), so with FOV > 100% the effect overlays were
+  // smaller than the screen and explosions showed a band at the edge (user report; GitHub #7
+  // rainbow band). Scaled for the call, restored after.
+  constexpr uint32_t kEffectFov = 0x84C56320 + 240;
+  const float scale = GameplayFovScale();
+  uint8_t* p = nullptr;
+  float saved = 0.0f;
+  if (scale != 1.0f) {
+    p = REX_KERNEL_STATE()->memory()->TranslateVirtual<uint8_t*>(kEffectFov);
+    saved = LoadF(p);
+    StoreF(p, saved * scale);
+  }
+  struct Restore {
+    uint8_t* p;
+    float v;
+    ~Restore() {
+      if (p) StoreF(p, v);
+    }
+  } restore{p, saved};
   if (REXCVAR_GET(ng2_effect_capture)) Ng2CaptureBurst("82845BD8");
   if (REXCVAR_GET(ng2_aspect_diag)) {
     g_aspect_calls[3].fetch_add(1);
@@ -1622,6 +1643,15 @@ extern "C" REX_FUNC(__imp__sub_822FB368);
 // effects use; widening those gave explosion effects black bands (findings #53).
 REXCVAR_DEFINE_INT32(ng2_fov_percent, 100, "NG2", "Gameplay camera field of view, percent of the game's")
     .range(50, 200);
+// Field of View setting x mouse wheel zoom past 1.0 (see sub_822FADB8), in gameplay only
+// (cutscenes keep their framing) and not in first-person view (camera mode 4).
+float GameplayFovScale() {
+  if (!Ng2InGameplay()) return 1.0f;
+  const int fov_pct = REXCVAR_GET(ng2_fov_percent);
+  const float wheel_fov = GuestLoadU32(0x84C569F0 + 4716) == 4 ? 1.0f : std::max(1.0f, g_zoom);
+  return float(fov_pct) / 100.0f * wheel_fov;
+}
+
 extern "C" REX_FUNC(sub_822FB368) {
   WideAspectScope wide_projection(0);
   // Field of View setting: the gameplay camera's fov (camera+176, read here for the main
@@ -1629,12 +1659,10 @@ extern "C" REX_FUNC(sub_822FB368) {
   // changes keep working. Cutscenes (HUD hidden) keep their framing.
   const uint32_t fov_cam = ctx.r3.u32;
   const int fov_pct = REXCVAR_GET(ng2_fov_percent);
-  // Mouse wheel zoom past 1.0 widens the view (see sub_822FADB8).
-  const float wheel_fov = GuestLoadU32(0x84C569F0 + 4716) == 4 ? 1.0f : std::max(1.0f, g_zoom);
-  const float fov_scale = float(fov_pct) / 100.0f * wheel_fov;
+  const float fov_scale = fov_cam == 0x84C569F0 ? GameplayFovScale() : 1.0f;
   uint8_t* fov_p = nullptr;
   float fov_saved = 0.0f;
-  if (fov_scale != 1.0f && fov_cam == 0x84C569F0 && Ng2InGameplay()) {
+  if (fov_scale != 1.0f) {
     fov_p = REX_KERNEL_STATE()->memory()->TranslateVirtual<uint8_t*>(fov_cam + 176);
     fov_saved = LoadF(fov_p);
     StoreF(fov_p, fov_saved * fov_scale);

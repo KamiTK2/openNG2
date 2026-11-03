@@ -150,6 +150,10 @@ def main():
             "anonymous request; switch it off in the launcher or in Recomp Settings > System).\n"
             "Update now replaces the launcher and rebuilds the game from the files already\n"
             "installed - nothing to add again. Saves and settings are kept.\n\n"
+            "Reporting a problem: open an issue on the project page and attach the game's log from\n"
+            "the session where it happened - Recomp Settings > System > Open Log Folder, or the logs\n"
+            "folder in your install folder (ng2_NNN.log; the highest number is the latest session).\n"
+            "If the build itself failed, attach openNG2-build.log from the install folder.\n\n"
             "Ninja Gaiden II belongs to Koei Tecmo; use only a copy you own.\n"
             "Third-party licences: THIRD-PARTY-NOTICES.txt\n"
             "Project page: https://github.com/KamiTK2/openNG2\n")

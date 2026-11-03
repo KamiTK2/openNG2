@@ -1821,6 +1821,11 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
                       SW_SHOWNORMAL);
         return false;
       });
+      action_row("Open Log Folder", [] {  // for bug reports: logs\ng2_NNN.log, newest highest
+        const std::wstring logs = (ExeDir() / "logs").wstring();
+        ShellExecuteW(nullptr, L"open", logs.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        return false;
+      });
       action_row("Back Up Saves", [this] {
         BackUpSaves();
         return false;
