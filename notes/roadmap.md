@@ -46,13 +46,17 @@ Players supply their own game; we never ship game data or game-derived code. A l
 - [ ] Before release: licence review of the SDK's bundled third-party libraries (ffmpeg etc.) and a LICENSE / third-party notices file; test on a clean PC without Visual Studio; GitHub release upload
 - [x] Updates (findings #69): launcher + game check GitHub releases; the launcher updates itself and rebuilds from the installed files; Play from the launcher
 
-## Version 1.1: native renderer (user 2026-11-02)
-Replace NG2's statically linked Xbox Direct3D layer with a D3D12 implementation (as Unleashed Recompiled does) instead of emulating the Xenos GPU: no PM4 interpretation, no EDRAM / ROV emulation, lower per-draw cost (weak machines). Estimate ~30-60 h of active work (findings #59-#63 for current costs):
-- [ ] Feasibility (2-4 h): find the D3D functions, how NG2 uses them, whether it writes GPU commands directly
-- [ ] Shaders: translate the 175 Xenos shaders to D3D12 ahead of time (Xenos -> HLSL translator)
-- [ ] Core renderer: textures (tiled formats), vertex formats, constants, render states, render targets, resolves
+## Version 1.1: native renderer (user 2026-11-02; Vulkan chosen 2026-11-03)
+Replace NG2's statically linked Xbox Direct3D layer with a native **Vulkan** renderer (as Unleashed Recompiled does with its own backend) instead of emulating the Xenos GPU: no PM4 draw interpretation, no EDRAM / ROV emulation, lower per-draw cost (weak machines), and a Linux port later. Branch `native-vulkan-renderer`. Opt-in (cvar) until it matches the emulated renderer; the emulated renderer stays the default. Findings #96-#98.
+- [x] Vulkan available: SDK built with `REXGLUE_USE_VULKAN=ON`, `--gpu_backend=vulkan` runs the emulated Vulkan backend (#98)
+- [x] Feasibility: D3D library located, device = register shadow + dirty masks, draw / state / resolve / swap calls identified with per-frame counts (#96); 2/3 of the GPU's draws are D3D pipeline drains (#97)
+- [ ] D3D API map with arguments (draws, Clear, Resolve, SetRenderTarget / DepthStencil, SetIndices / SetStreamSource, state setter table)
+- [ ] Capture mode: hooks run the original D3D code and record each frame's calls + decoded state (validates the map)
+- [ ] Shaders: Xenos ucode -> SPIR-V ahead of time for every shader in the manifest (validated offline)
+- [ ] Core renderer: device + presenter hand-off, render targets (no EDRAM), textures (tiled formats), vertex / index buffers, constants, render states, resolves, clears
 - [ ] Scene-by-scene correctness (1120x584 scene buffer, effects, cutscenes, HUD)
 - [ ] Port features: internal resolution, ultrawide, FSR, frame generation, HUD pinning, prompts
+- [ ] Linux build
 
 ## Cheats (user request 2026-11-01)
 - [x] Recomp Settings > Cheats: Unlock Difficulties, Unlock Costumes (apply after restart; nothing written to the save)
