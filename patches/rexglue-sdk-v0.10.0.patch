@@ -28,10 +28,10 @@ index da8e432..17c6cf4 100644
    // MicroEngine binary from PM4_ME_INIT
    std::vector<uint32_t> me_bin_;
 diff --git a/include/rex/graphics/d3d12/command_processor.h b/include/rex/graphics/d3d12/command_processor.h
-index 96d362b..8cc483a 100644
+index 96d362b..7be7ec3 100644
 --- a/include/rex/graphics/d3d12/command_processor.h
 +++ b/include/rex/graphics/d3d12/command_processor.h
-@@ -219,6 +219,38 @@ class D3D12CommandProcessor : public CommandProcessor {
+@@ -219,6 +219,39 @@ class D3D12CommandProcessor : public CommandProcessor {
                   IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
    bool IssueCopy() override;
  
@@ -49,6 +49,7 @@ index 96d362b..8cc483a 100644
 +    float viewport_w = 0, viewport_h = 0;
 +    bool resolve = false;            // ended by a resolve (else by the swap)
 +    uint32_t copy_dest_base = 0, copy_dest_pitch = 0, copy_dest_info = 0, copy_control = 0;
++    uint32_t batches = 0, loads = 0, uploads = 0;  // work recorded inside this segment
 +  };
 +  void GpuProfOnDraw();
 +  void GpuProfMark(bool resolve);
@@ -664,10 +665,10 @@ index 240bcb0..7553e43 100644
      auto entry_display = make_display_name(targeted[0].config.filePath);
      RecompilerConfig cfg = std::move(targeted[0].config);
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index a744375..ac24fe3 100644
+index a744375..e89c343 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
-@@ -10,9 +10,13 @@
+@@ -10,10 +10,15 @@
   */
  
  #include <algorithm>
@@ -679,11 +680,16 @@ index a744375..ac24fe3 100644
  #include <cstring>
 +#include <filesystem>
  #include <string_view>
++#include <vector>
  
  #include <fmt/format.h>
-@@ -36,6 +40,17 @@
+ 
+@@ -35,7 +40,31 @@
+ #include <rex/system/kernel_state.h>
  #include <rex/system/user_module.h>
  
++#include "ng2_cpu_prof.h"  // NG2 DIAG
++
  REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 +// NG2 DIAG: research logging (command stream, fences, threads, pacing); off for players.
 +REXCVAR_DECLARE(bool, ng2_diag_log);  // defined in ui/presenter.cpp (runtime)
@@ -696,10 +702,21 @@ index a744375..ac24fe3 100644
 +  static std::mutex m;
 +  return m;
 +}
++
++// NG2 DIAG: command processor thread CPU time by phase, logged every N guest frames (0 = off).
++REXCVAR_DEFINE_INT32(diag_cpu_prof, 0, "GPU",
++                     "NG2 DIAG: log command processor CPU time per phase every N frames (0 = off)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++// NG2 EXP: type-0 packets writing a run of registers use the range path (constant blocks
++// are copied in bulk with one dirty check) instead of one virtual WriteRegister per value.
++REXCVAR_DEFINE_BOOL(ng2_fast_type0, true, "GPU",
++                    "NG2 EXP: bulk register writes for multi-register type-0 packets")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
  
  REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                      "Refresh page-valid state from GPU-written memory at frame end. "
-@@ -154,17 +169,71 @@ void CommandProcessor::Shutdown() {
+@@ -154,17 +183,71 @@ void CommandProcessor::Shutdown() {
    worker_thread_.reset();
  }
  
@@ -773,7 +790,7 @@ index a744375..ac24fe3 100644
  void CommandProcessor::ClearCaches() {}
  
  void CommandProcessor::InvalidateGpuMemory() {}
-@@ -204,13 +273,25 @@ void CommandProcessor::WorkerThreadMain() {
+@@ -204,19 +287,32 @@ void CommandProcessor::WorkerThreadMain() {
    }
  
    while (worker_running_) {
@@ -803,7 +820,14 @@ index a744375..ac24fe3 100644
      if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
        SCOPE_profile_cpu_i("gpu", "rex::graphics::CommandProcessor::Stall");
        // We've run out of commands to execute.
-@@ -228,18 +309,36 @@ void CommandProcessor::WorkerThreadMain() {
+       // We spin here waiting for new ones, as the overhead of waiting on our
+       // event is too high.
+       PrepareForWait();
++      ng2prof::Scope ng2_idle(ng2prof::kIdle);  // NG2 DIAG
+       uint32_t loop_count = 0;
+       do {
+         // If we spin around too much, revert to a "low-power" state.
+@@ -228,18 +324,36 @@ void CommandProcessor::WorkerThreadMain() {
  
          rex::thread::MaybeYield();
          loop_count++;
@@ -844,7 +868,7 @@ index a744375..ac24fe3 100644
  
      // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
      //     that many indices.
-@@ -312,9 +411,18 @@ bool CommandProcessor::SetupContext() {
+@@ -312,9 +426,18 @@ bool CommandProcessor::SetupContext() {
  void CommandProcessor::ShutdownContext() {}
  
  void CommandProcessor::InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) {
@@ -864,7 +888,7 @@ index a744375..ac24fe3 100644
  }
  
  void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) {
-@@ -328,6 +436,14 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_s
+@@ -328,6 +451,14 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_s
  }
  
  void CommandProcessor::UpdateWritePointer(uint32_t value) {
@@ -879,7 +903,25 @@ index a744375..ac24fe3 100644
    write_ptr_index_ = value;
    write_ptr_index_event_->Set();
  }
-@@ -619,10 +735,24 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
+@@ -355,7 +486,16 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+ 
+   // Volatile for the WAIT_REG_MEM loop.
+   const_cast<volatile uint32_t&>(regs.values[index]) = value;
+-  if (!regs.GetRegisterInfo(index)) {
++  // NG2 EXP: GetRegisterInfo is a large switch with function-local statics; it only feeds
++  // this debug line, so look the answer up in a table built once.
++  static const auto* const known_registers = [] {
++    auto* known = new std::vector<bool>(RegisterFile::kRegisterCount);
++    for (uint32_t i = 0; i < RegisterFile::kRegisterCount; ++i) {
++      (*known)[i] = RegisterFile::GetRegisterInfo(i) != nullptr;
++    }
++    return known;
++  }();
++  if (!(*known_registers)[index]) {
+     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
+   }
+ 
+@@ -619,10 +759,24 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
    memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
    reader.set_read_offset(read_index * sizeof(uint32_t));
    reader.set_write_offset(write_index * sizeof(uint32_t));
@@ -904,7 +946,7 @@ index a744375..ac24fe3 100644
        assert_always();
        break;
      }
-@@ -633,9 +763,61 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
+@@ -633,9 +787,66 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
    return write_index;
  }
  
@@ -946,7 +988,12 @@ index a744375..ac24fe3 100644
 +  {  // NG2 DIAG: if the IB isn't well-formed yet, wait for the CPU to finish it.
 +    auto* w = memory_->TranslatePhysical<const uint32_t*>(ptr);
 +    uint32_t bad_at = 0;
-+    if (!Ng2IbWellFormed(w, count, &bad_at)) {
++    bool well_formed;
++    {
++      ng2prof::Scope ng2_scope(ng2prof::kIbCheck);  // NG2 DIAG
++      well_formed = Ng2IbWellFormed(w, count, &bad_at);
++    }
++    if (!well_formed) {
 +      auto t0 = std::chrono::steady_clock::now();
 +      bool ok = false;
 +      long long us = 0;
@@ -966,7 +1013,7 @@ index a744375..ac24fe3 100644
    // Execute commands!
    memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
    reader.set_write_offset(count * sizeof(uint32_t));
-@@ -643,6 +825,15 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
+@@ -643,6 +854,15 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
      if (!ExecutePacket(&reader)) {
        // Return up a level if we encounter a bad packet.
        REXGPU_ERROR("**** INDIRECT RINGBUFFER: Failed to execute packet.");
@@ -982,7 +1029,34 @@ index a744375..ac24fe3 100644
        assert_always();
        break;
      }
-@@ -960,6 +1151,14 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+@@ -689,6 +909,7 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
+ }
+ 
+ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet) {
++  ng2prof::Scope ng2_scope(ng2prof::kPm4Type0);  // NG2 DIAG
+   // Type-0 packet.
+   // Write count registers in sequence to the registers starting at
+   // (base_index << 2).
+@@ -702,6 +923,10 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
+ 
+   uint32_t base_index = (packet & 0x7FFF);
+   uint32_t write_one_reg = (packet >> 15) & 0x1;
++  if (!write_one_reg && count > 1 && REXCVAR_GET(ng2_fast_type0)) {  // NG2 EXP
++    WriteRegisterRangeFromRing(reader, base_index, count);
++    return true;
++  }
+   for (uint32_t m = 0; m < count; m++) {
+     uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
+     uint32_t target_index = write_one_reg ? base_index : base_index + m;
+@@ -730,6 +955,7 @@ bool CommandProcessor::ExecutePacketType2(memory::RingBuffer* reader, uint32_t p
+ }
+ 
+ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t packet) {
++  ng2prof::Scope ng2_scope(ng2prof::kPm4Type3);  // NG2 DIAG (draws / copies nested, excluded)
+   // Type-3 packet.
+   uint32_t opcode = (packet >> 8) & 0x7F;
+   uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
+@@ -960,6 +1186,14 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
  
    IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
  
@@ -997,7 +1071,7 @@ index a744375..ac24fe3 100644
    ++counter_;
    return true;
  }
-@@ -971,6 +1170,20 @@ bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* re
+@@ -971,6 +1205,20 @@ bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* re
    uint32_t list_length = reader->ReadAndSwap<uint32_t>();
    assert_zero(list_length & ~0xFFFFF);
    list_length &= 0xFFFFF;
@@ -1018,7 +1092,23 @@ index a744375..ac24fe3 100644
    ExecuteIndirectBuffer(GpuToCpu(list_ptr), list_length);
    return true;
  }
-@@ -1102,6 +1315,13 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
+@@ -1032,6 +1280,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+     if (!matched) {
+       // Wait.
+       if (wait >= 0x100) {
++        ng2prof::Scope ng2_wait(ng2prof::kWaitRegMem);  // NG2 DIAG
+         PrepareForWait();
+         if (!REXCVAR_GET(vsync)) {
+           // User wants it fast and dangerous.
+@@ -1047,6 +1296,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+           return false;
+         }
+       } else {
++        ng2prof::Scope ng2_wait(ng2prof::kWaitRegMem);  // NG2 DIAG
+         rex::thread::MaybeYield();
+       }
+     }
+@@ -1102,6 +1352,13 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
  bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, uint32_t packet,
                                                      uint32_t count) {
    uint32_t write_addr = reader->ReadAndSwap<uint32_t>();
@@ -1032,7 +1122,7 @@ index a744375..ac24fe3 100644
    for (uint32_t i = 0; i < count - 1; i++) {
      uint32_t write_data = reader->ReadAndSwap<uint32_t>();
  
-@@ -1211,6 +1431,13 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
+@@ -1211,6 +1468,13 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
      // Write value.
      data_value = value;
    }
@@ -1046,19 +1136,84 @@ index a744375..ac24fe3 100644
    auto endianness = static_cast<xenos::Endian>(address & 0x3);
    address &= ~0x3;
    data_value = GpuSwap(data_value, endianness);
+@@ -1611,4 +1875,60 @@ bool CommandProcessor::ExecutePacketType3_VIZ_QUERY(memory::RingBuffer* reader,
+   return true;
+ }
+ 
++
++// ---- NG2 DIAG: command processor CPU profile (diag_cpu_prof) -----------------------------
++namespace ng2prof {
++State g;
++void OnSwap() {
++  static uint64_t frames = 0, t0 = 0;
++  static std::chrono::steady_clock::time_point c0;
++  const int32_t every = REXCVAR_GET(diag_cpu_prof);
++  const bool want = every > 0;
++  if (want != g.enabled) {
++    g = State();
++    g.enabled = want;
++    frames = 0;
++    t0 = Now();
++    c0 = std::chrono::steady_clock::now();
++    return;
++  }
++  if (!want || ++frames < uint64_t(every)) return;
++  const uint64_t t1 = Now();
++  const auto c1 = std::chrono::steady_clock::now();
++  const double ns = double(std::chrono::duration_cast<std::chrono::nanoseconds>(c1 - c0).count());
++  const double ticks = double(t1 - t0);
++  if (ticks <= 0.0 || ns <= 0.0) return;
++  const double ms_per_tick = ns / ticks / 1e6;
++  const double f = double(frames);
++  auto ms = [&](uint64_t v) { return double(v) * ms_per_tick / f; };
++  const double wall = ticks * ms_per_tick / f;
++  double draw_total = 0.0, attributed = 0.0;
++  for (uint32_t p = 0; p < kCount; ++p) {
++    attributed += ms(g.acc[p]);
++    if (p <= kDrawOther) draw_total += ms(g.acc[p]);
++  }
++  const double waiting = ms(g.acc[kIdle]) + ms(g.acc[kWaitRegMem]) + ms(g.acc[kFenceWait]);
++  REXGPU_INFO(
++      "NG2 CP prof ({} frames): frame {:.3f} ms | busy {:.3f} | idle {:.3f} wait_reg_mem {:.3f} "
++      "fence_wait {:.3f} | draws {:.0f}/frame {:.3f} ms ({:.2f} us/draw) | copies {:.1f} | "
++      "packets+other {:.3f}",
++      frames, wall, wall - waiting, ms(g.acc[kIdle]), ms(g.acc[kWaitRegMem]),
++      ms(g.acc[kFenceWait]), double(g.draws) / f, draw_total,
++      g.draws ? draw_total * f * 1000.0 / double(g.draws) : 0.0, double(g.copies) / f,
++      wall - attributed);
++  std::string line;
++  for (uint32_t p = 0; p < kCount; ++p) {
++    if (p == kIdle || p == kWaitRegMem || p == kFenceWait) continue;
++    line += fmt::format(" {} {:.3f}", PhaseName(p), ms(g.acc[p]));
++  }
++  REXGPU_INFO("NG2 CP prof phases (ms/frame):{}", line);
++  const bool enabled = g.enabled;
++  g = State();
++  g.enabled = enabled;
++  frames = 0;
++  t0 = t1;
++  c0 = c1;
++}
++}  // namespace ng2prof
++
+ }  // namespace rex::graphics
 diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
-index 19874a5..68c5c4c 100644
+index 19874a5..bbe7502 100644
 --- a/src/graphics/d3d12/command_processor.cpp
 +++ b/src/graphics/d3d12/command_processor.cpp
-@@ -10,6 +10,7 @@
+@@ -9,7 +9,11 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
   */
  
++#include <map>
++#include <tuple>
++#include "../ng2_cpu_prof.h"  // NG2 DIAG
  #include <algorithm>
 +#include <unordered_map>
  #include <cstdarg>
  #include <cstring>
  #include <sstream>
-@@ -47,7 +48,23 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
+@@ -47,7 +51,27 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                      "Submit command list when PM4 primary buffer ends")
      .lifecycle(rex::cvar::Lifecycle::kHotReload);
  
@@ -1079,19 +1234,57 @@ index 19874a5..68c5c4c 100644
 +  uint64_t pipeline_changes = 0, draws = 0;
 +};
 +Ng2GpuWork g_ng2_gpu_work;  // NG2 DIAG (diag_gpu_work)
++bool g_ng2_log_frame_work = false;  // NG2 DIAG: log loads / uploads / resolves of the profiled frame
++// NG2 DIAG (diag_gpu_work): barriers by kind. Key: type, shared-memory flag, before, after.
++std::map<std::tuple<int, int, uint32_t, uint32_t>, uint64_t> g_ng2_barrier_kinds;
++uint64_t g_ng2_batches_shm = 0, g_ng2_batches_uav = 0, g_ng2_batches_other = 0;
  
  // Generated with `xb buildshaders`.
  namespace shaders {
-@@ -256,6 +273,8 @@ void D3D12CommandProcessor::PushUAVBarrier(ID3D12Resource* resource) {
+@@ -256,6 +280,33 @@ void D3D12CommandProcessor::PushUAVBarrier(ID3D12Resource* resource) {
  void D3D12CommandProcessor::SubmitBarriers() {
    UINT barrier_count = UINT(barriers_.size());
    if (barrier_count != 0) {
 +    ++g_ng2_gpu_work.barrier_batches;  // NG2 DIAG
 +    g_ng2_gpu_work.barriers += barrier_count;
++    if (REXCVAR_GET(diag_gpu_work)) {  // NG2 DIAG: classify
++      ID3D12Resource* shm = shared_memory_ ? shared_memory_->GetBuffer() : nullptr;
++      bool has_shm = false, has_uav = false;
++      for (const D3D12_RESOURCE_BARRIER& b : barriers_) {
++        int is_shm = 0;
++        uint32_t before = 0, after = 0;
++        if (b.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
++          is_shm = b.Transition.pResource == shm;
++          before = uint32_t(b.Transition.StateBefore);
++          after = uint32_t(b.Transition.StateAfter);
++        } else if (b.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV) {
++          is_shm = b.UAV.pResource == shm;
++          has_uav = true;
++        }
++        has_shm |= is_shm != 0;
++        ++g_ng2_barrier_kinds[{int(b.Type), is_shm, before, after}];
++      }
++      if (has_shm) {
++        ++g_ng2_batches_shm;
++      } else if (has_uav) {
++        ++g_ng2_batches_uav;
++      } else {
++        ++g_ng2_batches_other;
++      }
++    }
      deferred_command_list_.D3DResourceBarrier(barrier_count, barriers_.data());
      barriers_.clear();
    }
-@@ -1910,6 +1929,31 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+@@ -1894,6 +1945,8 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
+ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                       uint32_t frontbuffer_height) {
+   SCOPE_profile_cpu_f("gpu");
++  ng2prof::OnSwap();                            // NG2 DIAG
++  ng2prof::Scope ng2_scope(ng2prof::kSwap);  // NG2 DIAG
+   vertex_buffers_in_sync_[0] = 0;
+   vertex_buffers_in_sync_[1] = 0;
+ 
+@@ -1910,6 +1963,47 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
      REXGPU_ERROR("IssueSwap: BeginSubmission failed");
      return;
    }
@@ -1116,6 +1309,22 @@ index 19874a5..68c5c4c 100644
 +                  w.draws / f, w.pipeline_changes / f, w.uploads / f, w.upload_ranges / f,
 +                  w.upload_bytes / f / 1024.0, w.barrier_batches / f, w.barriers / f,
 +                  w.texture_loads / f);
++      REXGPU_INFO("NG2 barrier batches per frame: with shared memory {:.1f}, UAV-only {:.1f}, "
++                  "other {:.1f}",
++                  g_ng2_batches_shm / f, g_ng2_batches_uav / f, g_ng2_batches_other / f);
++      std::vector<std::pair<uint64_t, std::tuple<int, int, uint32_t, uint32_t>>> kinds;
++      for (const auto& k : g_ng2_barrier_kinds) kinds.push_back({k.second, k.first});
++      std::sort(kinds.begin(), kinds.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
++      std::string line;
++      for (size_t i = 0; i < kinds.size() && i < 10; ++i) {
++        const auto& [type, is_shm, before, after] = kinds[i].second;
++        line += fmt::format(" | {:.1f}x {}{} {:X}->{:X}", kinds[i].first / f,
++                            type == 0 ? "transition" : type == 1 ? "aliasing" : "uav",
++                            is_shm ? " shm" : "", before, after);
++      }
++      REXGPU_INFO("NG2 barrier kinds per frame:{}", line);
++      g_ng2_barrier_kinds.clear();
++      g_ng2_batches_shm = g_ng2_batches_uav = g_ng2_batches_other = 0;
 +      g_ng2_gpu_work = Ng2GpuWork();
 +      frames = 0;
 +    }
@@ -1123,7 +1332,7 @@ index 19874a5..68c5c4c 100644
  
    // Obtain the actual swap source texture size (resolution-scaled if it's a
    // resolve destination, or not otherwise).
-@@ -2256,8 +2300,166 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+@@ -2256,8 +2350,201 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
    EndSubmission(true);
  }
  
@@ -1183,6 +1392,15 @@ index 19874a5..68c5c4c 100644
 +  }
 +  deferred_command_list_.D3DEndQuery(gpu_prof_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
 +                                     gpu_prof_marks_++);
++  static uint64_t start_batches = 0, start_loads = 0, start_uploads = 0;
++  if (gpu_prof_marks_ > 2) {  // the first segment has no recorded start
++    seg.batches = uint32_t(g_ng2_gpu_work.barrier_batches - start_batches);
++    seg.loads = uint32_t(g_ng2_gpu_work.texture_loads - start_loads);
++    seg.uploads = uint32_t(g_ng2_gpu_work.uploads - start_uploads);
++  }
++  start_batches = g_ng2_gpu_work.barrier_batches;
++  start_loads = g_ng2_gpu_work.texture_loads;
++  start_uploads = g_ng2_gpu_work.uploads;
 +  gpu_prof_segments_.push_back(seg);
 +  seg = GpuProfSegment();
 +}
@@ -1199,6 +1417,7 @@ index 19874a5..68c5c4c 100644
 +      gpu_prof_pending_segments_ = std::move(gpu_prof_segments_);
 +    }
 +    gpu_prof_active_ = false;
++    g_ng2_log_frame_work = false;
 +  }
 +  gpu_prof_segments_.clear();
 +  gpu_prof_marks_ = 0;
@@ -1224,6 +1443,7 @@ index 19874a5..68c5c4c 100644
 +    }
 +  }
 +  gpu_prof_active_ = true;  // the next frame (after this swap) is profiled
++  g_ng2_log_frame_work = REXCVAR_GET(diag_gpu_work);
 +}
 +
 +void D3D12CommandProcessor::GpuProfPoll() {
@@ -1245,6 +1465,30 @@ index 19874a5..68c5c4c 100644
 +  REXGPU_INFO("NG2 GPU passes: frame {:.3f} ms GPU, {} segments, {} draws", ms(t[0], t[n - 1]),
 +              n - 1, draws);
 +  if (REXCVAR_GET(diag_gpu_passes_per_draw)) {
++    {  // NG2 DIAG: GPU time by what was recorded with the draw
++      double t_load = 0, t_upload = 0, t_batch = 0, t_clean = 0;
++      uint32_t n_load = 0, n_upload = 0, n_batch = 0, n_clean = 0, loads = 0, batches = 0;
++      for (uint32_t i = 1; i < n && i - 1 < gpu_prof_pending_segments_.size(); ++i) {
++        const GpuProfSegment& seg = gpu_prof_pending_segments_[i - 1];
++        const double d = ms(t[i - 1], t[i]);
++        loads += seg.loads;
++        batches += seg.batches;
++        if (seg.loads) {
++          t_load += d, ++n_load;
++        } else if (seg.uploads) {
++          t_upload += d, ++n_upload;
++        } else if (seg.batches) {
++          t_batch += d, ++n_batch;
++        } else {
++          t_clean += d, ++n_clean;
++        }
++      }
++      REXGPU_INFO("NG2 GPU by kind: with texture load {:.3f} ms ({} segs, {} loads) | with upload "
++                  "{:.3f} ms ({}) | other barriers {:.3f} ms ({}) | clean {:.3f} ms ({}, {:.2f} "
++                  "us each) | batches {}",
++                  t_load, n_load, loads, t_upload, n_upload, t_batch, n_batch, t_clean, n_clean,
++                  n_clean ? t_clean * 1000.0 / n_clean : 0.0, batches);
++    }
 +    // Totals per shader pair (+ target size), most expensive first.
 +    struct Total { double ms = 0; uint32_t draws = 0; uint32_t pitch = 0; float vw = 0, vh = 0; };
 +    std::unordered_map<std::string, Total> totals;
@@ -1291,15 +1535,46 @@ index 19874a5..68c5c4c 100644
        CanEndSubmissionImmediately()) {
      EndSubmission(false);
    }
-@@ -2283,6 +2485,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+@@ -2283,6 +2570,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
      // Special copy handling.
      return IssueCopy();
    }
 +  if (gpu_prof_active_) GpuProfOnDraw();  // NG2 DIAG
++  ng2prof::DrawTimer ng2_draw;              // NG2 DIAG: CPU phases (diag_cpu_prof)
  
    bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
  
-@@ -2411,7 +2614,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+@@ -2330,6 +2619,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+   if (!BeginSubmission(true)) {
+     return false;
+   }
++  ng2_draw.Mark(ng2prof::kDrawSetup);
+ 
+   // Process primitives.
+   PrimitiveProcessor::ProcessingResult primitive_processing_result;
+@@ -2341,6 +2631,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+     return true;
+   }
+ 
++  ng2_draw.Mark(ng2prof::kDrawPrimitives);
+   reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
+ 
+   // Shader modifications.
+@@ -2368,6 +2659,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+                                     normalized_color_mask, *vertex_shader)) {
+     return false;
+   }
++  ng2_draw.Mark(ng2prof::kDrawRtCache);
+ 
+   // Create the pipeline (for this, need the actually used render target formats
+   // from the render target cache), translating the shaders - doing this now to
+@@ -2407,11 +2699,15 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+   uint32_t used_texture_mask =
+       vertex_shader->GetUsedTextureMaskAfterTranslation() |
+       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
++  ng2_draw.Mark(ng2prof::kDrawPipeline);
+   texture_cache_->RequestTextures(used_texture_mask);
++  ng2_draw.Mark(ng2prof::kDrawTextures);
  
    // Bind the pipeline after configuring it and doing everything that may bind
    // other pipelines.
@@ -1309,7 +1584,29 @@ index 19874a5..68c5c4c 100644
      deferred_command_list_.SetPipelineStateHandle(reinterpret_cast<void*>(pipeline_handle));
      current_guest_pipeline_ = pipeline_handle;
      current_external_pipeline_ = nullptr;
-@@ -2511,7 +2716,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+@@ -2461,6 +2757,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+ 
+   // Update viewport, scissor, blend factor and stencil reference.
+   UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal, normalized_depth_control);
++  ng2_draw.Mark(ng2prof::kDrawFixedFunc);
+ 
+   // Update system constants before uploading them.
+   // TODO(Triang3l): With ROV, pass the disabled render target mask for safety.
+@@ -2468,11 +2765,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+                              primitive_processing_result.line_loop_closing_index,
+                              primitive_processing_result.host_shader_index_endian, viewport_info,
+                              used_texture_mask, normalized_depth_control, normalized_color_mask);
++  ng2_draw.Mark(ng2prof::kDrawSysConsts);
+ 
+   // Update constant buffers, descriptors and root parameters.
+   if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used)) {
+     return false;
+   }
++  ng2_draw.Mark(ng2prof::kDrawBindings);
+   // Must not call anything that can change the descriptor heap from now on!
+ 
+   // Ensure vertex buffers are resident.
+@@ -2511,7 +2810,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
          vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
          continue;
        }
@@ -1322,7 +1619,38 @@ index 19874a5..68c5c4c 100644
          REXGPU_ERROR(
              "Failed to request vertex buffer at 0x{:08X} (size {}) in the "
              "shared memory",
-@@ -2880,8 +3089,10 @@ bool D3D12CommandProcessor::IssueCopy() {
+@@ -2553,6 +2856,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+     }
+   }
+ 
++  ng2_draw.Mark(ng2prof::kDrawVertexBuffers);
+   // Primitive topology.
+   D3D_PRIMITIVE_TOPOLOGY primitive_topology;
+   if (primitive_processing_result.IsTessellated()) {
+@@ -2693,6 +2997,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+       ReleaseScratchGPUBuffer(scratch_index_buffer, D3D12_RESOURCE_STATE_INDEX_BUFFER);
+     }
+   }
++  ng2_draw.Mark(ng2prof::kDrawSubmit);
+ 
+   if (memexport_used) {
+     // Make sure this memexporting draw is ordered with other work using shared
+@@ -2874,14 +3179,25 @@ bool D3D12CommandProcessor::IssueCopy() {
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
++  ng2prof::Scope ng2_scope(ng2prof::kCopy);  // NG2 DIAG
++  if (ng2prof::g.enabled) ++ng2prof::g.copies;
++  if (g_ng2_log_frame_work) {  // NG2 DIAG
++    const RegisterFile& r = *register_file_;
++    REXGPU_INFO("NG2 frame work: resolve dest {:08X} pitch {:08X} info {:08X} ctl {:08X} surface {:08X}",
++                r.values[XE_GPU_REG_RB_COPY_DEST_BASE], r.values[XE_GPU_REG_RB_COPY_DEST_PITCH],
++                r.values[XE_GPU_REG_RB_COPY_DEST_INFO], r.values[XE_GPU_REG_RB_COPY_CONTROL],
++                r.values[XE_GPU_REG_RB_SURFACE_INFO]);
++  }
+   if (!BeginSubmission(true)) {
+     return false;
+   }
    ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
    if (readback_mode == ReadbackResolveMode::kDisabled) {
      uint32_t written_address, written_length;
@@ -1335,7 +1663,7 @@ index 19874a5..68c5c4c 100644
    }
    return IssueCopy_ReadbackResolvePath();
  }
-@@ -3092,6 +3303,13 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
+@@ -3092,6 +3408,13 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
    bool should_copy = (readback_mode == ReadbackResolveMode::kSome) ? is_cache_miss : true;
    if (should_copy && rb.buffers[read_index] && written_length <= rb.sizes[read_index] &&
        rb.mapped_data[read_index]) {
@@ -1349,6 +1677,50 @@ index 19874a5..68c5c4c 100644
      uint8_t* destination = memory_->TranslatePhysical(written_address);
      if (destination) {
        std::memcpy(destination, static_cast<uint8_t*>(rb.mapped_data[read_index]), written_length);
+@@ -3118,6 +3441,7 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
+                     SUCCEEDED(queue_operations_since_submission_fence_->SetEventOnCompletion(
+                         fence_value, fence_completion_event_)))) {
+         PROFILE_CMD_BUFFER_STALL();
++        ng2prof::Scope ng2_wait(ng2prof::kFenceWait);  // NG2 DIAG
+         WaitForSingleObject(fence_completion_event_, INFINITE);
+         queue_operations_done_since_submission_signal_ = false;
+       } else {
+@@ -3137,6 +3461,7 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
+     if (SUCCEEDED(
+             submission_fence_->SetEventOnCompletion(await_submission, fence_completion_event_))) {
+       PROFILE_CMD_BUFFER_STALL();
++      ng2prof::Scope ng2_wait(ng2prof::kFenceWait);  // NG2 DIAG
+       WaitForSingleObject(fence_completion_event_, INFINITE);
+       submission_completed_ = submission_fence_->GetCompletedValue();
+     }
+@@ -3372,6 +3697,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
+ }
+ 
+ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
++  ng2prof::Scope ng2_scope(ng2prof::kEndSubmission);  // NG2 DIAG
+   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+ 
+   // Make sure there is a command allocator to write commands to.
+@@ -3424,11 +3750,14 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+     ID3D12CommandAllocator* command_allocator =
+         command_allocator_writable_first_->command_allocator;
+     command_allocator->Reset();
+-    command_list_->Reset(command_allocator, nullptr);
+-    deferred_command_list_.Execute(command_list_, command_list_1_);
+-    command_list_->Close();
+-    ID3D12CommandList* execute_command_lists[] = {command_list_};
+-    direct_queue->ExecuteCommandLists(1, execute_command_lists);
++    {
++      ng2prof::Scope ng2_exec(ng2prof::kExecute);  // NG2 DIAG
++      command_list_->Reset(command_allocator, nullptr);
++      deferred_command_list_.Execute(command_list_, command_list_1_);
++      command_list_->Close();
++      ID3D12CommandList* execute_command_lists[] = {command_list_};
++      direct_queue->ExecuteCommandLists(1, execute_command_lists);
++    }
+     command_allocator_writable_first_->last_usage_submission = submission_current_;
+     if (command_allocator_submitted_last_) {
+       command_allocator_submitted_last_->next = command_allocator_writable_first_;
 diff --git a/src/graphics/d3d12/pipeline_cache.cpp b/src/graphics/d3d12/pipeline_cache.cpp
 index 8e6b854..bfd5681 100644
 --- a/src/graphics/d3d12/pipeline_cache.cpp
@@ -1460,10 +1832,10 @@ index 8e6b854..bfd5681 100644
  }
  
 diff --git a/src/graphics/d3d12/shared_memory.cpp b/src/graphics/d3d12/shared_memory.cpp
-index a5c97a0..d3cd54a 100644
+index a5c97a0..73457dc 100644
 --- a/src/graphics/d3d12/shared_memory.cpp
 +++ b/src/graphics/d3d12/shared_memory.cpp
-@@ -25,6 +25,17 @@ REXCVAR_DEFINE_BOOL(d3d12_tiled_shared_memory, true, "GPU/D3D12",
+@@ -25,6 +25,18 @@ REXCVAR_DEFINE_BOOL(d3d12_tiled_shared_memory, true, "GPU/D3D12",
                      "Use tiled shared memory on D3D12")
      .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
  
@@ -1476,12 +1848,13 @@ index a5c97a0..d3cd54a 100644
 +  uint64_t pipeline_changes = 0, draws = 0;
 +};
 +extern Ng2GpuWork g_ng2_gpu_work;
++extern bool g_ng2_log_frame_work;
 +}  // namespace rex::graphics::d3d12
 +
  namespace rex::graphics::d3d12 {
  
  D3D12SharedMemory::D3D12SharedMemory(D3D12CommandProcessor& command_processor,
-@@ -309,7 +320,10 @@ bool D3D12SharedMemory::UploadRanges(
+@@ -309,7 +321,14 @@ bool D3D12SharedMemory::UploadRanges(
    CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
    command_processor_.SubmitBarriers();
    auto& command_list = command_processor_.GetDeferredCommandList();
@@ -1489,14 +1862,18 @@ index a5c97a0..d3cd54a 100644
    for (auto upload_range : upload_page_ranges) {
 +    ++g_ng2_gpu_work.upload_ranges;
 +    g_ng2_gpu_work.upload_bytes += uint64_t(upload_range.second) << page_size_log2();
++    if (g_ng2_log_frame_work) {  // NG2 DIAG
++      REXGPU_INFO("NG2 frame work: upload {:08X} + {} KB", upload_range.first << page_size_log2(),
++                  (upload_range.second << page_size_log2()) >> 10);
++    }
      uint32_t upload_range_start = upload_range.first;
      uint32_t upload_range_length = upload_range.second;
      while (upload_range_length != 0) {
 diff --git a/src/graphics/d3d12/texture_cache.cpp b/src/graphics/d3d12/texture_cache.cpp
-index 2be0e8e..1666003 100644
+index 2be0e8e..121ee45 100644
 --- a/src/graphics/d3d12/texture_cache.cpp
 +++ b/src/graphics/d3d12/texture_cache.cpp
-@@ -32,6 +32,17 @@
+@@ -32,6 +32,18 @@
  #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
  #include <rex/ui/d3d12/d3d12_util.h>
  
@@ -1509,19 +1886,31 @@ index 2be0e8e..1666003 100644
 +  uint64_t pipeline_changes = 0, draws = 0;
 +};
 +extern Ng2GpuWork g_ng2_gpu_work;
++extern bool g_ng2_log_frame_work;
 +}  // namespace rex::graphics::d3d12
 +
  namespace rex::graphics::d3d12 {
  
  // Generated with `xb buildshaders`.
-@@ -1559,6 +1570,7 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
+@@ -1559,8 +1571,18 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
  
  bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                                bool load_mips) {
 +  ++g_ng2_gpu_work.texture_loads;  // NG2 DIAG
    D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
    TextureKey texture_key = d3d12_texture.key();
++  if (g_ng2_log_frame_work) {  // NG2 DIAG
++    REXGPU_INFO("NG2 frame work: texture load base {:08X} mips {:08X} {}x{}x{} fmt {} tiled {} "
++                "scaled {} mip_max {} base {} mips {} size {} B",
++                texture_key.base_page << 12, texture_key.mip_page << 12, texture_key.GetWidth(),
++                texture_key.GetHeight(), texture_key.GetDepthOrArraySize(),
++                uint32_t(texture_key.format), uint32_t(texture_key.tiled),
++                uint32_t(texture_key.scaled_resolve), uint32_t(texture_key.mip_max_level),
++                load_base, load_mips, d3d12_texture.GetGuestBaseSize());
++  }
  
+   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
+   ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
 diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
 index 8f2fcb0..24aca99 100644
 --- a/src/graphics/graphics_system.cpp
@@ -1750,6 +2139,104 @@ index 8f2fcb0..24aca99 100644
  void GraphicsSystem::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                               uint32_t title_id, bool blocking) {
    if (!REXCVAR_GET(store_shaders)) {
+diff --git a/src/graphics/ng2_cpu_prof.h b/src/graphics/ng2_cpu_prof.h
+new file mode 100644
+index 0000000..dc4a202
+--- /dev/null
++++ b/src/graphics/ng2_cpu_prof.h
+@@ -0,0 +1,92 @@
++// NG2 DIAG: CPU time of the GPU command processor thread, split by phase (cvar diag_cpu_prof).
++// Uses rdtsc; ticks are converted to ms with a steady_clock calibration at each report.
++// Nested scopes (e.g. EndSubmission inside a draw) are excluded from the enclosing phase.
++#pragma once
++
++#include <cstdint>
++#include <intrin.h>
++
++namespace rex::graphics::ng2prof {
++
++enum Phase : uint32_t {
++  kDrawSetup,          // shader analysis, BeginSubmission
++  kDrawPrimitives,     // PrimitiveProcessor::Process (index conversion / guest DMA)
++  kDrawRtCache,        // RenderTargetCache::Update
++  kDrawPipeline,       // shader translation lookup + ConfigurePipeline
++  kDrawTextures,       // TextureCache::RequestTextures
++  kDrawFixedFunc,      // pipeline bind, viewport / scissor / fixed-function state
++  kDrawSysConsts,      // UpdateSystemConstantValues
++  kDrawBindings,       // UpdateBindings (constant buffers, descriptors, root params)
++  kDrawVertexBuffers,  // vertex buffer + memexport residency (shared memory requests)
++  kDrawSubmit,         // topology, index buffer, barriers, draw recording
++  kDrawOther,          // early returns / tail
++  kCopy,               // IssueCopy (resolves)
++  kSwap,               // IssueSwap (presenter hand-over)
++  kEndSubmission,      // EndSubmission minus the deferred list replay
++  kExecute,            // DeferredCommandList::Execute + ExecuteCommandLists
++  kIbCheck,            // NG2 DIAG indirect buffer well-formedness pre-walk
++  kPm4Type0,           // type-0 packets (register writes)
++  kPm4Type3,           // type-3 packets other than draws / copies / swaps (constants, events...)
++  kFenceWait,          // CPU waiting for the GPU (submission fence)
++  kWaitRegMem,         // PM4 WAIT_REG_MEM sleeps (waiting for the guest)
++  kIdle,               // ring empty (waiting for the guest)
++  kCount
++};
++
++inline const char* PhaseName(uint32_t p) {
++  static const char* const names[kCount] = {
++      "draw.setup", "draw.primitives", "draw.rt_cache", "draw.pipeline", "draw.textures",
++      "draw.fixed_func", "draw.sys_consts", "draw.bindings", "draw.vertex_buffers",
++      "draw.submit", "draw.other", "copy", "swap", "end_submission", "execute",
++      "ib_check", "pm4_type0", "pm4_type3",
++      "fence_wait", "wait_reg_mem", "idle"};
++  return p < kCount ? names[p] : "?";
++}
++
++struct State {
++  bool enabled = false;
++  uint64_t acc[kCount] = {};
++  uint64_t nested = 0;  // ticks already attributed by scopes (excluded from enclosing ones)
++  uint64_t draws = 0, copies = 0;
++};
++extern State g;
++
++inline uint64_t Now() { return __rdtsc(); }
++
++struct Scope {
++  Phase phase;
++  uint64_t start, nested_start;
++  explicit Scope(Phase p) : phase(p), start(g.enabled ? Now() : 0), nested_start(g.nested) {}
++  ~Scope() {
++    if (!start) return;
++    const uint64_t dur = Now() - start;
++    const uint64_t inner = g.nested - nested_start;
++    const uint64_t self = dur > inner ? dur - inner : 0;
++    g.acc[phase] += self;
++    g.nested += self;
++  }
++};
++
++// Sequential phases of one draw: Mark(p) charges the time since the previous mark to p.
++struct DrawTimer {
++  uint64_t last, nested_last;
++  DrawTimer() : last(g.enabled ? Now() : 0), nested_last(g.nested) {
++    if (last) ++g.draws;
++  }
++  void Mark(Phase p) {
++    if (!last) return;
++    const uint64_t n = Now();
++    const uint64_t inner = g.nested - nested_last;
++    const uint64_t self = (n - last) > inner ? (n - last) - inner : 0;
++    g.acc[p] += self;
++    g.nested += self;
++    last = n;
++    nested_last = g.nested;
++  }
++  ~DrawTimer() { Mark(kDrawOther); }
++};
++
++// Called once per guest swap: refreshes `enabled` from the cvar and logs every N frames.
++void OnSwap();
++
++}  // namespace rex::graphics::ng2prof
 diff --git a/src/graphics/primitive_processor.cpp b/src/graphics/primitive_processor.cpp
 index d49e9c3..6f97694 100644
 --- a/src/graphics/primitive_processor.cpp
