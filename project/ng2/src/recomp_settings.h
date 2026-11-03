@@ -199,6 +199,7 @@ class RecompOptionsPane : public rex::ui::ImGuiDialog {
   RecompSettings startup_;  // values the running session started with (restart checks)
   PadInput pad_;
   int64_t pane_since_ms_ = 0;
+  int64_t pane_last_visible_ms_ = 0;  // last frame the pane was shown (gap tolerance)
   bool focused_ = false;
   int category_ = 0;
   int row_ = 0;

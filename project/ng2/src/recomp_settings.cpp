@@ -36,11 +36,16 @@
 #pragma comment(lib, "shell32.lib")
 
 bool Ng2IngameRecompRowSelected();  // ng2_hooks.cpp
+int64_t Ng2IngameMenuHiddenMs();     // ng2_hooks.cpp
 
 REXCVAR_DEFINE_BOOL(ng2_prompt_device_diag, false, "NG2",
                     "Log what switches button prompts between controller and keyboard");
 
 namespace ng2 {
+
+int CurrentPromptStyle();  // ps_prompts.cpp
+bool PromptsUseKeyboard();
+
 namespace {
 
 // ---- helpers -----------------------------------------------------------------------
@@ -1502,11 +1507,26 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
     pad_.accept = false;  // this press only opens the panel
     Ng2QueueSystemSound(kSoundCursor);
   }
-  if (!overlay_open_ && !pane_visible_()) {
-    pane_since_ms_ = 0;
-    if (focused_) {
-      focused_ = false;
-      g_pane_focused = false;
+  // The in-game overlay belongs to the in-game menu: if that menu is gone for a while (game
+  // resumed, quit to title) close it, or a stale overlay_open_ showed the pane at the main
+  // menu with no cursor and no way in (user report).
+  if (overlay_open_ && Ng2IngameMenuHiddenMs() > 400) {
+    REXLOG_INFO("RECOMP SETTINGS: in-game menu gone, closing the overlay");
+    overlay_open_ = false;
+  }
+  // Main-menu pane: visible while the game draws the highlighted item. A frame-time spike or
+  // a menu animation can skip that for a moment; only treat a gap over 400 ms as leaving, so
+  // focus and the 250 ms entry guard aren't reset by hiccups (pane showed, A did nothing).
+  const bool visible_now = overlay_open_ || pane_visible_();
+  if (visible_now) pane_last_visible_ms_ = NowMs();
+  if (!visible_now) {
+    if (NowMs() - pane_last_visible_ms_ > 400) {
+      pane_since_ms_ = 0;
+      if (focused_) {
+        REXLOG_INFO("RECOMP SETTINGS: pane closed (item no longer shown), focus released");
+        focused_ = false;
+        g_pane_focused = false;
+      }
     }
     return;
   }
@@ -1852,6 +1872,9 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
       focused_ = true;
       g_pane_focused = true;
       row_ = 0;
+      REXLOG_INFO("RECOMP SETTINGS: pane focused (main menu)");
+    } else if (pad_.accept) {
+      REXLOG_INFO("RECOMP SETTINGS: accept ignored, pane shown {} ms ago", now - pane_since_ms_);
     }
   } else if (capture_bind_ >= 0) {
     // Key capture for a binding row: wait until everything is released, then take the next
@@ -1956,10 +1979,32 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
     text_at(X(0.127f), vp.y + vp.h * 0.100f, kWhite, "RECOMP SETTINGS", false, vp.h * 0.05f);
     dl->AddLine(ImVec2(X(0.127f), vp.y + vp.h * 0.135f), ImVec2(X(0.930f), vp.y + vp.h * 0.135f),
                 IM_COL32(150, 140, 150, 160), std::max(1.0f, vp.h * 0.002f));
-    const float hx = X(0.865f), hy = vp.y + vp.h * 0.853f;
-    dl->AddCircleFilled(ImVec2(hx, hy), px * 0.45f, IM_COL32(176, 22, 18, 255));
-    text_at(hx, hy, kWhite, "B", true, px * 0.62f);
-    text_at(hx + px * 0.75f, hy, kWhite, "Back", false, px);
+    // "Back" hint in the current prompt style (keys, Xbox B, PS4 / PS5 Circle).
+    const float hx = X(0.865f), hy = vp.y + vp.h * 0.853f, r = px * 0.45f;
+    float label_x = hx + px * 0.75f;
+    if (PromptsUseKeyboard()) {
+      const char* key = "Esc";
+      const ImVec2 ks = font->CalcTextSizeA(px * 0.55f, FLT_MAX, 0.0f, key);
+      const float w = ks.x + px * 0.4f, h = px * 0.8f;
+      dl->AddRectFilled(ImVec2(hx - w * 0.5f, hy - h * 0.5f), ImVec2(hx + w * 0.5f, hy + h * 0.5f),
+                        IM_COL32(20, 14, 14, 200), h * 0.25f);
+      dl->AddRect(ImVec2(hx - w * 0.5f, hy - h * 0.5f), ImVec2(hx + w * 0.5f, hy + h * 0.5f),
+                  IM_COL32(220, 210, 200, 230), h * 0.25f, 0, std::max(1.0f, h * 0.06f));
+      text_at(hx, hy, kWhite, key, true, px * 0.55f);
+      label_x = hx + w * 0.5f + px * 0.3f;
+    } else if (const int style = CurrentPromptStyle(); style == 2) {  // PS5: light, grey symbol
+      dl->AddCircleFilled(ImVec2(hx, hy), r, IM_COL32(205, 205, 205, 255));
+      dl->AddCircle(ImVec2(hx, hy), r, IM_COL32(120, 120, 120, 255), 0, std::max(1.0f, r * 0.10f));
+      dl->AddCircle(ImVec2(hx, hy), r * 0.52f, IM_COL32(95, 95, 95, 255), 0, std::max(1.5f, r * 0.15f));
+    } else if (style == 1) {  // PS4: dark, red symbol
+      dl->AddCircleFilled(ImVec2(hx, hy), r, IM_COL32(32, 32, 34, 255));
+      dl->AddCircle(ImVec2(hx, hy), r, IM_COL32(90, 90, 95, 255), 0, std::max(1.0f, r * 0.10f));
+      dl->AddCircle(ImVec2(hx, hy), r * 0.52f, IM_COL32(232, 60, 72, 255), 0, std::max(1.5f, r * 0.15f));
+    } else {  // Xbox 360 B
+      dl->AddCircleFilled(ImVec2(hx, hy), r, IM_COL32(176, 22, 18, 255));
+      text_at(hx, hy, kWhite, "B", true, px * 0.62f);
+    }
+    text_at(label_x, hy, kWhite, "Back", false, px);
   }
 
   // The row list can change after input (category switch), so rebuild-free drawing uses

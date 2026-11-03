@@ -1093,6 +1093,9 @@ void Ng2IngameMenuFrame(bool drawn) {
   }
 }
 
+// Milliseconds since the in-game (pause) menu was last drawn.
+int64_t Ng2IngameMenuHiddenMs() { return NowMs() - g_ingame_visible_ms.load(); }
+
 // True while the in-game menu is on screen with its cursor on Recomp Settings.
 bool Ng2IngameRecompRowSelected() {
   const uint32_t menu = g_ingame_menu.load();

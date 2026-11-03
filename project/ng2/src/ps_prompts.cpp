@@ -368,10 +368,13 @@ void Write(const Sheet& s, const std::vector<uint8_t>& idx, const std::vector<ui
     mem->TriggerPhysicalMemoryCallbacks(rex::thread::global_critical_region::AcquireDirect(),
                                         s.idx_addr, uint32_t(idx.size()), true, false, true);
   };
-  invalidate();
+  invalidate();  // unprotects watched pages so the copy below can't fault
   std::memcpy(Host(s.pal_addr), pal.data(), pal.size());
   std::memcpy(Host(s.idx_addr), idx.data(), idx.size());
-  invalidate();  // in case the GPU reloaded the old pixels in between
+  // Then drop the GPU's copies outright: after the first swap the pages are no longer watched,
+  // and the watch path alone ignored every later swap (user: "only worked once").
+  mem->InvalidatePhysicalMemoryRange(s.pal_addr - 0xA0000000u, uint32_t(pal.size()));
+  mem->InvalidatePhysicalMemoryRange(s.idx_addr - 0xA0000000u, uint32_t(idx.size()));
 }
 
 }  // namespace
@@ -417,6 +420,9 @@ static void Apply(int want) {
 }
 
 static std::atomic<int> g_want{0};
+
+// Prompt style in use (0 Xbox, 1 PS4, 2 PS5), for prompts the app draws itself.
+int CurrentPromptStyle() { return g_want.load(); }
 
 // UI thread, once per frame. want: 0 Xbox, 1 PS4 (and older), 2 PS5.
 void UpdatePlayStationPrompts(int want) {

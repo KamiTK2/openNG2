@@ -287,6 +287,23 @@ index d54df86..4542853 100644
    // One-shot convenience for callers that don't care about the split.
    X_STATUS Setup(runtime::FunctionDispatcher* function_dispatcher, KernelState* kernel_state,
                   ui::WindowedAppContext* app_context, bool with_presentation) {
+diff --git a/include/rex/system/xmemory.h b/include/rex/system/xmemory.h
+index 0c39a42..fc9d353 100644
+--- a/include/rex/system/xmemory.h
++++ b/include/rex/system/xmemory.h
+@@ -510,6 +510,12 @@ class Memory {
+       std::unique_lock<std::recursive_mutex> global_lock_locked_once, uint32_t virtual_address,
+       uint32_t length, bool is_write, bool unwatch_exact_range, bool unprotect = true);
+ 
++  // NG2 ADDITION: tells every invalidation callback (the GPU shared memory and through it the
++  // texture cache) that host code rewrote [physical_address, +length), whether or not the
++  // pages are watched right now. TriggerPhysicalMemoryCallbacks does nothing for unwatched
++  // pages, so a second host-side rewrite of a texture was never seen.
++  void InvalidatePhysicalMemoryRange(uint32_t physical_address, uint32_t length);
++
+   // Allocates virtual memory from the 'system' heap.
+   // System memory is kept separate from game memory but is still accessible
+   // using normal guest virtual addresses. Kernel structures and other internal
 diff --git a/include/rex/ui/d3d12/d3d12_frame_interpolator.h b/include/rex/ui/d3d12/d3d12_frame_interpolator.h
 new file mode 100644
 index 0000000..a3fe6d0
@@ -3134,6 +3151,25 @@ index f4e0efd..0e91e60 100644
      }
  
      uint64_t filetime = CurrentFileTime();
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 76cc877..a06e5a3 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -656,6 +656,14 @@ bool Memory::TriggerPhysicalMemoryCallbacks(
+   return false;
+ }
+ 
++void Memory::InvalidatePhysicalMemoryRange(uint32_t physical_address, uint32_t length) {
++  if (!length) return;
++  auto lock = global_critical_region_.Acquire();
++  for (auto invalidation_callback : physical_memory_invalidation_callbacks_) {
++    invalidation_callback->first(invalidation_callback->second, physical_address, length, true);
++  }
++}
++
+ void* Memory::RegisterPhysicalMemoryInvalidationCallback(
+     PhysicalMemoryInvalidationCallback callback, void* callback_context) {
+   auto entry = new std::pair<PhysicalMemoryInvalidationCallback, void*>(callback, callback_context);
 diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
 index 77bce25..00412cf 100644
 --- a/src/system/xthread.cpp
