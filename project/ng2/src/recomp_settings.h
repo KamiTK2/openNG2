@@ -200,7 +200,8 @@ class RecompOptionsPane : public rex::ui::ImGuiDialog {
   PadInput pad_;
   int64_t pane_since_ms_ = 0;
   int64_t pane_last_visible_ms_ = 0;  // last frame the pane was shown (gap tolerance)
-  int64_t quit_armed_until_ms_ = 0;   // Quit to Desktop: second A before this quits
+  int64_t quit_armed_until_ms_ = 0;   // main menu Quit to Desktop: second Y before this quits
+  void UpdateQuitToDesktop(const ImGuiIO& io);
   bool focused_ = false;
   int category_ = 0;
   int row_ = 0;

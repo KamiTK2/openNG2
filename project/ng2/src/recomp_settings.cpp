@@ -37,6 +37,7 @@
 
 bool Ng2IngameRecompRowSelected();  // ng2_hooks.cpp
 int64_t Ng2IngameMenuHiddenMs();     // ng2_hooks.cpp
+bool Ng2MainMenuExitSelected();      // ng2_hooks.cpp: main menu up, cursor on EXIT TO DESKTOP
 
 REXCVAR_DEFINE_BOOL(ng2_prompt_device_diag, false, "NG2",
                     "Log what switches button prompts between controller and keyboard");
@@ -138,6 +139,7 @@ std::atomic<bool> g_invert_y{false};
 std::atomic<int> g_deadzone_pct{0};
 std::atomic<int> g_vibration_pct{100};
 std::atomic<int> g_button_prompts{0};
+std::atomic<uint32_t> g_quit_presses{0};  // A presses on the main menu's EXIT TO DESKTOP item
 std::atomic<bool> g_pause_in_background{false};
 std::atomic<uint64_t> g_game_frames{0};
 
@@ -524,6 +526,16 @@ void InstallRecompInputFilters() {
           }
         }
       }
+    }
+    // Main menu EXIT TO DESKTOP (the Xbox LIVE Marketplace item): the game never sees A on it,
+    // so it doesn't open Marketplace / the sign-in message; each new press is counted for the
+    // pane's confirm step (keyboard Enter is A here, added above).
+    if (Ng2MainMenuExitSelected() && !RecompSettingsBlocksGameInput()) {
+      static bool a_was_down[4] = {};
+      const bool a = (uint16_t(g.buttons) & XINPUT_GAMEPAD_A) != 0;
+      if (a && !a_was_down[user_index & 3]) g_quit_presses.fetch_add(1);
+      a_was_down[user_index & 3] = a;
+      g.buttons = uint16_t(uint16_t(g.buttons) & ~XINPUT_GAMEPAD_A);
     }
     const int dz = g_deadzone_pct.load();
     if (dz > 0) {
@@ -1456,11 +1468,47 @@ static void DrawShaderProgress(ImGuiIO& io) {
   dl->AddText(f, ns, ImVec2((ds.x - nts.x) * 0.5f, b.y + ns), IM_COL32(150, 140, 130, 255), note);
 }
 
+// Main menu EXIT TO DESKTOP (GitHub #7; the Xbox LIVE Marketplace item, label swapped in
+// ps_prompts.cpp). First A asks, a second within 3 s closes the game like its close button.
+void RecompOptionsPane::UpdateQuitToDesktop(const ImGuiIO& io) {
+  static uint32_t seen = g_quit_presses.load();
+  const uint32_t presses = g_quit_presses.load();
+  const int64_t now = NowMs();
+  if (!Ng2MainMenuExitSelected()) quit_armed_until_ms_ = 0;  // moved off the item / left the menu
+  if (presses != seen) {
+    seen = presses;
+    if (now < quit_armed_until_ms_) {
+      REXLOG_INFO("RECOMP SETTINGS: quit to desktop (main menu)");
+      HWND h = window_ ? static_cast<HWND>(window_->GetNativeWindowHandle()) : nullptr;
+      if (h) PostMessageW(h, WM_CLOSE, 0, 0);
+      quit_armed_until_ms_ = 0;
+    } else {
+      quit_armed_until_ms_ = now + 3000;
+      Ng2QueueSystemSound(kSoundCursor);
+    }
+  }
+  if (now >= quit_armed_until_ms_) return;
+  const int style = PromptsUseKeyboard() ? -1 : CurrentPromptStyle();
+  const char* button = style < 0 ? "Enter" : style == 0 ? "A" : "Cross";
+  char text[96];
+  std::snprintf(text, sizeof(text), "Press %s again to quit to the desktop", button);
+  ImFont* font = g_serif_font ? g_serif_font : ImGui::GetFont();
+  const float size = io.DisplaySize.y * 0.032f;
+  const ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, 0.0f, text);
+  const ImVec2 c(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f);
+  ImDrawList* dl = ImGui::GetForegroundDrawList();
+  dl->AddRectFilled(ImVec2(c.x - ts.x * 0.5f - size, c.y - ts.y * 0.5f - size * 0.6f),
+                    ImVec2(c.x + ts.x * 0.5f + size, c.y + ts.y * 0.5f + size * 0.6f),
+                    IM_COL32(10, 5, 12, 230), size * 0.3f);
+  dl->AddText(font, size, ImVec2(c.x - ts.x * 0.5f, c.y - ts.y * 0.5f), IM_COL32(240, 232, 220, 255), text);
+}
+
 void RecompOptionsPane::OnDraw(ImGuiIO& io) {
   pad_.Poll();
   DrawShaderProgress(io);
   UpdatePromptDevice(io, window_);
   DrawPromptGlyphs(io);
+  UpdateQuitToDesktop(io);
   if (const char* aspect_test = Ng2AspectTestModeName()) {  // NG2 DIAG (ng2_aspect_cycle)
     ImFont* f = g_serif_font ? g_serif_font : ImGui::GetFont();
     const float size = io.DisplaySize.y * 0.03f;
@@ -1855,20 +1903,6 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
                           return false;
                         }});
       }
-      // GitHub #7: a way out without the window's close button (fullscreen, controller).
-      // A twice, like Restore Backup; unsaved progress is lost as with the game's Quit Game.
-      action_row("Quit to Desktop", [this] {
-        if (NowMs() < quit_armed_until_ms_) {
-          REXLOG_INFO("RECOMP SETTINGS: quit to desktop");
-          HWND h = window_ ? static_cast<HWND>(window_->GetNativeWindowHandle()) : nullptr;
-          if (h) PostMessageW(h, WM_CLOSE, 0, 0);
-        } else {
-          quit_armed_until_ms_ = NowMs() + 4000;
-          status_ = "Press A again to quit to the desktop (unsaved progress is lost).";
-          status_until_ms_ = quit_armed_until_ms_;
-        }
-        return false;
-      });
       break;
     }
   }

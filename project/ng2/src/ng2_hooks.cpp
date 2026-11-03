@@ -1752,6 +1752,19 @@ uint32_t RewritePromptString(uint32_t src) {
 }
 }  // namespace
 
+// Main menu (NEW GAME ... Xbox LIVE Marketplace): item count at 0x853A4A60 (7), cursor at
+// +4 (0..6, 6 = the Marketplace item, now EXIT TO DESKTOP), and a float at +8 that is 1.0
+// while the menu is up (0 at the title screen and in gameplay). Found by memory diffs with the
+// cursor on items 6, 5, 4 (mainmenu*.bin) against title.bin / options.bin.
+bool Ng2MainMenuExitSelected() {
+  constexpr uint32_t kMenu = 0x853A4A60;
+  if (GuestLoadU32(kMenu) != 7 || GuestLoadU32(kMenu + 4) != 6) return false;
+  const uint32_t up = GuestLoadU32(kMenu + 8);
+  float f;
+  std::memcpy(&f, &up, 4);
+  return f > 0.99f;
+}
+
 extern "C" REX_FUNC(__imp__sub_83706C20);
 extern "C" REX_FUNC(sub_83706C20) {
   const uint32_t obj = ctx.r3.u32;
