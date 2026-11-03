@@ -26,6 +26,7 @@
 #include <rex/logging.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
+#include <rex/thread/mutex.h>
 
 REXCVAR_DEFINE_INT32(ng2_playstation_prompts, 0, "NG2",
                      "PlayStation button prompts: 0 = when a PS4/PS5 pad is in use, 1 = always "
@@ -355,10 +356,22 @@ void BuildPs(Sheet& s, int ps5) {
 }
 
 void Write(const Sheet& s, const std::vector<uint8_t>& idx, const std::vector<uint8_t>& pal) {
-  // Through the 0xA0000000 view: the GPU's write watch on these pages sees it and reloads.
   if (!Readable(s.pal_addr, pal.size()) || !Readable(s.idx_addr, idx.size())) return;  // exiting
+  // Once the GPU has loaded the texture it watches these pages, and a plain write from this
+  // (non-guest) thread is neither noticed nor serviced: the prompts didn't change in game.
+  // Fire the watch callbacks first (texture cache drops its copy, pages unprotected), as the
+  // SDK's own GPU-side writes do.
+  auto* mem = REX_KERNEL_STATE()->memory();
+  auto invalidate = [&] {
+    mem->TriggerPhysicalMemoryCallbacks(rex::thread::global_critical_region::AcquireDirect(),
+                                        s.pal_addr, uint32_t(pal.size()), true, false, true);
+    mem->TriggerPhysicalMemoryCallbacks(rex::thread::global_critical_region::AcquireDirect(),
+                                        s.idx_addr, uint32_t(idx.size()), true, false, true);
+  };
+  invalidate();
   std::memcpy(Host(s.pal_addr), pal.data(), pal.size());
   std::memcpy(Host(s.idx_addr), idx.data(), idx.size());
+  invalidate();  // in case the GPU reloaded the old pixels in between
 }
 
 }  // namespace
