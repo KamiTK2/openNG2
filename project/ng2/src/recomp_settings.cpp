@@ -563,9 +563,15 @@ void RecompCountGameFrame() { g_game_frames.fetch_add(1, std::memory_order_relax
 // Every connected controller: SDL's view (Xbox, PS4 / PS5 DualShock / DualSense, Switch, ...)
 // plus XInput (the only source with the xinput backend; with SDL an Xbox pad shows up in both,
 // which is harmless for these OR-ed reads).
-static std::vector<XINPUT_GAMEPAD> ConnectedPads() {
+// families (optional): per pad 0 = Xbox / other, 1 = PS4 (or older), 2 = PS5.
+static std::vector<XINPUT_GAMEPAD> ConnectedPads(std::vector<int>* families = nullptr) {
   std::vector<XINPUT_GAMEPAD> pads;
   for (const auto& p : rex::input::ReadPhysicalPads()) {
+    if (families) {
+      families->push_back(p.family == rex::input::PadFamily::kPlayStation5  ? 2
+                          : p.family == rex::input::PadFamily::kPlayStation ? 1
+                                                                            : 0);
+    }
     XINPUT_GAMEPAD g{};
     g.wButtons = uint16_t(p.gamepad.buttons);
     g.bLeftTrigger = uint8_t(p.gamepad.left_trigger);
@@ -578,7 +584,10 @@ static std::vector<XINPUT_GAMEPAD> ConnectedPads() {
   }
   for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i) {
     XINPUT_STATE st{};
-    if (XInputGetState(i, &st) == ERROR_SUCCESS) pads.push_back(st.Gamepad);
+    if (XInputGetState(i, &st) == ERROR_SUCCESS) {
+      pads.push_back(st.Gamepad);
+      if (families) families->push_back(0);
+    }
   }
   return pads;
 }
@@ -2103,16 +2112,24 @@ std::string PromptLabel(const std::string& tag, bool gameplay) {
   return {};  // symbols (ninpo kanji, shuriken, plus, ...) keep their icon
 }
 
+void UpdatePlayStationPrompts(int want);  // ps_prompts.cpp
+
 // Last input device: called once per frame from the pane (UI thread).
 void UpdatePromptDevice(const ImGuiIO& io) {
   bool pad = false;
-  const std::vector<XINPUT_GAMEPAD> pads = ConnectedPads();
-  for (const XINPUT_GAMEPAD& g : pads) {
-    if (pad) break;
+  std::vector<int> families;
+  const std::vector<XINPUT_GAMEPAD> pads = ConnectedPads(&families);
+  // PlayStation prompts follow the pad used last (at start: the first one connected).
+  static int pad_family = -1;
+  if (pad_family < 0 && !families.empty()) pad_family = families[0];
+  for (size_t i = 0; i < pads.size() && !pad; ++i) {
+    const XINPUT_GAMEPAD& g = pads[i];
     pad = g.wButtons != 0 || g.bLeftTrigger > 40 || g.bRightTrigger > 40 ||
           std::abs(int(g.sThumbLX)) > 12000 || std::abs(int(g.sThumbLY)) > 12000 ||
           std::abs(int(g.sThumbRX)) > 12000 || std::abs(int(g.sThumbRY)) > 12000;
+    if (pad) pad_family = families[i];
   }
+  UpdatePlayStationPrompts(std::max(pad_family, 0));
   // Keyboard & mouse count only on a fresh key press or real mouse travel: a key that reads as
   // held all the time (stuck VK, a key-holding tool, or a held modifier) or sub-pixel / warp
   // mouse jitter must not keep flipping prompts back to keyboard while the pad is idle.

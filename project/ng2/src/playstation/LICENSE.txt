@@ -1,0 +1,12 @@
+PlayStation button prompts (PS4_*.png, PS5_*.png) from "Xelu's FREE Controllers & Keyboard
+PROMPTS" by Nicolae "Xelu" Berbece, Those Awesome Guys: https://thoseawesomeguys.com/prompts/
+
+Released into the public domain under Creative Commons Zero (CC0 1.0):
+https://creativecommons.org/publicdomain/zero/1.0/
+"You can use all these assets in any project you want to (be it commercial or not). All of the
+assets are in the public domain under Creative Commons 0 (CC0)" (the pack's Readme.txt).
+
+Unmodified copies of the pack's 100x100 PNGs; openNG2 scales them into the game's button icon
+sheet at runtime when a PlayStation controller is in use. PlayStation and the button symbols
+are trademarks of Sony Interactive Entertainment; openNG2 is not affiliated with or endorsed
+by Sony.

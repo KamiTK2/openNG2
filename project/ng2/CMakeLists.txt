@@ -15,6 +15,7 @@ set(NG2_SOURCES
     src/main.cpp
     src/crash_handler.cpp
     src/ng2_hooks.cpp
+    src/ps_prompts.cpp
     src/recomp_settings.cpp
     src/shader_precompile.cpp
     src/update_check.cpp
@@ -40,7 +41,7 @@ if(NOT OPENNG2_VERSION)
 endif()
 set_source_files_properties(src/update_check.cpp src/recomp_settings.cpp PROPERTIES
     COMPILE_DEFINITIONS "OPENNG2_VERSION=\"${OPENNG2_VERSION}\"")
-target_link_libraries(ng2 PRIVATE winhttp)
+target_link_libraries(ng2 PRIVATE winhttp windowscodecs ole32)
 
 # NG2 DIAG: whole-program guest function counter (tools/gen_trace_all.py). Off by default.
 option(NG2_TRACE_ALL "Count guest function entries (diagnostic)" OFF)

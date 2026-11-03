@@ -1,2 +1,25 @@
 // openNG2 icon (tools/make_icon.py); SDL uses the first icon resource for the game window.
 1 ICON "openNG2.ico"
+
+// PlayStation button prompts (CC0, playstation/LICENSE.txt), loaded by ps_prompts.cpp.
+// IDs: 200 + set * 10 + button (set 0 PS4, 1 PS5; button order as in kPsButtons).
+200 RCDATA "playstation/PS4_Square.png"
+201 RCDATA "playstation/PS4_Triangle.png"
+202 RCDATA "playstation/PS4_Circle.png"
+203 RCDATA "playstation/PS4_Cross.png"
+204 RCDATA "playstation/PS4_L2.png"
+205 RCDATA "playstation/PS4_R2.png"
+206 RCDATA "playstation/PS4_L1.png"
+207 RCDATA "playstation/PS4_R1.png"
+208 RCDATA "playstation/PS4_Share.png"
+209 RCDATA "playstation/PS4_Options.png"
+210 RCDATA "playstation/PS5_Square.png"
+211 RCDATA "playstation/PS5_Triangle.png"
+212 RCDATA "playstation/PS5_Circle.png"
+213 RCDATA "playstation/PS5_Cross.png"
+214 RCDATA "playstation/PS5_L2.png"
+215 RCDATA "playstation/PS5_R2.png"
+216 RCDATA "playstation/PS5_L1.png"
+217 RCDATA "playstation/PS5_R1.png"
+218 RCDATA "playstation/PS5_Share.png"
+219 RCDATA "playstation/PS5_Options.png"

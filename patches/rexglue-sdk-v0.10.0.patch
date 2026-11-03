@@ -119,7 +119,7 @@ index 4d85a2b..524e58e 100644
    // locked when checking or updating validity of pages/ranges and when firing
 diff --git a/include/rex/input/input_filter.h b/include/rex/input/input_filter.h
 new file mode 100644
-index 0000000..040e480
+index 0000000..b88380b
 --- /dev/null
 +++ b/include/rex/input/input_filter.h
 @@ -0,0 +1,32 @@
@@ -147,7 +147,7 @@ index 0000000..040e480
 +// NG2 ADDITION: the connected physical controllers as SDL sees them (Xbox, PlayStation 4/5,
 +// Switch and others), without keyboard / mouse emulation and not blanked while the window is
 +// unfocused. For app-side menus and prompt-device detection; empty with the xinput backend.
-+enum class PadFamily : uint8_t { kXbox, kPlayStation, kNintendo, kOther };
++enum class PadFamily : uint8_t { kXbox, kPlayStation, kPlayStation5, kNintendo, kOther };
 +struct PhysicalPad {
 +  X_INPUT_GAMEPAD gamepad;
 +  PadFamily family;
@@ -2717,7 +2717,7 @@ index 3f9422d..2b3579c 100644
    has_focus_ = false;
    // Withdraw the request too, or an update queued before the focus loss grabs
 diff --git a/src/input/sdl/sdl_input_driver.cpp b/src/input/sdl/sdl_input_driver.cpp
-index c7c440d..76cbc4f 100644
+index c7c440d..a9f39f8 100644
 --- a/src/input/sdl/sdl_input_driver.cpp
 +++ b/src/input/sdl/sdl_input_driver.cpp
 @@ -9,7 +9,9 @@
@@ -2744,7 +2744,7 @@ index c7c440d..76cbc4f 100644
  
  namespace rex::input::sdl {
  
-@@ -30,8 +39,60 @@ namespace {
+@@ -30,8 +39,62 @@ namespace {
  // SDL clamps to SDL_MAX_RUMBLE_DURATION_MS, which is not a public constant.
  constexpr uint32_t kRumbleDurationMs = 0xFFFF;
  
@@ -2769,8 +2769,10 @@ index c7c440d..76cbc4f 100644
 +        break;
 +      case SDL_GAMEPAD_TYPE_PS3:
 +      case SDL_GAMEPAD_TYPE_PS4:
-+      case SDL_GAMEPAD_TYPE_PS5:
 +        pad.family = rex::input::PadFamily::kPlayStation;
++        break;
++      case SDL_GAMEPAD_TYPE_PS5:
++        pad.family = rex::input::PadFamily::kPlayStation5;
 +        break;
 +      case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO:
 +      case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
@@ -2805,7 +2807,7 @@ index c7c440d..76cbc4f 100644
  SDLInputDriver::SDLInputDriver(rex::ui::Window* window, size_t window_z_order)
      : InputDriver(window, window_z_order),
        sdl_events_initialized_(false),
-@@ -41,7 +102,10 @@ SDLInputDriver::SDLInputDriver(rex::ui::Window* window, size_t window_z_order)
+@@ -41,7 +104,10 @@ SDLInputDriver::SDLInputDriver(rex::ui::Window* window, size_t window_z_order)
        controllers_(),
        controllers_mutex_() {}
  
@@ -2817,7 +2819,7 @@ index c7c440d..76cbc4f 100644
  
  X_STATUS SDLInputDriver::Setup() {
    if (!TestSDLVersion()) {
-@@ -94,6 +158,10 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
+@@ -94,6 +160,10 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
          return;
        }
        SDL_Gamepad_initialized_ = true;
@@ -2828,7 +2830,7 @@ index c7c440d..76cbc4f 100644
  
        // Load custom controller mappings if available
        if (!REXCVAR_GET(hid_mappings_file).empty()) {
-@@ -118,6 +186,10 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
+@@ -118,6 +188,10 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
  }
  
  void SDLInputDriver::OnClosing(rex::ui::UIEvent&) {
@@ -2839,7 +2841,7 @@ index c7c440d..76cbc4f 100644
    if (attached_window_) {
      attached_window_->RemoveListener(this);
      if (sdl_pumpevents_queued_) {
-@@ -236,11 +308,30 @@ X_RESULT SDLInputDriver::SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION* vibr
+@@ -236,11 +310,30 @@ X_RESULT SDLInputDriver::SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION* vibr
      return X_ERROR_DEVICE_NOT_CONNECTED;
    }
  
@@ -2872,7 +2874,7 @@ index c7c440d..76cbc4f 100644
               ? X_ERROR_SUCCESS
               : X_ERROR_FUNCTION_FAILED;
  }
-@@ -554,8 +645,8 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
+@@ -554,8 +647,8 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
            X_INPUT_GAMEPAD_B,
            X_INPUT_GAMEPAD_X,
            X_INPUT_GAMEPAD_A,

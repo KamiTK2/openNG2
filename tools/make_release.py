@@ -63,6 +63,11 @@ THIRD_PARTY = [
     ("RenderDoc in-application API header", None,
      "renderdoc_app.h, Copyright (c) Baldur Karlsson: The MIT License, see https://github.com/baldurk/renderdoc"),
     ("disruptorplus", None, "disruptorplus (Lewis Baker): MIT License, see https://github.com/lewissbaker/disruptorplus"),
+    ("Xelu's FREE Controllers & Keyboard PROMPTS (PlayStation button icons)", None,
+     "PS4 / PS5 button prompts by Nicolae \"Xelu\" Berbece, Those Awesome Guys "
+     "(https://thoseawesomeguys.com/prompts/): public domain, Creative Commons Zero (CC0 1.0). "
+     "PlayStation and its button symbols are trademarks of Sony Interactive Entertainment; openNG2 is "
+     "not affiliated with or endorsed by Sony."),
     ("DirectX Shader Compiler", None,
      "DirectX Shader Compiler (Microsoft): University of Illinois/NCSA Open Source License, "
      "see https://github.com/microsoft/DirectXShaderCompiler"),
