@@ -2717,10 +2717,34 @@ index 3f9422d..2b3579c 100644
    has_focus_ = false;
    // Withdraw the request too, or an update queued before the focus loss grabs
 diff --git a/src/input/sdl/sdl_input_driver.cpp b/src/input/sdl/sdl_input_driver.cpp
-index c7c440d..34d7091 100644
+index c7c440d..76cbc4f 100644
 --- a/src/input/sdl/sdl_input_driver.cpp
 +++ b/src/input/sdl/sdl_input_driver.cpp
-@@ -30,8 +30,60 @@ namespace {
+@@ -9,7 +9,9 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <algorithm>
+ #include <array>
++#include <cmath>
+ #include <filesystem>
+ 
+ #include <rex/assert.h>
+@@ -22,6 +24,13 @@
+ 
+ REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
+                       "Path to SDL gamecontroller mappings file");
++// NG2 ADDITION: PlayStation rumble strength (see SetDeviceVibration).
++REXCVAR_DEFINE_DOUBLE(hid_playstation_rumble_curve, 0.5, "Input",
++                      "PS4/PS5 rumble curve exponent (1 = as the game sends it, lower = stronger "
++                      "low and medium rumble)");
++REXCVAR_DEFINE_DOUBLE(hid_playstation_rumble_gain, 1.25, "Input",
++                      "PS4/PS5 rumble gain after the curve (clamped to full strength)");
++REXCVAR_DEFINE_BOOL(hid_rumble_log, false, "Input", "Diagnostic: log every rumble request");
+ 
+ namespace rex::input::sdl {
+ 
+@@ -30,8 +39,60 @@ namespace {
  // SDL clamps to SDL_MAX_RUMBLE_DURATION_MS, which is not a public constant.
  constexpr uint32_t kRumbleDurationMs = 0xFFFF;
  
@@ -2781,7 +2805,7 @@ index c7c440d..34d7091 100644
  SDLInputDriver::SDLInputDriver(rex::ui::Window* window, size_t window_z_order)
      : InputDriver(window, window_z_order),
        sdl_events_initialized_(false),
-@@ -41,7 +93,10 @@ SDLInputDriver::SDLInputDriver(rex::ui::Window* window, size_t window_z_order)
+@@ -41,7 +102,10 @@ SDLInputDriver::SDLInputDriver(rex::ui::Window* window, size_t window_z_order)
        controllers_(),
        controllers_mutex_() {}
  
@@ -2793,7 +2817,7 @@ index c7c440d..34d7091 100644
  
  X_STATUS SDLInputDriver::Setup() {
    if (!TestSDLVersion()) {
-@@ -94,6 +149,10 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
+@@ -94,6 +158,10 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
          return;
        }
        SDL_Gamepad_initialized_ = true;
@@ -2804,7 +2828,7 @@ index c7c440d..34d7091 100644
  
        // Load custom controller mappings if available
        if (!REXCVAR_GET(hid_mappings_file).empty()) {
-@@ -118,6 +177,10 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
+@@ -118,6 +186,10 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
  }
  
  void SDLInputDriver::OnClosing(rex::ui::UIEvent&) {
@@ -2815,7 +2839,40 @@ index c7c440d..34d7091 100644
    if (attached_window_) {
      attached_window_->RemoveListener(this);
      if (sdl_pumpevents_queued_) {
-@@ -554,8 +617,8 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
+@@ -236,11 +308,30 @@ X_RESULT SDLInputDriver::SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION* vibr
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+ 
++  uint16_t low = vibration->left_motor_speed, high = vibration->right_motor_speed;
++  // NG2 ADDITION: DualShock 4 / DualSense motors are far weaker than an Xbox 360 pad's at the
++  // same value, so games tuned for the 360 feel faint on them. Lift PlayStation pads with a
++  // power curve (full stays full, low and medium strengths rise most) and a gain.
++  const SDL_GamepadType type = SDL_GetGamepadType(controller->sdl);
++  if (type == SDL_GAMEPAD_TYPE_PS4 || type == SDL_GAMEPAD_TYPE_PS5) {
++    const double curve = std::clamp(double(REXCVAR_GET(hid_playstation_rumble_curve)), 0.1, 1.0);
++    const double gain = std::clamp(double(REXCVAR_GET(hid_playstation_rumble_gain)), 0.0, 4.0);
++    auto lift = [&](uint16_t v) -> uint16_t {
++      if (!v) return 0;
++      return uint16_t(std::min(65535.0, std::pow(v / 65535.0, curve) * gain * 65535.0));
++    };
++    low = lift(low);
++    high = lift(high);
++  }
++  if (REXCVAR_GET(hid_rumble_log)) {
++    REXLOG_INFO("SDL rumble: type {} in {} {} -> {} {}", int(type),
++                uint16_t(vibration->left_motor_speed), uint16_t(vibration->right_motor_speed), low,
++                high);
++  }
+   // XInput vibration holds until the guest changes it, but SDL rumble expires,
+   // and a zero duration expires on the next SDL_UpdateJoysticks. Arm it for
+   // SDL's maximum instead; each call cancels the previous effect anyway.
+-  return SDL_RumbleGamepad(controller->sdl, vibration->left_motor_speed,
+-                           vibration->right_motor_speed, kRumbleDurationMs)
++  return SDL_RumbleGamepad(controller->sdl, low, high, kRumbleDurationMs)
+              ? X_ERROR_SUCCESS
+              : X_ERROR_FUNCTION_FAILED;
+ }
+@@ -554,8 +645,8 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
            X_INPUT_GAMEPAD_B,
            X_INPUT_GAMEPAD_X,
            X_INPUT_GAMEPAD_A,
