@@ -14,4 +14,7 @@ native_render_targets = true
 # - Vulkan: resolved render targets reach textures as image copies instead of
 #   untile-and-upload (#109, #111).
 native_resolves = true
+# - Vulkan: NG2's 2x / 4x MSAA scene surfaces are stored as the 1x surface the game reads them
+#   back as (supersampling), which removes the MSAA copies (#117).
+ng2_msaa_supersample = true
 # To try the Vulkan renderer: gpu_backend = "vulkan"

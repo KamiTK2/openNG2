@@ -142,10 +142,27 @@ index ac6b056..a7c79ee 100644
    bool is_paused() const { return paused_; }
    void Pause();
 diff --git a/include/rex/graphics/pipeline/render_target/cache.h b/include/rex/graphics/pipeline/render_target/cache.h
-index 3bbd52e..92dc5ea 100644
+index 3bbd52e..321ba81 100644
 --- a/include/rex/graphics/pipeline/render_target/cache.h
 +++ b/include/rex/graphics/pipeline/render_target/cache.h
-@@ -533,6 +533,10 @@ class RenderTargetCache {
+@@ -180,7 +180,16 @@ class RenderTargetCache {
+   // each.
+   uint32_t GetLastUpdateBoundRenderTargets(uint32_t* depth_and_color_formats_out = nullptr) const;
+ 
++  // NG2 ADDITION (ng2_msaa_supersample): whether 2x / 4x MSAA surfaces are stored as their
++  // EDRAM-equivalent 1x surface (one host pixel per sample: 4x doubles width and height, 2x
++  // the height).
++  // The backend rewrites RB_SURFACE_INFO to that 1x surface for the draw and tells Update
++  // the vertical factor so the guest-pixel height estimate covers the 1x surface.
++  static bool Ng2MsaaSupersampleEnabled();
++  void Ng2SetDrawSupersampleY(uint32_t factor) { ng2_draw_supersample_y_ = factor; }
++
+  protected:
++  uint32_t ng2_draw_supersample_y_ = 1;
+   RenderTargetCache(const RegisterFile& register_file, const memory::Memory& memory,
+                     uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y)
+       : register_file_(register_file),
+@@ -533,6 +542,10 @@ class RenderTargetCache {
    // need to be done (false in both empty and error cases).
    // TODO(Triang3l): Try to defer clears until the first draw in the next pass
    // (if it uses one or both render targets being cleared) for tile-based GPUs.
@@ -187,7 +204,7 @@ index 4d85a2b..524e58e 100644
    // Mutex between the guest memory subsystem and the command processor, to be
    // locked when checking or updating validity of pages/ranges and when firing
 diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
-index 696ff48..81b6a03 100644
+index 696ff48..3f91da7 100644
 --- a/include/rex/graphics/vulkan/command_processor.h
 +++ b/include/rex/graphics/vulkan/command_processor.h
 @@ -425,7 +425,7 @@ class VulkanCommandProcessor : public CommandProcessor {
@@ -199,6 +216,18 @@ index 696ff48..81b6a03 100644
    bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
    bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
  
+@@ -531,6 +531,11 @@ class VulkanCommandProcessor : public CommandProcessor {
+   std::deque<std::pair<uint64_t, VkSemaphore>> submissions_in_flight_semaphores_;
+ 
+   static constexpr uint32_t kMaxFramesInFlight = 3;
++  // NG2 ADDITION (ng2_msaa_supersample): host pixels per guest pixel while issuing an MSAA
++  // draw as its 1x equivalent surface (4x: 2x2, 2x: 1x2; viewport, scissor, point size, depth
++  // bias and ps_param_gen scaled), 1 otherwise.
++  uint32_t ng2_draw_supersample_x_ = 1;
++  uint32_t ng2_draw_supersample_y_ = 1;
+   bool frame_open_ = false;
+   // Tracks whether any draw in the current frame used an async placeholder
+   // graphics pipeline and may have produced incomplete output.
 diff --git a/include/rex/graphics/vulkan/deferred_command_buffer.h b/include/rex/graphics/vulkan/deferred_command_buffer.h
 index 9d2a848..a81c682 100644
 --- a/include/rex/graphics/vulkan/deferred_command_buffer.h
@@ -265,10 +294,10 @@ index 9d2a848..a81c682 100644
      VkBuffer src_buffer;
      VkImage dst_image;
 diff --git a/include/rex/graphics/vulkan/render_target_cache.h b/include/rex/graphics/vulkan/render_target_cache.h
-index 34f7033..20d7258 100644
+index 34f7033..0133b89 100644
 --- a/include/rex/graphics/vulkan/render_target_cache.h
 +++ b/include/rex/graphics/vulkan/render_target_cache.h
-@@ -805,6 +805,20 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+@@ -805,6 +805,21 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
    bool TryResolveCopyDirectly(const draw_util::ResolveInfo& resolve_info,
                                draw_util::ResolveCopyShaderIndex copy_shader,
                                bool draw_resolution_scaled);
@@ -285,7 +314,8 @@ index 34f7033..20d7258 100644
 +  VkDescriptorSetLayout ng2_msaa_unpack_storage_layout_ = VK_NULL_HANDLE;
 +  VkDescriptorPool ng2_msaa_unpack_pool_ = VK_NULL_HANDLE;
 +  VkPipelineLayout ng2_msaa_unpack_pipeline_layout_ = VK_NULL_HANDLE;
-+  VkPipeline ng2_msaa_unpack_pipelines_[2] = {};  // [source view is uint]
++  // [source view is uint + 2 * source is 1x (ng2_msaa_supersample: 1x surface read as 2x)]
++  VkPipeline ng2_msaa_unpack_pipelines_[4] = {};
  
    // Writes contents of host render targets within rectangles from
    // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.
@@ -2808,7 +2838,7 @@ index 0000000..9291093
 +
 +}  // namespace rex::graphics::ng2prof
 diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
-index 953c5fd..62bd532 100644
+index 953c5fd..24d90df 100644
 --- a/src/graphics/pipeline/render_target/cache.cpp
 +++ b/src/graphics/pipeline/render_target/cache.cpp
 @@ -9,6 +9,7 @@
@@ -2819,7 +2849,7 @@ index 953c5fd..62bd532 100644
  #include <algorithm>
  #include <cmath>
  #include <cstring>
-@@ -37,6 +38,15 @@ REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_for_psi_render_backend, tru
+@@ -37,6 +38,20 @@ REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_for_psi_render_backend, tru
  REXCVAR_DEFINE_BOOL(snorm16_render_target_full_range, true, "GPU",
                      "Use full range for SNORM16 render targets");
  
@@ -2832,10 +2862,40 @@ index 953c5fd..62bd532 100644
 +                    "With native_render_targets: still copy depth/stencil when the same surface is "
 +                    "re-bound with another MSAA sample count (NG2 ADDITION)");
 +
++REXCVAR_DEFINE_BOOL(ng2_msaa_supersample, false, "GPU",
++                    "With native_render_targets (Vulkan): store 2x / 4x MSAA surfaces as their "
++                    "EDRAM-equivalent 1x surface (1x2 / 2x2 supersampling), so the game's 1x "
++                    "views of the samples need no copies (NG2 ADDITION)");
++
  REXCVAR_DEFINE_BOOL(direct_host_resolve, true, "GPU",
                      "Resolve from host render targets directly to shared memory when possible")
      .lifecycle(rex::cvar::Lifecycle::kHotReload);
-@@ -934,6 +944,69 @@ void RenderTargetCache::GetResolveCopyDispatchesToDump(
+@@ -566,13 +581,18 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+ 
+   // Estimate height used by render targets (for color for writes, for depth /
+   // stencil for both reads and writes) from various sources.
++  uint32_t height_estimated = draw_extent_estimator_.EstimateMaxY(
++      interlock_barrier_only
++          ? REXCVAR_GET(execute_unclipped_draw_vs_on_cpu_for_psi_render_backend)
++          : true,
++      vertex_shader);
++  if (ng2_draw_supersample_y_ > 1) {
++    // NG2 ADDITION: guest pixels of the 4x surface -> rows of its 1x equivalent (+1 for the
++    // 1x top-left rounding the estimator used).
++    height_estimated = (height_estimated + 1) * ng2_draw_supersample_y_;
++  }
+   uint32_t height_used =
+-      std::min(GetRenderTargetHeight(pitch_tiles_at_32bpp, msaa_samples),
+-               draw_extent_estimator_.EstimateMaxY(
+-                   interlock_barrier_only
+-                       ? REXCVAR_GET(execute_unclipped_draw_vs_on_cpu_for_psi_render_backend)
+-                       : true,
+-                   vertex_shader));
++      std::min(GetRenderTargetHeight(pitch_tiles_at_32bpp, msaa_samples), height_estimated);
+ 
+   // Sorted by EDRAM base and then by index in the pipeline - for simplicity,
+   // treat render targets placed closer to the end of the EDRAM as truncating
+@@ -934,6 +954,77 @@ void RenderTargetCache::GetResolveCopyDispatchesToDump(
    }
  }
  
@@ -2845,6 +2905,10 @@ index 953c5fd..62bd532 100644
 +// and the front buffer came out black on host render targets (findings #16, #113). With
 +// native surfaces nothing was transferred to the depth render target, so the color one still
 +// holds the image - hand the resolved tiles back to it (without transfers) before dumping.
++bool RenderTargetCache::Ng2MsaaSupersampleEnabled() {
++  return REXCVAR_GET(native_render_targets) && REXCVAR_GET(ng2_msaa_supersample);
++}
++
 +void RenderTargetCache::Ng2ClaimResolveSourceSurface(const draw_util::ResolveInfo& resolve_info) {
 +  if (!REXCVAR_GET(native_render_targets) || GetPath() != Path::kHostRenderTargets ||
 +      !resolve_info.copy_dest_extent_length) {
@@ -2870,6 +2934,10 @@ index 953c5fd..62bd532 100644
 +  key.base_tiles = original_base;
 +  key.pitch_tiles_at_32bpp = pitch_tiles_at_32bpp;
 +  key.msaa_samples = edram_info.msaa_samples;
++  if (key.msaa_samples != xenos::MsaaSamples::k1X && Ng2MsaaSupersampleEnabled()) {
++    // Stored as the EDRAM-equivalent 1x surface (same pitch in tiles).
++    key.msaa_samples = xenos::MsaaSamples::k1X;
++  }
 +  key.is_depth = is_depth;
 +  key.resource_format =
 +      is_depth ? edram_info.format
@@ -2905,7 +2973,23 @@ index 953c5fd..62bd532 100644
  bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
      const draw_util::ResolveInfo& resolve_info, Transfer::Rectangle& clear_rectangle_out,
      RenderTarget*& depth_render_target_out, std::vector<Transfer>& depth_transfers_out,
-@@ -1289,7 +1362,35 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
+@@ -1027,6 +1118,15 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
+       ((clear_rectangle.x_pixels + clear_rectangle.width_pixels - 1) << msaa_samples_x_log2) /
+           xenos::kEdramTileWidthSamples +
+       1 - clear_start_tiles_at_32bpp;
++  // NG2 ADDITION (ng2_msaa_supersample): an MSAA surface lives in its EDRAM-equivalent 1x
++  // surface (same tiles; 4x: 2x2 pixels per pixel, 2x: 1x2), so clear that one, in its pixels.
++  if (msaa_samples != xenos::MsaaSamples::k1X && Ng2MsaaSupersampleEnabled()) {
++    clear_rectangle.x_pixels <<= msaa_samples_x_log2;
++    clear_rectangle.width_pixels <<= msaa_samples_x_log2;
++    clear_rectangle.y_pixels <<= 1;
++    clear_rectangle.height_pixels <<= 1;
++    msaa_samples = xenos::MsaaSamples::k1X;
++  }
+   // Up to the range from the base in the current 11 tile index bits to the base
+   // in the next 11 tile index bits after wrapping can be cleared.
+   uint32_t depth_clear_start_tiles_base_relative = 0;
+@@ -1289,7 +1389,35 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
          ownership_ranges_.emplace(extent_end, it->second);
          it->second.end_tiles = extent_end;
        }
@@ -2942,6 +3026,70 @@ index 953c5fd..62bd532 100644
          RenderTargetKey transfer_source = it->second.render_target;
          // Only perform the copying when actually changing the latest owner, not
          // just the latest host depth owner - the transfer source is expected to
+diff --git a/src/graphics/pipeline/shader/spirv_translator.cpp b/src/graphics/pipeline/shader/spirv_translator.cpp
+index 1774f97..a46dfb6 100644
+--- a/src/graphics/pipeline/shader/spirv_translator.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator.cpp
+@@ -3215,6 +3215,29 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
+           spv::OpFMul, type_float_, param_gen_x,
+           builder_->makeFloatConstant(1.0f / float(draw_resolution_scale_x_)));
+     }
++    if (!edram_fragment_shader_interlock_) {
++      // NG2 ADDITION (ng2_msaa_supersample): an MSAA surface drawn as its 1x equivalent at
++      // twice the resolution along this axis; the host render target path doesn't use the
++      // EDRAM pitch constant, so it carries the doubled axes (bit 0 x, bit 1 y).
++      id_vector_temp_.clear();
++      id_vector_temp_.push_back(
++          builder_->makeIntConstant(kSystemConstantEdram32bppTilePitchDwordsScaled));
++      param_gen_x = builder_->createNoContractionBinOp(
++          spv::OpFMul, type_float_, param_gen_x,
++          builder_->createTriOp(
++              spv::OpSelect, type_float_,
++              builder_->createBinOp(
++                  spv::OpINotEqual, type_bool_,
++                  builder_->createBinOp(
++                      spv::OpBitwiseAnd, type_uint_,
++                      builder_->createLoad(
++                          builder_->createAccessChain(spv::StorageClassUniform,
++                                                      uniform_system_constants_, id_vector_temp_),
++                          spv::NoPrecision),
++                      builder_->makeUintConstant(1)),
++                  const_uint_0_),
++              builder_->makeFloatConstant(0.5f), builder_->makeFloatConstant(1.0f)));
++    }
+     param_gen_x = builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
+                                                    GLSLstd450FAbs, param_gen_x);
+     if (!modification.pixel.param_gen_point) {
+@@ -3251,6 +3274,29 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
+           spv::OpFMul, type_float_, param_gen_y,
+           builder_->makeFloatConstant(1.0f / float(draw_resolution_scale_y_)));
+     }
++    if (!edram_fragment_shader_interlock_) {
++      // NG2 ADDITION (ng2_msaa_supersample): an MSAA surface drawn as its 1x equivalent at
++      // twice the resolution along this axis; the host render target path doesn't use the
++      // EDRAM pitch constant, so it carries the doubled axes (bit 0 x, bit 1 y).
++      id_vector_temp_.clear();
++      id_vector_temp_.push_back(
++          builder_->makeIntConstant(kSystemConstantEdram32bppTilePitchDwordsScaled));
++      param_gen_y = builder_->createNoContractionBinOp(
++          spv::OpFMul, type_float_, param_gen_y,
++          builder_->createTriOp(
++              spv::OpSelect, type_float_,
++              builder_->createBinOp(
++                  spv::OpINotEqual, type_bool_,
++                  builder_->createBinOp(
++                      spv::OpBitwiseAnd, type_uint_,
++                      builder_->createLoad(
++                          builder_->createAccessChain(spv::StorageClassUniform,
++                                                      uniform_system_constants_, id_vector_temp_),
++                          spv::NoPrecision),
++                      builder_->makeUintConstant(2)),
++                  const_uint_0_),
++              builder_->makeFloatConstant(0.5f), builder_->makeFloatConstant(1.0f)));
++    }
+     param_gen_y = builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
+                                                    GLSLstd450FAbs, param_gen_y);
+     if (modification.pixel.param_gen_point) {
 diff --git a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
 index 9ce3bb4..d193916 100644
 --- a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
@@ -3166,7 +3314,7 @@ index ec0df7c..4d374e7 100644
    std::pair<uint32_t, uint32_t> range(start, length);
    return RequestRanges(&range, 1);
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 001f36b..ca5e63d 100644
+index 001f36b..0e58626 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -47,6 +47,8 @@
@@ -3201,7 +3349,50 @@ index 001f36b..ca5e63d 100644
  REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
                      "When async shader compilation is enabled, skip presenting frames that "
                      "used placeholder pipelines to avoid visible flashing")
-@@ -3843,6 +3861,36 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+@@ -3616,6 +3634,42 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     return IssueCopy();
+   }
+ 
++  // NG2 ADDITION (ng2_msaa_supersample): draw into a 4x MSAA surface as its EDRAM-equivalent
++  // 1x surface (pitch x2, one host pixel per sample, viewport / scissor scaled 2x2). Everything
++  // downstream (render target cache, render pass, pipeline, system constants) then sees a 1x
++  // surface; RB_SURFACE_INFO is restored when the draw returns.
++  struct Ng2SurfaceInfoRestore {
++    VulkanCommandProcessor* self = nullptr;
++    uint32_t value = 0;
++    ~Ng2SurfaceInfoRestore() {
++      if (self) {
++        (*self->register_file_)[XE_GPU_REG_RB_SURFACE_INFO] = value;
++        self->ng2_draw_supersample_x_ = 1;
++        self->ng2_draw_supersample_y_ = 1;
++        self->render_target_cache_->Ng2SetDrawSupersampleY(1);
++      }
++    }
++  } ng2_surface_info_restore;
++  {
++    auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
++    // 4x: 2x2 host pixels per guest pixel (pitch x2); 2x: 1x2 (samples are vertical).
++    uint32_t ss_x = rb_surface_info.msaa_samples >= xenos::MsaaSamples::k4X ? 2 : 1;
++    if (rb_surface_info.msaa_samples != xenos::MsaaSamples::k1X &&
++        render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
++        RenderTargetCache::Ng2MsaaSupersampleEnabled() &&
++        rb_surface_info.surface_pitch * ss_x <= xenos::kTexture2DCubeMaxWidthHeight) {
++      ng2_surface_info_restore.self = this;
++      ng2_surface_info_restore.value = rb_surface_info.value;
++      reg::RB_SURFACE_INFO rewritten = rb_surface_info;
++      rewritten.msaa_samples = xenos::MsaaSamples::k1X;
++      rewritten.surface_pitch = rb_surface_info.surface_pitch * ss_x;
++      (*register_file_)[XE_GPU_REG_RB_SURFACE_INFO] = rewritten.value;
++      ng2_draw_supersample_x_ = ss_x;
++      ng2_draw_supersample_y_ = 2;
++      render_target_cache_->Ng2SetDrawSupersampleY(2);
++    }
++  }
++
+   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
+ 
+   const ui::vulkan::VulkanDevice::Properties& device_properties = GetVulkanDevice()->properties();
+@@ -3843,6 +3897,36 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
                                      normalized_color_mask, *vertex_shader)) {
      return draw_fail("render_target_update");
    }
@@ -3238,7 +3429,18 @@ index 001f36b..ca5e63d 100644
  
    // Create the pipeline (for this, need the render pass from the render target
    // cache), translating the shaders - doing this now to obtain the used
-@@ -4391,6 +4439,10 @@ bool VulkanCommandProcessor::IssueCopy() {
+@@ -3904,8 +3988,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+ 
+   bool host_render_targets_used =
+       render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets;
+-  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
+-  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
++  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x() * ng2_draw_supersample_x_;
++  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y() * ng2_draw_supersample_y_;
+ 
+   // Get dynamic rasterizer state.
+   draw_util::ViewportInfo viewport_info;
+@@ -4391,6 +4475,10 @@ bool VulkanCommandProcessor::IssueCopy() {
    }
  
    ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
@@ -3249,7 +3451,7 @@ index 001f36b..ca5e63d 100644
    if (readback_mode == ReadbackResolveMode::kDisabled) {
      uint32_t written_address, written_length;
      return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-@@ -4400,7 +4452,7 @@ bool VulkanCommandProcessor::IssueCopy() {
+@@ -4400,7 +4488,7 @@ bool VulkanCommandProcessor::IssueCopy() {
    return IssueCopy_ReadbackResolvePath();
  }
  
@@ -3258,7 +3460,7 @@ index 001f36b..ca5e63d 100644
    const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
    const VkDevice device = vulkan_device->device();
-@@ -4420,6 +4472,9 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
+@@ -4420,6 +4508,9 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
    }
  
    ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
@@ -3268,7 +3470,7 @@ index 001f36b..ca5e63d 100644
    if (readback_mode == ReadbackResolveMode::kDisabled) {
      return true;
    }
-@@ -4679,10 +4734,24 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
+@@ -4679,10 +4770,24 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
      readback_memory_range.size = VK_WHOLE_SIZE;
      dfn.vkInvalidateMappedMemoryRanges(device, 1, &readback_memory_range);
  
@@ -3293,7 +3495,7 @@ index 001f36b..ca5e63d 100644
    }
  
    readback.current_index = 1 - readback.current_index;
-@@ -5116,6 +5185,39 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -5116,6 +5221,39 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
      return false;
    }
  
@@ -3333,7 +3535,7 @@ index 001f36b..ca5e63d 100644
    if (is_opening_frame) {
      // Update the completed frame index, also obtaining the actual completed
      // frame number (since the CPU may be actually less than 3 frames behind)
-@@ -5385,7 +5487,38 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+@@ -5385,7 +5523,38 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
        REXGPU_ERROR("Failed to begin a Vulkan command buffer");
        return false;
      }
@@ -3372,7 +3574,7 @@ index 001f36b..ca5e63d 100644
      if (dfn.vkEndCommandBuffer(command_buffer.buffer) != VK_SUCCESS) {
        REXGPU_ERROR("Failed to end a Vulkan command buffer");
        return false;
-@@ -5430,6 +5563,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+@@ -5430,6 +5599,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
        return false;
      }
      uint64_t submission_current = GetCurrentSubmission();
@@ -3382,6 +3584,50 @@ index 001f36b..ca5e63d 100644
      current_submission_wait_stage_masks_.clear();
      for (VkSemaphore semaphore : current_submission_wait_semaphores_) {
        submissions_in_flight_semaphores_.emplace_back(submission_current, semaphore);
+@@ -5660,8 +5832,11 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+ 
+   const RegisterFile& regs = *register_file_;
+-  uint32_t draw_resolution_scale_x = texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 1;
+-  uint32_t draw_resolution_scale_y = texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 1;
++  // NG2 ADDITION: x ng2_draw_supersample_x_/y_ (MSAA drawn as its 1x equivalent).
++  uint32_t draw_resolution_scale_x =
++      (texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 1) * ng2_draw_supersample_x_;
++  uint32_t draw_resolution_scale_y =
++      (texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 1) * ng2_draw_supersample_y_;
+ 
+   // Window parameters.
+   // http://ftp.tku.edu.tw/NetBSD/NetBSD-current/xsrc/external/mit/xf86-video-ati/dist/src/r600_reg_auto_r6xx.h
+@@ -5887,8 +6062,11 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
+ 
+   bool edram_fragment_shader_interlock =
+       render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+-  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
+-  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
++  // NG2 ADDITION: x ng2_draw_supersample_x_/y_ (MSAA drawn as its 1x equivalent).
++  uint32_t draw_resolution_scale_x =
++      texture_cache_->draw_resolution_scale_x() * ng2_draw_supersample_x_;
++  uint32_t draw_resolution_scale_y =
++      texture_cache_->draw_resolution_scale_y() * ng2_draw_supersample_y_;
+ 
+   // Get the color info register values for each render target. Also, for FSI,
+   // exclude components that don't exist in the format from the write mask.
+@@ -6215,6 +6393,15 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
+                                       xenos::kEdramTileHeightSamples *
+                                       (draw_resolution_scale_x * draw_resolution_scale_y);
+ 
++  // NG2 ADDITION (ng2_msaa_supersample): with host render targets the EDRAM pitch constant is
++  // unused - it carries the axes drawn at twice the resolution (bit 0 x, bit 1 y) for
++  // ps_param_gen.
++  if (!edram_fragment_shader_interlock) {
++    uint32_t ng2_supersample_axes =
++        uint32_t(ng2_draw_supersample_x_ > 1) | (uint32_t(ng2_draw_supersample_y_ > 1) << 1);
++    dirty |= system_constants_.edram_32bpp_tile_pitch_dwords_scaled != ng2_supersample_axes;
++    system_constants_.edram_32bpp_tile_pitch_dwords_scaled = ng2_supersample_axes;
++  }
+   // EDRAM pitch for FSI render target writing.
+   if (edram_fragment_shader_interlock) {
+     // Align, then multiply by 32bpp tile size in dwords.
 diff --git a/src/graphics/vulkan/deferred_command_buffer.cpp b/src/graphics/vulkan/deferred_command_buffer.cpp
 index b49e033..29f8283 100644
 --- a/src/graphics/vulkan/deferred_command_buffer.cpp
@@ -3427,7 +3673,7 @@ index 91ac08f..9734204 100644
    // TODO(Triang3l): Log that the shader has been successfully translated in
    // common code.
 diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
-index 0298f06..f9b3136 100644
+index 0298f06..41ca87c 100644
 --- a/src/graphics/vulkan/render_target_cache.cpp
 +++ b/src/graphics/vulkan/render_target_cache.cpp
 @@ -10,6 +10,7 @@
@@ -3498,7 +3744,7 @@ index 0298f06..f9b3136 100644
        current_transfer_invocations_.clear();
        current_transfer_invocations_.reserve(current_transfers.size()
                                              << uint32_t(need_stencil_bit_draws));
-@@ -6152,4 +6169,430 @@ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dum
+@@ -6152,4 +6169,475 @@ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dum
    return all_pipelines_available;
  }
  
@@ -3593,9 +3839,14 @@ index 0298f06..f9b3136 100644
 +  bool msaa_select = false;
 +  // A 2x resolve of tiles owned by a 4x surface (horizontal samples read as pixels).
 +  bool msaa_4x_as_2x = false;
++  // A 2x resolve of tiles owned by a 1x surface that stores a 4x one (ng2_msaa_supersample):
++  // 2x pixel (x, y) sample g = 1x pixel (x, 2y + g).
++  bool msaa_1x_as_2x = false;
 +  if (resolve_2x) {
 +    msaa_4x_as_2x = rt_key.msaa_samples == xenos::MsaaSamples::k4X;
-+    if ((rt_key.msaa_samples != xenos::MsaaSamples::k2X && !msaa_4x_as_2x) ||
++    msaa_1x_as_2x =
++        rt_key.msaa_samples == xenos::MsaaSamples::k1X && Ng2MsaaSupersampleEnabled();
++    if ((rt_key.msaa_samples != xenos::MsaaSamples::k2X && !msaa_4x_as_2x && !msaa_1x_as_2x) ||
 +        image_format != VK_FORMAT_R16G16B16A16_SFLOAT ||
 +        rt_host_format != VK_FORMAT_R16G16B16A16_SFLOAT || !Ng2InitMsaaUnpack()) {
 +      return (reason = 730 + int(rt_key.msaa_samples) * 10 +
@@ -3637,6 +3888,9 @@ index 0298f06..f9b3136 100644
 +  uint32_t rt_width = rt_key.GetWidth() * scale_x * view_factor_x;
 +  uint32_t rt_height = GetRenderTargetHeight(rt_key.pitch_tiles_at_32bpp, rt_key.msaa_samples) *
 +                       scale_y * view_factor_y;
++  if (msaa_1x_as_2x) {
++    rt_height /= 2;  // two 1x rows per 2x row
++  }
 +  if (!width || !height || (src_x + width) * scale_x > rt_width ||
 +      (src_y + height) * scale_y > rt_height) {
 +    return (reason = 8, reject());
@@ -3706,7 +3960,8 @@ index 0298f06..f9b3136 100644
 +        VK_IMAGE_LAYOUT_GENERAL);
 +    command_processor_.SubmitBarriers(true);
 +    bool source_uint = rt.view_color_transfer_separate() != VK_NULL_HANDLE;
-+    command_processor_.BindExternalComputePipeline(ng2_msaa_unpack_pipelines_[source_uint]);
++    command_processor_.BindExternalComputePipeline(
++        ng2_msaa_unpack_pipelines_[uint32_t(source_uint) + 2 * uint32_t(msaa_1x_as_2x)]);
 +    VkDescriptorSet sets[2] = {rt.GetDescriptorSetTransferSource(), entry->storage_set};
 +    DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
 +    command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -3716,9 +3971,9 @@ index 0298f06..f9b3136 100644
 +    // [sample_a, sample_b] (equal for a single sample) at the same pixel.
 +    int32_t mode = 0, sample_a = 0, sample_b = 0;
 +    if (msaa_select) {
-+      mode = msaa_4x_as_2x ? 2 : 1;
-+      auto to_host = [this, msaa_4x_as_2x](uint32_t guest_sample) {
-+        if (msaa_4x_as_2x) {
++      mode = msaa_1x_as_2x ? 3 : (msaa_4x_as_2x ? 2 : 1);
++      auto to_host = [this, msaa_4x_as_2x, msaa_1x_as_2x](uint32_t guest_sample) {
++        if (msaa_4x_as_2x || msaa_1x_as_2x) {
 +          return int32_t(guest_sample);  // the shader builds the 4x sample index
 +        }
 +        // Same as the 2x transfers: native 2x swaps the two samples, 2x-as-4x uses 0 and 3.
@@ -3794,7 +4049,9 @@ index 0298f06..f9b3136 100644
 +bool VulkanRenderTargetCache::Ng2InitMsaaUnpack() {
 +  if (ng2_msaa_unpack_init_tried_) {
 +    return ng2_msaa_unpack_pipelines_[0] != VK_NULL_HANDLE &&
-+           ng2_msaa_unpack_pipelines_[1] != VK_NULL_HANDLE;
++           ng2_msaa_unpack_pipelines_[1] != VK_NULL_HANDLE &&
++           ng2_msaa_unpack_pipelines_[2] != VK_NULL_HANDLE &&
++           ng2_msaa_unpack_pipelines_[3] != VK_NULL_HANDLE;
 +  }
 +  ng2_msaa_unpack_init_tried_ = true;
 +  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
@@ -3844,7 +4101,7 @@ index 0298f06..f9b3136 100644
 +  }
 +  // Host 1x-view pixel (x, y) = 4x pixel (x >> 1, y >> 1), sample (x & 1) | ((y & 1) << 1),
 +  // the same mapping as the 4x -> 1x ownership transfer shaders.
-+  static const char* const kSources[2] = {
++  static const char* const kSources[4] = {
 +      R"(#version 450
 +#extension GL_EXT_samplerless_texture_functions : require
 +layout(local_size_x = 8, local_size_y = 8) in;
@@ -3894,8 +4151,42 @@ index 0298f06..f9b3136 100644
 +  }
 +  imageStore(dest_image, dest, value);
 +}
++)",
++      // NG2 ADDITION (ng2_msaa_supersample): 1x surface (a stored 4x one) read as 2x - 2x
++      // pixel (x, y) guest sample g = 1x pixel (x, 2y + g); mode 3, samples in .y / .z.
++      R"(#version 450
++#extension GL_EXT_samplerless_texture_functions : require
++layout(local_size_x = 8, local_size_y = 8) in;
++layout(set = 0, binding = 0) uniform texture2D source_texture;
++layout(set = 1, binding = 0, rgba16f) uniform writeonly image2D dest_image;
++layout(push_constant) uniform Constants { ivec4 rect; ivec4 mode_samples; } constants;
++void main() {
++  ivec2 dest = ivec2(gl_GlobalInvocationID.xy);
++  if (dest.x >= constants.rect.z || dest.y >= constants.rect.w) return;
++  ivec2 view = constants.rect.xy + dest;
++  imageStore(dest_image, dest,
++             0.5 * (texelFetch(source_texture, ivec2(view.x, 2 * view.y + constants.mode_samples.y), 0) +
++                    texelFetch(source_texture, ivec2(view.x, 2 * view.y + constants.mode_samples.z), 0)));
++}
++)",
++      R"(#version 450
++#extension GL_EXT_samplerless_texture_functions : require
++layout(local_size_x = 8, local_size_y = 8) in;
++layout(set = 0, binding = 0) uniform utexture2D source_texture;
++layout(set = 1, binding = 0, rgba16f) uniform writeonly image2D dest_image;
++layout(push_constant) uniform Constants { ivec4 rect; ivec4 mode_samples; } constants;
++void main() {
++  ivec2 dest = ivec2(gl_GlobalInvocationID.xy);
++  if (dest.x >= constants.rect.z || dest.y >= constants.rect.w) return;
++  ivec2 view = constants.rect.xy + dest;
++  uvec4 a = texelFetch(source_texture, ivec2(view.x, 2 * view.y + constants.mode_samples.y), 0);
++  uvec4 b = texelFetch(source_texture, ivec2(view.x, 2 * view.y + constants.mode_samples.z), 0);
++  imageStore(dest_image, dest,
++             0.5 * (vec4(unpackHalf2x16(a.x | (a.y << 16)), unpackHalf2x16(a.z | (a.w << 16))) +
++                    vec4(unpackHalf2x16(b.x | (b.y << 16)), unpackHalf2x16(b.z | (b.w << 16)))));
++}
 +)"};
-+  for (uint32_t i = 0; i < 2; ++i) {
++  for (uint32_t i = 0; i < 4; ++i) {
 +    std::vector<uint32_t> spirv;
 +    std::string error;
 +    if (!command_processor_.CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT, kSources[i], spirv,

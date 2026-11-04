@@ -7,9 +7,10 @@ Branch `native-vulkan-renderer`, started 2026-11-03.
 To try Vulkan: add `gpu_backend = "vulkan"` to `ng2.toml` next to ng2.exe (or pass
 `--gpu_backend=vulkan`). Frame generation works on Vulkan too (#114); the 30 fps cap repeats every other frame on Vulkan (cadence not measured yet).
 
-5x gameplay GPU time (#106-#112): D3D12 ROV 8.7 ms; Vulkan 19.97 ms baseline -> 16.25 ms
-with `native_render_targets` + `native_resolves` (60 fps) -> 13.36 ms with the
-`ng2_skip_stencil_transfer` experiment (off by default).
+5x gameplay GPU time (#106-#112, #117): D3D12 ROV 8.7-9.1 ms; Vulkan 19.97 ms baseline ->
+16.25 ms with `native_render_targets` + `native_resolves` -> 10.5-10.9 ms with
+`ng2_msaa_supersample` (MSAA surfaces stored as the 1x surface the game reads them as; on in
+ng2.toml). 4x: 10.9 -> 9.0 ms.
 Evidence lives in `notes/findings.md` (#96 onwards); this file is the plan.
 
 ## Goal
@@ -80,6 +81,11 @@ resolve/untile compute 3.0 ms, uploads 1.3 ms, the game's own draws 3.7 ms. NG2 
 scene into a 4x MSAA surface and reads the samples back as a 2x-wide/2x-tall 1x surface. The next big
 step is storing 4x MSAA surfaces as supersampled 1x images so both views share one layout
 (no transfers, and the scene-buffer resolve becomes a plain copy).
+
+Done in #117 (`ng2_msaa_supersample`): MSAA draws are issued into the EDRAM-equivalent 1x surface
+at twice the resolution along the sampled axes, so no MSAA host images exist and the MSAA <-> 1x
+transfers are gone (5x 16.2 -> 10.5 ms). What remains above D3D12 ROV is to be measured again
+(resolve -> texture copies, uploads).
 
 ## Testing
 
