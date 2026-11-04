@@ -290,10 +290,10 @@ index 34f7033..20d7258 100644
    // Writes contents of host render targets within rectangles from
    // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.
 diff --git a/include/rex/graphics/vulkan/texture_cache.h b/include/rex/graphics/vulkan/texture_cache.h
-index 04856ee..321909c 100644
+index 04856ee..222cae7 100644
 --- a/include/rex/graphics/vulkan/texture_cache.h
 +++ b/include/rex/graphics/vulkan/texture_cache.h
-@@ -133,6 +133,37 @@ class VulkanTextureCache final : public TextureCache {
+@@ -133,6 +133,38 @@ class VulkanTextureCache final : public TextureCache {
    void UseScaledResolveBufferForWrite(uint64_t written_start_scaled,
                                        uint64_t written_length_scaled);
  
@@ -319,6 +319,7 @@ index 04856ee..321909c 100644
 +    // on demand by the render target cache; the view is destroyed with the image.
 +    VkImageView storage_view = VK_NULL_HANDLE;
 +    VkDescriptorSet storage_set = VK_NULL_HANDLE;
++    uint64_t last_acquired = 0;  // for retiring the least recently used snapshot
 +    bool valid = false;
 +  };
 +  VkFormat Ng2GetTextureHostFormat(xenos::TextureFormat format) const;
@@ -331,7 +332,7 @@ index 04856ee..321909c 100644
   protected:
    bool IsSignedVersionSeparateForFormat(TextureKey key) const override;
    bool IsScaledResolveSupportedForFormat(TextureKey key) const override;
-@@ -327,6 +358,20 @@ class VulkanTextureCache final : public TextureCache {
+@@ -327,6 +359,21 @@ class VulkanTextureCache final : public TextureCache {
  
    xenos::ClampMode NormalizeClampMode(xenos::ClampMode clamp_mode) const;
  
@@ -339,6 +340,7 @@ index 04856ee..321909c 100644
 +  bool Ng2TryLoadFromNativeResolve(VulkanTexture& texture, VkFormat host_format);
 +  void Ng2DestroyNativeResolves(bool all);
 +  std::vector<Ng2NativeResolve> ng2_native_resolves_;
++  uint64_t ng2_native_resolve_acquire_counter_ = 0;
 +  struct Ng2NativeResolveDestroy {
 +    uint64_t submission;
 +    VkImage image;
@@ -3928,7 +3930,7 @@ index 0298f06..f9b3136 100644
 +}
  }  // namespace rex::graphics::vulkan
 diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
-index ecbd940..6c0748f 100644
+index ecbd940..94e9b0b 100644
 --- a/src/graphics/vulkan/texture_cache.cpp
 +++ b/src/graphics/vulkan/texture_cache.cpp
 @@ -34,6 +34,9 @@
@@ -3969,7 +3971,7 @@ index ecbd940..6c0748f 100644
    LoadShaderIndex load_shader = host_format.load_shader;
    if (load_shader == kLoadShaderIndexUnknown) {
      return false;
-@@ -3258,4 +3268,177 @@ xenos::ClampMode VulkanTextureCache::NormalizeClampMode(xenos::ClampMode clamp_m
+@@ -3258,4 +3268,207 @@ xenos::ClampMode VulkanTextureCache::NormalizeClampMode(xenos::ClampMode clamp_m
    return clamp_mode;
  }
  
@@ -3982,25 +3984,54 @@ index ecbd940..6c0748f 100644
 +VulkanTextureCache::Ng2NativeResolve* VulkanTextureCache::Ng2AcquireNativeResolve(
 +    uint32_t dest_base, VkFormat host_format, VkFormat image_format, uint32_t width_scaled,
 +    uint32_t height_scaled) {
++  // A destination can be resolved at several sizes or formats (NG2 resolves 1CE10000 twice per
++  // frame at two sizes), so keep one snapshot per (destination, format, size) instead of
++  // recreating a full-resolution image on every resolve, which stalled frames. Images that
++  // aren't reused are retired least-recently-acquired first.
++  Ng2NativeResolve* match = nullptr;
++  size_t same_base_count = 0, oldest_same_base = SIZE_MAX, oldest_invalid = SIZE_MAX;
 +  for (size_t i = 0; i < ng2_native_resolves_.size(); ++i) {
 +    Ng2NativeResolve& entry = ng2_native_resolves_[i];
 +    if (entry.dest_base != dest_base) {
++      if (!entry.valid && (oldest_invalid == SIZE_MAX ||
++                           entry.last_acquired < ng2_native_resolves_[oldest_invalid].last_acquired)) {
++        oldest_invalid = i;
++      }
 +      continue;
 +    }
++    // The destination is being overwritten: every snapshot of it is stale now.
++    entry.valid = false;
 +    if (entry.host_format == host_format && entry.image_format == image_format &&
-+        entry.width_scaled == width_scaled &&
-+        entry.height_scaled == height_scaled) {
-+      entry.valid = false;
-+      return &entry;
++        entry.width_scaled == width_scaled && entry.height_scaled == height_scaled) {
++      match = &entry;
++      continue;
 +    }
-+    // Same destination, other size or format: retire the old image after the GPU is done.
-+    ng2_native_resolves_destroy_.push_back({command_processor_.GetCurrentSubmission(), entry.image,
-+                                            entry.allocation, entry.storage_view});
-+    ng2_native_resolves_.erase(ng2_native_resolves_.begin() + i);
-+    break;
++    ++same_base_count;
++    if (oldest_same_base == SIZE_MAX ||
++        entry.last_acquired < ng2_native_resolves_[oldest_same_base].last_acquired) {
++      oldest_same_base = i;
++    }
 +  }
-+  if (ng2_native_resolves_.size() >= 64) {
-+    return nullptr;
++  if (match) {
++    match->last_acquired = ++ng2_native_resolve_acquire_counter_;
++    return match;
++  }
++  size_t retire = SIZE_MAX;
++  if (same_base_count >= 4) {
++    retire = oldest_same_base;
++  } else if (ng2_native_resolves_.size() >= 64) {
++    retire = oldest_invalid;
++    if (retire == SIZE_MAX) {
++      return nullptr;
++    }
++  }
++  if (retire != SIZE_MAX) {
++    // Retire the old image after the GPU is done with it.
++    Ng2NativeResolve& old_entry = ng2_native_resolves_[retire];
++    ng2_native_resolves_destroy_.push_back({command_processor_.GetCurrentSubmission(),
++                                            old_entry.image, old_entry.allocation,
++                                            old_entry.storage_view});
++    ng2_native_resolves_.erase(ng2_native_resolves_.begin() + retire);
 +  }
 +  VkImageCreateInfo image_create_info = {};
 +  image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -4032,6 +4063,7 @@ index ecbd940..6c0748f 100644
 +  entry.image_format = image_format;
 +  entry.width_scaled = width_scaled;
 +  entry.height_scaled = height_scaled;
++  entry.last_acquired = ++ng2_native_resolve_acquire_counter_;
 +  REXGPU_INFO("NG2 native resolve: snapshot image {:08X} {}x{} format {}", dest_base,
 +              width_scaled, height_scaled, uint32_t(image_format));
 +  ng2_native_resolves_.push_back(entry);
