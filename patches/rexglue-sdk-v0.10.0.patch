@@ -141,6 +141,21 @@ index ac6b056..a7c79ee 100644
  
    bool is_paused() const { return paused_; }
    void Pause();
+diff --git a/include/rex/graphics/pipeline/render_target/cache.h b/include/rex/graphics/pipeline/render_target/cache.h
+index 3bbd52e..92dc5ea 100644
+--- a/include/rex/graphics/pipeline/render_target/cache.h
++++ b/include/rex/graphics/pipeline/render_target/cache.h
+@@ -533,6 +533,10 @@ class RenderTargetCache {
+   // need to be done (false in both empty and error cases).
+   // TODO(Triang3l): Try to defer clears until the first draw in the next pass
+   // (if it uses one or both render targets being cleared) for tile-based GPUs.
++  // NG2 ADDITION (native_render_targets): give the resolve area back to the surface the
++  // resolve reads, without transfers (see cache.cpp).
++  void Ng2ClaimResolveSourceSurface(const draw_util::ResolveInfo& resolve_info);
++
+   bool PrepareHostRenderTargetsResolveClear(const draw_util::ResolveInfo& resolve_info,
+                                             Transfer::Rectangle& clear_rectangle_out,
+                                             RenderTarget*& depth_render_target_out,
 diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
 index 4d85a2b..524e58e 100644
 --- a/include/rex/graphics/shared_memory.h
@@ -2327,6 +2342,18 @@ index 8e6b854..bfd5681 100644
    }
  }
  
+diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
+index dd321a5..8c601ee 100644
+--- a/src/graphics/d3d12/render_target_cache.cpp
++++ b/src/graphics/d3d12/render_target_cache.cpp
+@@ -1185,6 +1185,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
+   // Copying.
+   bool copied = false;
+   if (resolve_info.copy_dest_extent_length) {
++    Ng2ClaimResolveSourceSurface(resolve_info);  // NG2 ADDITION
+     draw_util::ResolveCopyShaderConstants copy_shader_constants;
+     uint32_t copy_group_count_x, copy_group_count_y;
+     draw_util::ResolveCopyShaderIndex copy_shader =
 diff --git a/src/graphics/d3d12/shared_memory.cpp b/src/graphics/d3d12/shared_memory.cpp
 index a5c97a0..73457dc 100644
 --- a/src/graphics/d3d12/shared_memory.cpp
@@ -2736,7 +2763,7 @@ index 0000000..9291093
 +
 +}  // namespace rex::graphics::ng2prof
 diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
-index 953c5fd..a97b519 100644
+index 953c5fd..62bd532 100644
 --- a/src/graphics/pipeline/render_target/cache.cpp
 +++ b/src/graphics/pipeline/render_target/cache.cpp
 @@ -9,6 +9,7 @@
@@ -2763,7 +2790,77 @@ index 953c5fd..a97b519 100644
  REXCVAR_DEFINE_BOOL(direct_host_resolve, true, "GPU",
                      "Resolve from host render targets directly to shared memory when possible")
      .lifecycle(rex::cvar::Lifecycle::kHotReload);
-@@ -1289,7 +1299,35 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
+@@ -934,6 +944,69 @@ void RenderTargetCache::GetResolveCopyDispatchesToDump(
+   }
+ }
+ 
++// NG2 ADDITION (native_render_targets): a resolve of a surface reads that surface. NG2's
++// cutscenes resolve the 1280x720 front buffer right after a depth-only pass whose surface
++// Xenia sizes to the whole EDRAM, so the color tiles were owned by the depth render target
++// and the front buffer came out black on host render targets (findings #16, #113). With
++// native surfaces nothing was transferred to the depth render target, so the color one still
++// holds the image - hand the resolved tiles back to it (without transfers) before dumping.
++void RenderTargetCache::Ng2ClaimResolveSourceSurface(const draw_util::ResolveInfo& resolve_info) {
++  if (!REXCVAR_GET(native_render_targets) || GetPath() != Path::kHostRenderTargets ||
++      !resolve_info.copy_dest_extent_length) {
++    return;
++  }
++  bool is_depth = resolve_info.IsCopyingDepth();
++  const draw_util::ResolveEdramInfo& edram_info =
++      is_depth ? resolve_info.depth_edram_info : resolve_info.color_edram_info;
++  uint32_t original_base =
++      is_depth ? resolve_info.depth_original_base : resolve_info.color_original_base;
++  uint32_t pitch_tiles_at_32bpp = edram_info.pitch_tiles;
++  uint32_t base_offset_tiles_at_32bpp =
++      (edram_info.base_tiles - original_base) & (xenos::kEdramTileCount - 1);
++  bool is_64bpp = !is_depth && edram_info.format_is_64bpp;
++  if (is_64bpp) {
++    pitch_tiles_at_32bpp >>= 1;
++    base_offset_tiles_at_32bpp >>= 1;
++  }
++  if (!pitch_tiles_at_32bpp) {
++    return;
++  }
++  RenderTargetKey key;
++  key.base_tiles = original_base;
++  key.pitch_tiles_at_32bpp = pitch_tiles_at_32bpp;
++  key.msaa_samples = edram_info.msaa_samples;
++  key.is_depth = is_depth;
++  key.resource_format =
++      is_depth ? edram_info.format
++               : uint32_t(GetColorResourceFormat(xenos::ColorRenderTargetFormat(edram_info.format)));
++  auto it = render_targets_.find(key);
++  if (it == render_targets_.end() || !it->second) {
++    return;
++  }
++  uint32_t msaa_x_log2 = uint32_t(edram_info.msaa_samples >= xenos::MsaaSamples::k4X);
++  uint32_t msaa_y_log2 = uint32_t(edram_info.msaa_samples >= xenos::MsaaSamples::k2X);
++  uint32_t base_offset_rows = base_offset_tiles_at_32bpp / pitch_tiles_at_32bpp;
++  uint32_t x = (base_offset_tiles_at_32bpp - base_offset_rows * pitch_tiles_at_32bpp) *
++                   (xenos::kEdramTileWidthSamples >> msaa_x_log2) +
++               (uint32_t(resolve_info.coordinate_info.edram_offset_x_div_8) << 3);
++  uint32_t y = base_offset_rows * (xenos::kEdramTileHeightSamples >> msaa_y_log2) +
++               (uint32_t(resolve_info.coordinate_info.edram_offset_y_div_8) << 3);
++  uint32_t width = uint32_t(resolve_info.coordinate_info.width_div_8) << 3;
++  uint32_t height = uint32_t(resolve_info.height_div_8) << 3;
++  if (!width || !height) {
++    return;
++  }
++  uint32_t start = ((y << msaa_y_log2) / xenos::kEdramTileHeightSamples) * pitch_tiles_at_32bpp +
++                   (x << msaa_x_log2) / xenos::kEdramTileWidthSamples;
++  uint32_t end =
++      (((y + height - 1) << msaa_y_log2) / xenos::kEdramTileHeightSamples) * pitch_tiles_at_32bpp +
++      ((x + width - 1) << msaa_x_log2) / xenos::kEdramTileWidthSamples + 1;
++  start = std::min(start << uint32_t(is_64bpp), xenos::kEdramTileCount);
++  end = std::min(end << uint32_t(is_64bpp), xenos::kEdramTileCount);
++  if (end > start) {
++    ChangeOwnership(key, start, end - start, nullptr);
++  }
++}
+ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
+     const draw_util::ResolveInfo& resolve_info, Transfer::Rectangle& clear_rectangle_out,
+     RenderTarget*& depth_render_target_out, std::vector<Transfer>& depth_transfers_out,
+@@ -1289,7 +1362,35 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
          ownership_ranges_.emplace(extent_end, it->second);
          it->second.end_tiles = extent_end;
        }
@@ -3285,7 +3382,7 @@ index 91ac08f..9734204 100644
    // TODO(Triang3l): Log that the shader has been successfully translated in
    // common code.
 diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
-index 0298f06..6d1de4f 100644
+index 0298f06..f9b3136 100644
 --- a/src/graphics/vulkan/render_target_cache.cpp
 +++ b/src/graphics/vulkan/render_target_cache.cpp
 @@ -10,6 +10,7 @@
@@ -3316,7 +3413,15 @@ index 0298f06..6d1de4f 100644
    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
                                           direct_resolve_pipeline_layout_depth_);
    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
-@@ -1288,6 +1295,12 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+@@ -1153,6 +1160,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+   // Copying.
+   bool copied = false;
+   if (resolve_info.copy_dest_extent_length) {
++    Ng2ClaimResolveSourceSurface(resolve_info);  // NG2 ADDITION
+     draw_util::ResolveCopyShaderConstants copy_shader_constants;
+     uint32_t copy_group_count_x, copy_group_count_y;
+     draw_util::ResolveCopyShaderIndex copy_shader =
+@@ -1288,6 +1296,12 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
            // Invalidate textures and mark the range as scaled if needed.
            texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
                                              resolve_info.copy_dest_extent_length);
@@ -3329,7 +3434,7 @@ index 0298f06..6d1de4f 100644
            written_address_out = resolve_info.copy_dest_extent_start;
            written_length_out = resolve_info.copy_dest_extent_length;
            copied = true;
-@@ -1900,6 +1913,8 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
+@@ -1900,6 +1914,8 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
        image_create_info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
      }
      image_create_info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
@@ -3338,7 +3443,7 @@ index 0298f06..6d1de4f 100644
    }
    if (image_create_info.format == VK_FORMAT_UNDEFINED) {
      REXGPU_ERROR("VulkanRenderTargetCache: Unknown {} render target format {}",
-@@ -4843,7 +4858,8 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+@@ -4843,7 +4859,8 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
        // Gather shader keys and sort to reduce pipeline state and binding
        // switches. Also gather stencil rectangles to clear if needed.
        bool need_stencil_bit_draws =
@@ -3348,7 +3453,7 @@ index 0298f06..6d1de4f 100644
        current_transfer_invocations_.clear();
        current_transfer_invocations_.reserve(current_transfers.size()
                                              << uint32_t(need_stencil_bit_draws));
-@@ -6152,4 +6168,430 @@ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dum
+@@ -6152,4 +6169,430 @@ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dum
    return all_pipelines_available;
  }
  
