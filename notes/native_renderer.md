@@ -5,7 +5,7 @@ options on (they are in `project/ng2/ng2.toml`); D3D12 ROV stays the default and
 Branch `native-vulkan-renderer`, started 2026-11-03.
 
 To try Vulkan: add `gpu_backend = "vulkan"` to `ng2.toml` next to ng2.exe (or pass
-`--gpu_backend=vulkan`). Frame generation works on Vulkan too (#114); not yet: the 30 fps half-rate cap.
+`--gpu_backend=vulkan`). Frame generation works on Vulkan too (#114); the 30 fps cap repeats every other frame on Vulkan (cadence not measured yet).
 
 5x gameplay GPU time (#106-#112): D3D12 ROV 8.7 ms; Vulkan 19.97 ms baseline -> 16.25 ms
 with `native_render_targets` + `native_resolves` (60 fps) -> 13.36 ms with the

@@ -817,7 +817,7 @@ index aa55a4a..7faa5c7 100644
  XE_UI_VULKAN_FUNCTION(vkCmdSetDepthBias)
  XE_UI_VULKAN_FUNCTION(vkCmdSetScissor)
 diff --git a/include/rex/ui/vulkan/presenter.h b/include/rex/ui/vulkan/presenter.h
-index 56ee43b..c337e9d 100644
+index 56ee43b..c2eb78e 100644
 --- a/include/rex/ui/vulkan/presenter.h
 +++ b/include/rex/ui/vulkan/presenter.h
 @@ -12,6 +12,7 @@
@@ -828,7 +828,7 @@ index 56ee43b..c337e9d 100644
  #include <cstddef>
  #include <cstdint>
  #include <memory>
-@@ -481,6 +482,15 @@ class VulkanPresenter final : public Presenter {
+@@ -481,6 +482,18 @@ class VulkanPresenter final : public Presenter {
    // well as by presenter initialization and shutdown.
    PaintContext paint_context_;
  
@@ -840,6 +840,9 @@ index 56ee43b..c337e9d 100644
 +  std::chrono::steady_clock::time_point frame_gen_last_new_frame_{};
 +  double frame_gen_interval_us_ = 16667.0;
 +  bool frame_gen_showing_generated_ = false;
++  // NG2 ADDITION: present_half_rate - the guest output image currently being repeated.
++  std::shared_ptr<GuestOutputImage> half_rate_shown_image_;
++  uint32_t half_rate_counter_ = 0;
 +
  #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
    void* temporal_upscaler_context_ = nullptr;
@@ -5590,7 +5593,7 @@ index 0000000..8318afb
 +
 +}  // namespace rex::ui::d3d12
 diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
-index 306118e..3b36552 100644
+index 306118e..c6c34a3 100644
 --- a/src/ui/d3d12/d3d12_presenter.cpp
 +++ b/src/ui/d3d12/d3d12_presenter.cpp
 @@ -10,7 +10,9 @@
@@ -5603,7 +5606,7 @@ index 306118e..3b36552 100644
  #include <cmath>
  #include <memory>
  #include <utility>
-@@ -30,9 +32,26 @@
+@@ -30,9 +32,24 @@
  #include <ffx_api/ffx_upscale.h>
  #endif
  
@@ -5617,9 +5620,7 @@ index 306118e..3b36552 100644
 +// NG2 ADDITION: display-side 30 fps cap. NG2's simulation is frame-locked to the guest
 +// vblank, so lowering the guest frame rate would slow the game down; instead every other
 +// new guest frame is simply not presented (ignored while frame generation is on).
-+REXCVAR_DEFINE_BOOL(present_half_rate, false, "UI/Presenter",
-+                    "Present only every other guest frame (e.g. 60 -> 30 fps); the game "
-+                    "itself keeps running at full rate");
++REXCVAR_DECLARE(bool, present_half_rate);  // NG2 ADDITION, ui/presenter.cpp
 +
  REXCVAR_DEFINE_BOOL(d3d12_allow_variable_refresh_rate_and_tearing, true, "UI/D3D12",
                      "Allow variable refresh rate and tearing");
@@ -5630,7 +5631,7 @@ index 306118e..3b36552 100644
  namespace rex::ui::d3d12 {
  
  // Generated with `xb buildshaders`.
-@@ -49,9 +68,11 @@ namespace shaders {
+@@ -49,9 +66,11 @@ namespace shaders {
  #include "ui/shaders/bytecode/d3d12_5_1/guest_output_ffx_fsr_rcas_ps.h"
  #endif
  #include "ui/shaders/bytecode/d3d12_5_1/guest_output_triangle_strip_rect_vs.h"
@@ -5642,7 +5643,7 @@ index 306118e..3b36552 100644
    // Await completion of the usage of everything before destroying anything.
    // From most likely the latest to most likely the earliest to be signaled, so
    // just one sleep will likely be needed.
-@@ -601,6 +622,132 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+@@ -601,6 +620,132 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
      // (and multiple threads can't paint the main target at the same time).
    }
  
@@ -5775,7 +5776,7 @@ index 306118e..3b36552 100644
    if (guest_output_resource) {
      GuestOutputPaintFlow guest_output_flow = GetGuestOutputPaintFlow(
          guest_output_properties, paint_context_.swap_chain_width, paint_context_.swap_chain_height,
-@@ -1155,9 +1302,12 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+@@ -1155,9 +1300,12 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
    // fullscreen is ever used in, the allow tearing flag must not be passed in
    // fullscreen, but DXGI fullscreen is largely unneeded with the flip
    // presentation model used in Direct3D 12).
@@ -5828,7 +5829,7 @@ index 9822f3b..34f0e31 100644
  
  VirtualKey ParseVirtualKey(std::string_view name) {
 diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
-index 7360ed9..bdde29b 100644
+index 7360ed9..534a1c9 100644
 --- a/src/ui/presenter.cpp
 +++ b/src/ui/presenter.cpp
 @@ -11,6 +11,7 @@
@@ -5839,7 +5840,7 @@ index 7360ed9..bdde29b 100644
  #include <cctype>
  #include <utility>
  
-@@ -21,11 +22,39 @@
+@@ -21,11 +22,44 @@
  #include <rex/ui/presenter.h>
  #include <rex/ui/window.h>
  
@@ -5863,6 +5864,11 @@ index 7360ed9..bdde29b 100644
  #endif
  
 +// NG2 ADDITION: vendor-neutral frame generation (D3D12 presenter).
++// NG2 ADDITION (moved from d3d12_presenter.cpp so every backend has it).
++REXCVAR_DEFINE_BOOL(present_half_rate, false, "UI/Presenter",
++                    "Present only every other guest frame (e.g. 60 -> 30 fps); the game "
++                    "itself keeps running at full rate");
++
 +REXCVAR_DEFINE_BOOL(frame_generation, false, "UI/Presenter",
 +                    "Show a generated frame between guest frames (doubles the displayed frame "
 +                    "rate; adds about half a guest frame of latency)");
@@ -5879,7 +5885,7 @@ index 7360ed9..bdde29b 100644
  REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
                      "Allow presentation from non-UI thread");
  
-@@ -287,6 +316,8 @@ Presenter::~Presenter() {
+@@ -287,6 +321,8 @@ Presenter::~Presenter() {
    // it if needed.
    assert_false(is_executing_ui_drawers_);
  
@@ -5888,7 +5894,7 @@ index 7360ed9..bdde29b 100644
  #if REX_PLATFORM_WIN32
    if (dxgi_ui_tick_thread_.joinable()) {
      {
-@@ -556,6 +587,12 @@ bool Presenter::RefreshGuestOutput(
+@@ -556,6 +592,12 @@ bool Presenter::RefreshGuestOutput(
    writable_properties.frontbuffer_height = frontbuffer_height;
    writable_properties.display_aspect_ratio_x = display_aspect_ratio_x;
    writable_properties.display_aspect_ratio_y = display_aspect_ratio_y;
@@ -5901,7 +5907,7 @@ index 7360ed9..bdde29b 100644
    writable_properties.is_8bpc = false;
    bool is_active = writable_properties.IsActive();
    if (is_active) {
-@@ -615,6 +652,23 @@ bool Presenter::RefreshGuestOutput(
+@@ -615,6 +657,23 @@ bool Presenter::RefreshGuestOutput(
  
    // Trigger the presentation on the host.
    PaintResult paint_result = PaintResult::kNotPresented;
@@ -5925,7 +5931,7 @@ index 7360ed9..bdde29b 100644
    {
      std::lock_guard<std::mutex> paint_mode_mutex_lock(paint_mode_mutex_);
      switch (paint_mode_) {
-@@ -767,6 +821,7 @@ void Presenter::RemoveUIDrawerFromUIThread(UIDrawer* drawer) {
+@@ -767,6 +826,7 @@ void Presenter::RemoveUIDrawerFromUIThread(UIDrawer* drawer) {
  }
  
  void Presenter::RequestUIPaintFromUIThread() {
@@ -5933,7 +5939,7 @@ index 7360ed9..bdde29b 100644
    if (is_in_ui_thread_paint_) {
      // The paint request will be done once in the end of PaintFromUIThread
      // according to the actual state at the moment that happens. It's common for
-@@ -840,6 +895,8 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
+@@ -840,6 +900,8 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
          (old_acquired_and_ready & ~uint32_t(3)) | (old_acquired_and_ready >> 2);
    }
    uint32_t mailbox_index = desired_acquired_and_ready & 3;
@@ -5942,7 +5948,7 @@ index 7360ed9..bdde29b 100644
    // Give the current acquired image to the caller, or UINT32_MAX if it's
    // inactive.
    const GuestOutputProperties& properties = guest_output_properties_[mailbox_index];
-@@ -850,6 +907,97 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
+@@ -850,6 +912,97 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
    return std::move(consumer_lock);
  }
  
@@ -6040,7 +6046,7 @@ index 7360ed9..bdde29b 100644
  Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
      const GuestOutputProperties& properties, uint32_t host_rt_width, uint32_t host_rt_height,
      uint32_t max_rt_width, uint32_t max_rt_height, const GuestOutputPaintConfig& config) const {
-@@ -1421,6 +1569,7 @@ bool Presenter::RequestPaintOrConnectionRecoveryViaWindow(bool force_ui_thread_p
+@@ -1421,6 +1574,7 @@ bool Presenter::RequestPaintOrConnectionRecoveryViaWindow(bool force_ui_thread_p
    if (force_ui_thread_paint_tick) {
      ForceUIThreadPaintTick();
    }
@@ -9251,7 +9257,7 @@ index 8197bb4..9edfba8 100644
      XE_UI_VULKAN_FEATURE(shaderCullDistance)
      XE_UI_VULKAN_FEATURE(sparseBinding)
 diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
-index 23645ef..a5275ba 100644
+index 23645ef..c2f827e 100644
 --- a/src/ui/vulkan/vulkan_presenter.cpp
 +++ b/src/ui/vulkan/vulkan_presenter.cpp
 @@ -26,6 +26,7 @@
@@ -9262,17 +9268,18 @@ index 23645ef..a5275ba 100644
  
  #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
  #include <ffx_api/ffx_api.h>
-@@ -46,6 +47,9 @@
+@@ -46,6 +47,10 @@
  #include <rex/ui/surface_mac.h>
  #endif
  
 +REXCVAR_DECLARE(bool, frame_generation);          // NG2 ADDITION, ui/presenter.cpp
 +REXCVAR_DECLARE(int32_t, frame_generation_debug);  // NG2 ADDITION, ui/presenter.cpp
++REXCVAR_DECLARE(bool, present_half_rate);          // NG2 ADDITION, ui/presenter.cpp
 +
  REXCVAR_DEFINE_BOOL(present_render_pass_clear, true, "UI/Presenter",
                      "Clear render pass during presentation");
  
-@@ -121,6 +125,554 @@ namespace shaders {
+@@ -121,6 +126,554 @@ namespace shaders {
  #include "../shaders/vulkan_spirv/guest_output_triangle_strip_rect_vs.h"
  }  // namespace shaders
  
@@ -9827,7 +9834,7 @@ index 23645ef..a5275ba 100644
  VulkanPresenter::PaintContext::Submission::~Submission() {
    const VulkanDevice::Functions& dfn = vulkan_device_->functions();
    const VkDevice device = vulkan_device_->device();
-@@ -200,6 +752,7 @@ VulkanPresenter::~VulkanPresenter() {
+@@ -200,6 +753,7 @@ VulkanPresenter::~VulkanPresenter() {
    // and the vkQueuePresentKHR semaphore wait).
    // This will await completion of all paint submissions also.
    paint_context_.DestroySwapchainAndVulkanSurface();
@@ -9835,10 +9842,26 @@ index 23645ef..a5275ba 100644
  
    // Await completion of the usage of everything before destroying anything
    // (paint submission completion already awaited).
-@@ -1645,6 +2198,64 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+@@ -1645,6 +2199,80 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
      // multiple threads can't paint the main target at the same time).
    }
  
++  // NG2 ADDITION: half-rate presentation (present_half_rate, the 30 fps cap). The swapchain
++  // image is already acquired here, so instead of skipping the present (as D3D12 does) every
++  // other new guest frame repeats the previously shown one - the same 30 fps cadence.
++  if (guest_output_image && REXCVAR_GET(present_half_rate) && !REXCVAR_GET(frame_generation)) {
++    if (LastConsumedGuestOutputIsNew()) {
++      if ((++half_rate_counter_ & 1) && half_rate_shown_image_) {
++        guest_output_image = half_rate_shown_image_;
++      } else {
++        half_rate_shown_image_ = guest_output_image;
++      }
++    } else if (half_rate_shown_image_) {
++      guest_output_image = half_rate_shown_image_;
++    }
++  } else {
++    half_rate_shown_image_.reset();
++  }
 +  // NG2 ADDITION: frame generation (port of the D3D12 presenter's). On a new guest frame,
 +  // show a generated frame halfway between it and the previous one now, and the real frame
 +  // half a guest frame later.
