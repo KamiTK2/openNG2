@@ -2552,6 +2552,90 @@ index 0000000..9291093
 +void OnSwap();
 +
 +}  // namespace rex::graphics::ng2prof
+diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
+index 953c5fd..de69f31 100644
+--- a/src/graphics/pipeline/render_target/cache.cpp
++++ b/src/graphics/pipeline/render_target/cache.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <rex/graphics/command_processor.h>  // NG2 DIAG
+ #include <algorithm>
+ #include <cmath>
+ #include <cstring>
+@@ -37,6 +38,11 @@ REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_for_psi_render_backend, tru
+ REXCVAR_DEFINE_BOOL(snorm16_render_target_full_range, true, "GPU",
+                     "Use full range for SNORM16 render targets");
+ 
++REXCVAR_DEFINE_BOOL(native_render_targets, false, "GPU",
++                    "Host render targets only: treat every render target as its own surface "
++                    "and skip EDRAM ownership transfers between aliasing render targets "
++                    "(native renderer, NG2 ADDITION)");
++
+ REXCVAR_DEFINE_BOOL(direct_host_resolve, true, "GPU",
+                     "Resolve from host render targets directly to shared memory when possible")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+@@ -1289,7 +1295,34 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
+         ownership_ranges_.emplace(extent_end, it->second);
+         it->second.end_tiles = extent_end;
+       }
+-      if (transfers_append_out) {
++      // NG2 ADDITION (native renderer step 1): surfaces are independent images; don't copy
++      // pixels between render targets that alias the same EDRAM tiles.
++      if (transfers_append_out && Ng2CensusActiveNow() && !it->second.render_target.IsEmpty() &&
++          it->second.render_target != dest) {  // NG2 DIAG: which aliasing the game relies on
++        RenderTargetKey src = it->second.render_target;
++        REXGPU_INFO("NG2 FRAME TRANSFER tiles {:X}-{:X} src base {:X} pitch {} msaa {} depth {} fmt {} "
++                    "-> dest base {:X} pitch {} msaa {} depth {} fmt {}{}",
++                    uint32_t(it->first), uint32_t(std::min(it->second.end_tiles, extent_end)),
++                    uint32_t(src.base_tiles), uint32_t(src.pitch_tiles_at_32bpp),
++                    uint32_t(src.msaa_samples), uint32_t(src.is_depth),
++                    uint32_t(src.resource_format), uint32_t(dest.base_tiles),
++                    uint32_t(dest.pitch_tiles_at_32bpp), uint32_t(dest.msaa_samples),
++                    uint32_t(dest.is_depth), uint32_t(dest.resource_format),
++                    resolve_clear_cutout ? " (resolve clear)" : "");
++      }
++      bool ng2_transfer = !REXCVAR_GET(native_render_targets);
++      if (!ng2_transfer && transfers_append_out) {
++        // Native surfaces still keep content across (1) clears done by resolves, which on
++        // the GPU hit the EDRAM tiles whatever surface owns them, and (2) the same surface
++        // re-bound with another MSAA sample count (NG2 switches its scene buffer 1x <-> 4x).
++        RenderTargetKey src = it->second.render_target;
++        ng2_transfer = resolve_clear_cutout != nullptr ||
++                       (src.base_tiles == dest.base_tiles &&
++                        src.pitch_tiles_at_32bpp == dest.pitch_tiles_at_32bpp &&
++                        src.is_depth == dest.is_depth &&
++                        src.resource_format == dest.resource_format);
++      }
++      if (transfers_append_out && ng2_transfer) {
+         RenderTargetKey transfer_source = it->second.render_target;
+         // Only perform the copying when actually changing the latest owner, not
+         // just the latest host depth owner - the transfer source is expected to
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index 76f5600..ce34e70 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <rex/graphics/command_processor.h>  // NG2 DIAG
+ #include <algorithm>
+ #include <cstdint>
+ #include <utility>
+@@ -446,6 +447,11 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
+   // not up to date anymore.
+   texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
+   texture.LogAction("Loaded");
++  if (Ng2CensusActiveNow()) {  // NG2 DIAG
++    REXGPU_INFO("NG2 FRAME TEXLOAD base {:08X} {}x{} format {} scaled {}", texture_key.base_page << 12,
++                texture_key.GetWidth(), texture_key.GetHeight(), uint32_t(texture_key.format),
++                uint32_t(texture_key.scaled_resolve));
++  }
+ 
+   return true;
+ }
 diff --git a/src/graphics/primitive_processor.cpp b/src/graphics/primitive_processor.cpp
 index d49e9c3..6f97694 100644
 --- a/src/graphics/primitive_processor.cpp
