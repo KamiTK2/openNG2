@@ -57,11 +57,20 @@ stream can't express (e.g. CPU reads of a resolved texture: write back on demand
 1. [x] Vulkan backend builds and runs (emulated) - `--gpu_backend=vulkan` (#98)
 2. [x] Emulated Vulkan path renders gameplay (black 3D was an SPIR-V exp_adjust bug, fixed, #103)
 3. [~] Native render targets behind `--native_render_targets=true`: step 1 (no EDRAM transfers except clears / MSAA switches) correct on D3D12 and Vulkan (#102, #103)
-4. [ ] Native resolves -> host textures
+4. [~] Native resolves -> host textures: step 1 on Vulkan (`--native_resolves=true`, 1x colour RTs, blit snapshot -> texture copy), -1.8 ms at 5x (#109); scene buffer and depth not yet
 5. [ ] Drain skipping, per-frame stats vs the emulated path
 6. [ ] Scene-by-scene correctness: title, menus, gameplay, cutscenes, HUD, effects
 7. [ ] Port features on Vulkan: internal resolution, FSR / CAS, frame generation, ultrawide
 8. [ ] Linux build
+
+## Where the time goes (5x Vulkan, #107)
+
+A 5x gameplay frame is ~21 ms on Vulkan: EDRAM ownership transfers 8.5 ms (mostly the 1x <-> 4x
+MSAA aliasing of the scene buffer and its depth/stencil), resolve -> texture copies 5.1 ms,
+resolve/untile compute 3.0 ms, uploads 1.3 ms, the game's own draws 3.7 ms. NG2 renders its
+scene into a 4x MSAA surface and reads the samples back as a 2x-wide/2x-tall 1x surface. The next big
+step is storing 4x MSAA surfaces as supersampled 1x images so both views share one layout
+(no transfers, and the scene-buffer resolve becomes a plain copy).
 
 ## Testing
 

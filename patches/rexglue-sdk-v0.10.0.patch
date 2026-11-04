@@ -184,6 +184,136 @@ index 696ff48..81b6a03 100644
    bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
    bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
  
+diff --git a/include/rex/graphics/vulkan/deferred_command_buffer.h b/include/rex/graphics/vulkan/deferred_command_buffer.h
+index 9d2a848..a81c682 100644
+--- a/include/rex/graphics/vulkan/deferred_command_buffer.h
++++ b/include/rex/graphics/vulkan/deferred_command_buffer.h
+@@ -203,7 +203,28 @@ class DeferredCommandBuffer {
+     args.region_count = region_count;
+     return reinterpret_cast<VkBufferImageCopy*>(args_ptr + header_size);
+   }
+-  void CmdVkCopyBufferToImage(VkBuffer src_buffer, VkImage dst_image,
++  // NG2 ADDITION: native resolves (render target -> snapshot -> texture image copies).
++  void CmdVkCopyImage(VkImage src_image, VkImageLayout src_image_layout, VkImage dst_image,
++                      VkImageLayout dst_image_layout, const VkImageCopy& region) {
++    auto& args = *reinterpret_cast<ArgsVkCopyImage*>(
++        WriteCommand(Command::kVkCopyImage, sizeof(ArgsVkCopyImage)));
++    args.src_image = src_image;
++    args.src_image_layout = src_image_layout;
++    args.dst_image = dst_image;
++    args.dst_image_layout = dst_image_layout;
++    args.region = region;
++  }  void CmdVkBlitImage(VkImage src_image, VkImageLayout src_image_layout, VkImage dst_image,
++                      VkImageLayout dst_image_layout, const VkImageBlit& region,
++                      VkFilter filter) {  // NG2 ADDITION
++    auto& args = *reinterpret_cast<ArgsVkBlitImage*>(
++        WriteCommand(Command::kVkBlitImage, sizeof(ArgsVkBlitImage)));
++    args.src_image = src_image;
++    args.src_image_layout = src_image_layout;
++    args.dst_image = dst_image;
++    args.dst_image_layout = dst_image_layout;
++    args.region = region;
++    args.filter = filter;
++  }  void CmdVkCopyBufferToImage(VkBuffer src_buffer, VkImage dst_image,
+                               VkImageLayout dst_image_layout, uint32_t region_count,
+                               const VkBufferImageCopy* regions) {
+     std::memcpy(CmdCopyBufferToImageEmplace(src_buffer, dst_image, dst_image_layout, region_count),
+@@ -363,6 +384,8 @@ class DeferredCommandBuffer {
+     kVkClearColorImage,
+     kVkCopyBuffer,
+     kVkCopyBufferToImage,
++    kVkCopyImage,  // NG2 ADDITION
++    kVkBlitImage,  // NG2 ADDITION
+     kVkCopyQueryPoolResults,
+     kVkDispatch,
+     kVkDraw,
+@@ -475,6 +498,21 @@ class DeferredCommandBuffer {
+     static_assert(alignof(VkBufferCopy) <= alignof(uintmax_t));
+   };
+ 
++  struct ArgsVkBlitImage {  // NG2 ADDITION
++    VkImage src_image;
++    VkImageLayout src_image_layout;
++    VkImage dst_image;
++    VkImageLayout dst_image_layout;
++    VkImageBlit region;
++    VkFilter filter;
++  };
++  struct ArgsVkCopyImage {  // NG2 ADDITION
++    VkImage src_image;
++    VkImageLayout src_image_layout;
++    VkImage dst_image;
++    VkImageLayout dst_image_layout;
++    VkImageCopy region;
++  };
+   struct ArgsVkCopyBufferToImage {
+     VkBuffer src_buffer;
+     VkImage dst_image;
+diff --git a/include/rex/graphics/vulkan/render_target_cache.h b/include/rex/graphics/vulkan/render_target_cache.h
+index 34f7033..6083e64 100644
+--- a/include/rex/graphics/vulkan/render_target_cache.h
++++ b/include/rex/graphics/vulkan/render_target_cache.h
+@@ -805,6 +805,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+   bool TryResolveCopyDirectly(const draw_util::ResolveInfo& resolve_info,
+                               draw_util::ResolveCopyShaderIndex copy_shader,
+                               bool draw_resolution_scaled);
++  // NG2 ADDITION: native resolves - snapshot the resolved render target region for the
++  // texture cache (VulkanTextureCache::Ng2NativeResolve). Returns whether it was recorded.
++  bool Ng2RecordNativeResolve(const draw_util::ResolveInfo& resolve_info,
++                              VulkanTextureCache& texture_cache);
++  uint64_t ng2_native_resolves_recorded_ = 0, ng2_native_resolves_rejected_ = 0;
+ 
+   // Writes contents of host render targets within rectangles from
+   // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.
+diff --git a/include/rex/graphics/vulkan/texture_cache.h b/include/rex/graphics/vulkan/texture_cache.h
+index 04856ee..4b50073 100644
+--- a/include/rex/graphics/vulkan/texture_cache.h
++++ b/include/rex/graphics/vulkan/texture_cache.h
+@@ -133,6 +133,30 @@ class VulkanTextureCache final : public TextureCache {
+   void UseScaledResolveBufferForWrite(uint64_t written_start_scaled,
+                                       uint64_t written_length_scaled);
+ 
++  // NG2 ADDITION: native resolves (cvar native_resolves). A scaled resolve of a 1x colour
++  // render target into a texture with the same host format also copies the render target
++  // region into a host image ("snapshot"); loading that texture later copies the snapshot
++  // instead of untiling the scaled resolve buffer and copying a buffer to the image.
++  struct Ng2NativeResolve {
++    uint32_t extent_start = 0, extent_length = 0;  // guest memory the resolve wrote
++    uint32_t dest_base = 0, pitch_div_32 = 0, width = 0, height = 0;  // unscaled
++    xenos::TextureFormat format = xenos::TextureFormat(0);
++    uint32_t endian = 0;
++    VkFormat host_format = VK_FORMAT_UNDEFINED;   // the texture's host format
++    VkFormat image_format = VK_FORMAT_UNDEFINED;  // snapshot (size-compatible, may swap R/B)
++    uint32_t width_scaled = 0, height_scaled = 0;
++    VkImage image = VK_NULL_HANDLE;
++    VmaAllocation allocation = VK_NULL_HANDLE;
++    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
++    bool valid = false;
++  };
++  VkFormat Ng2GetTextureHostFormat(xenos::TextureFormat format) const;
++  // Returns a snapshot image of the given size and format for the destination (valid = false
++  // until the caller has recorded the copy), or nullptr.
++  Ng2NativeResolve* Ng2AcquireNativeResolve(uint32_t dest_base, VkFormat host_format, VkFormat image_format,
++                                            uint32_t width_scaled, uint32_t height_scaled);
++  void Ng2InvalidateNativeResolves(uint32_t start, uint32_t length);
++
+  protected:
+   bool IsSignedVersionSeparateForFormat(TextureKey key) const override;
+   bool IsScaledResolveSupportedForFormat(TextureKey key) const override;
+@@ -327,6 +351,13 @@ class VulkanTextureCache final : public TextureCache {
+ 
+   xenos::ClampMode NormalizeClampMode(xenos::ClampMode clamp_mode) const;
+ 
++  // NG2 ADDITION: native resolves.
++  bool Ng2TryLoadFromNativeResolve(VulkanTexture& texture, VkFormat host_format);
++  void Ng2DestroyNativeResolves(bool all);
++  std::vector<Ng2NativeResolve> ng2_native_resolves_;
++  std::vector<std::pair<uint64_t, std::pair<VkImage, VmaAllocation>>> ng2_native_resolves_destroy_;
++  uint64_t ng2_native_resolve_loads_ = 0, ng2_native_resolve_loads_logged_ = 0;
++
+   VulkanCommandProcessor& command_processor_;
+   VkPipelineStageFlags guest_shader_pipeline_stages_;
+ 
 diff --git a/include/rex/input/input_filter.h b/include/rex/input/input_filter.h
 new file mode 100644
 index 0000000..b88380b
@@ -621,15 +751,17 @@ index afb4a30..59034f9 100644
  
  }  // namespace ui
 diff --git a/include/rex/ui/vulkan/functions/device_1_0.inc b/include/rex/ui/vulkan/functions/device_1_0.inc
-index aa55a4a..64227ce 100644
+index aa55a4a..7faa5c7 100644
 --- a/include/rex/ui/vulkan/functions/device_1_0.inc
 +++ b/include/rex/ui/vulkan/functions/device_1_0.inc
-@@ -25,6 +25,9 @@ XE_UI_VULKAN_FUNCTION(vkCmdEndQuery)
+@@ -25,6 +25,11 @@ XE_UI_VULKAN_FUNCTION(vkCmdEndQuery)
  XE_UI_VULKAN_FUNCTION(vkCmdPipelineBarrier)
  XE_UI_VULKAN_FUNCTION(vkCmdPushConstants)
  XE_UI_VULKAN_FUNCTION(vkCmdResetQueryPool)
 +// NG2 ADDITION: GPU frame timer (ng2_gpu_frame_time)
 +XE_UI_VULKAN_FUNCTION(vkCmdWriteTimestamp)
++XE_UI_VULKAN_FUNCTION(vkCmdCopyImage)  // NG2 ADDITION: native resolves
++XE_UI_VULKAN_FUNCTION(vkCmdBlitImage)  // NG2 ADDITION: native resolves
 +XE_UI_VULKAN_FUNCTION(vkGetQueryPoolResults)
  XE_UI_VULKAN_FUNCTION(vkCmdSetBlendConstants)
  XE_UI_VULKAN_FUNCTION(vkCmdSetDepthBias)
@@ -3085,6 +3217,27 @@ index 001f36b..ca5e63d 100644
      current_submission_wait_stage_masks_.clear();
      for (VkSemaphore semaphore : current_submission_wait_semaphores_) {
        submissions_in_flight_semaphores_.emplace_back(submission_current, semaphore);
+diff --git a/src/graphics/vulkan/deferred_command_buffer.cpp b/src/graphics/vulkan/deferred_command_buffer.cpp
+index b49e033..29f8283 100644
+--- a/src/graphics/vulkan/deferred_command_buffer.cpp
++++ b/src/graphics/vulkan/deferred_command_buffer.cpp
+@@ -156,6 +156,16 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+                 rex::align(sizeof(ArgsVkCopyBufferToImage), alignof(VkBufferImageCopy))));
+       } break;
+ 
++      case Command::kVkBlitImage: {  // NG2 ADDITION
++        auto& args = *reinterpret_cast<const ArgsVkBlitImage*>(stream);
++        dfn.vkCmdBlitImage(command_buffer, args.src_image, args.src_image_layout, args.dst_image,
++                           args.dst_image_layout, 1, &args.region, args.filter);
++      } break;
++      case Command::kVkCopyImage: {  // NG2 ADDITION
++        auto& args = *reinterpret_cast<const ArgsVkCopyImage*>(stream);
++        dfn.vkCmdCopyImage(command_buffer, args.src_image, args.src_image_layout, args.dst_image,
++                           args.dst_image_layout, 1, &args.region);
++      } break;
+       case Command::kVkCopyQueryPoolResults: {
+         auto& args = *reinterpret_cast<const ArgsVkCopyQueryPoolResults*>(stream);
+         dfn.vkCmdCopyQueryPoolResults(command_buffer, args.query_pool, args.first_query,
 diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
 index 91ac08f..9734204 100644
 --- a/src/graphics/vulkan/pipeline_cache.cpp
@@ -3108,6 +3261,396 @@ index 91ac08f..9734204 100644
  
    // TODO(Triang3l): Log that the shader has been successfully translated in
    // common code.
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 0298f06..f84d20f 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -37,6 +37,8 @@
+ #include <rex/math.h>
+ #include <rex/ui/vulkan/util.h>
+ 
++REXCVAR_DECLARE(bool, native_resolves);  // NG2 ADDITION, vulkan/texture_cache.cpp
++
+ REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
+                       "Vulkan render target implementation path")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+@@ -1288,6 +1290,12 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+           // Invalidate textures and mark the range as scaled if needed.
+           texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
+                                             resolve_info.copy_dest_extent_length);
++          // NG2 ADDITION: native resolves - drop overlapping snapshots, then try to record one.
++          texture_cache.Ng2InvalidateNativeResolves(resolve_info.copy_dest_extent_start,
++                                                    resolve_info.copy_dest_extent_length);
++          if (REXCVAR_GET(native_resolves)) {
++            Ng2RecordNativeResolve(resolve_info, texture_cache);
++          }
+           written_address_out = resolve_info.copy_dest_extent_start;
+           written_length_out = resolve_info.copy_dest_extent_length;
+           copied = true;
+@@ -1900,6 +1908,8 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
+       image_create_info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+     }
+     image_create_info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
++    // NG2 ADDITION: native resolves copy render target regions into snapshot images.
++    image_create_info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+   }
+   if (image_create_info.format == VK_FORMAT_UNDEFINED) {
+     REXGPU_ERROR("VulkanRenderTargetCache: Unknown {} render target format {}",
+@@ -6152,4 +6162,157 @@ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dum
+   return all_pipelines_available;
+ }
+ 
++// NG2 ADDITION: native resolves (see VulkanTextureCache::Ng2NativeResolve).
++bool VulkanRenderTargetCache::Ng2RecordNativeResolve(const draw_util::ResolveInfo& resolve_info,
++                                                     VulkanTextureCache& texture_cache) {
++  int reason = 0;
++  auto reject = [&]() {
++    if (++ng2_native_resolves_rejected_ <= 200) {
++      REXGPU_INFO(
++          "NG2 native resolve rejected (step {}): dest {:08X} src fmt {} msaa {} 64bpp {} "
++          "dest fmt {} num {} bias {} swap {} endian {} off {},{} base {} pitch {}",
++          reason, resolve_info.copy_dest_base, uint32_t(resolve_info.color_edram_info.format),
++          uint32_t(resolve_info.color_edram_info.msaa_samples),
++          uint32_t(resolve_info.color_edram_info.format_is_64bpp),
++          uint32_t(resolve_info.copy_dest_info.copy_dest_format),
++          uint32_t(resolve_info.copy_dest_info.copy_dest_number),
++          int32_t(resolve_info.copy_dest_info.copy_dest_exp_bias),
++          uint32_t(resolve_info.copy_dest_info.copy_dest_swap),
++          uint32_t(resolve_info.copy_dest_info.copy_dest_endian),
++          uint32_t(resolve_info.copy_dest_coordinate_info.offset_x_div_8),
++          uint32_t(resolve_info.copy_dest_coordinate_info.offset_y_div_8),
++          uint32_t(resolve_info.color_edram_info.base_tiles),
++          uint32_t(resolve_info.color_edram_info.pitch_tiles));
++    }
++    return false;
++  };
++  if (GetPath() != Path::kHostRenderTargets || !IsDrawResolutionScaled() ||
++      resolve_info.IsCopyingDepth()) {
++    return (reason = 1, reject());
++  }
++  const draw_util::ResolveEdramInfo edram_info = resolve_info.color_edram_info;
++  const reg::RB_COPY_DEST_INFO dest_info = resolve_info.copy_dest_info;
++  if (edram_info.msaa_samples != xenos::MsaaSamples::k1X || edram_info.format_is_64bpp ||
++      dest_info.copy_dest_exp_bias != 0 || dest_info.copy_dest_array ||
++      resolve_info.copy_dest_coordinate_info.offset_x_div_8 ||
++      resolve_info.copy_dest_coordinate_info.offset_y_div_8 ||
++      uint32_t(dest_info.copy_dest_endian) >= 4) {
++    return (reason = 2, reject());
++  }
++  // Supported conversions (done by a blit, which converts by value; a red/blue swap blits
++  // into a B8G8R8A8 snapshot whose bytes are then copied raw into the R8G8B8A8 texture):
++  //   8888 -> 8888 (unorm), 7e3 -> 8888 (unorm, clamped), 7e3 -> 16_16_16_16_FLOAT.
++  auto rt_format = xenos::ColorRenderTargetFormat(edram_info.format);
++  bool rt_7e3 = rt_format == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
++                rt_format == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16;
++  bool rt_8888 = rt_format == xenos::ColorRenderTargetFormat::k_8_8_8_8;
++  auto texture_format = xenos::TextureFormat(uint32_t(dest_info.copy_dest_format));
++  VkFormat host_format = texture_cache.Ng2GetTextureHostFormat(texture_format);
++  VkFormat image_format = VK_FORMAT_UNDEFINED;
++  if ((rt_8888 || rt_7e3) && dest_info.copy_dest_format == xenos::ColorFormat::k_8_8_8_8 &&
++      uint32_t(dest_info.copy_dest_number) == 0 && host_format == VK_FORMAT_R8G8B8A8_UNORM) {
++    image_format = dest_info.copy_dest_swap ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_R8G8B8A8_UNORM;
++  } else if (rt_7e3 && dest_info.copy_dest_format == xenos::ColorFormat::k_16_16_16_16_FLOAT &&
++             !dest_info.copy_dest_swap && host_format == VK_FORMAT_R16G16B16A16_SFLOAT) {
++    image_format = VK_FORMAT_R16G16B16A16_SFLOAT;
++  }
++  if (image_format == VK_FORMAT_UNDEFINED) {
++    return (reason = 3, reject());
++  }
++  VkFormat rt_host_format = GetColorVulkanFormat(rt_format);
++  if (rt_host_format == VK_FORMAT_UNDEFINED) {
++    return (reason = 4, reject());
++  }
++
++  // One render target must own the whole resolved span.
++  uint32_t span_base, span_row_length, span_rows, span_pitch;
++  resolve_info.GetCopyEdramTileSpan(span_base, span_row_length, span_rows, span_pitch);
++  GetResolveCopyRectanglesToDump(span_base, span_row_length, span_rows, span_pitch,
++                                 dump_rectangles_);
++  if (dump_rectangles_.size() != 1) {
++    return (reason = 5, reject());
++  }
++  const ResolveCopyDumpRectangle& rectangle = dump_rectangles_[0];
++  if (!rectangle.render_target || rectangle.row_first != 0 || rectangle.rows != span_rows ||
++      rectangle.row_first_start != 0 ||
++      rectangle.row_last_end != (span_rows > 1 ? span_row_length : span_row_length)) {
++    return (reason = 6, reject());
++  }
++  auto& rt = *static_cast<VulkanRenderTarget*>(rectangle.render_target);
++  RenderTargetKey rt_key = rt.key();
++  if (rt_key.is_depth || rt_key.msaa_samples != xenos::MsaaSamples::k1X || rt_key.Is64bpp()) {
++    return (reason = 70 + uint32_t(rt_key.msaa_samples), reject());
++  }
++  if (rt_key.pitch_tiles_at_32bpp != edram_info.pitch_tiles) {
++    return (reason = 75, reject());
++  }
++  if (GetColorVulkanFormat(rt_key.GetColorFormat()) != rt_host_format) {
++    return (reason = 76, reject());
++  }
++
++  // Source rectangle in the render target (32bpp 1x: 80x16 pixel tiles).
++  uint32_t pitch = edram_info.pitch_tiles;
++  uint32_t delta = (edram_info.base_tiles + xenos::kEdramTileCount - rt_key.base_tiles) %
++                   xenos::kEdramTileCount;
++  uint32_t src_x = (delta % pitch) * xenos::kEdramTileWidthSamples +
++                   resolve_info.coordinate_info.edram_offset_x_div_8 * 8;
++  uint32_t src_y = (delta / pitch) * xenos::kEdramTileHeightSamples +
++                   resolve_info.coordinate_info.edram_offset_y_div_8 * 8;
++  uint32_t width = resolve_info.coordinate_info.width_div_8 * 8;
++  uint32_t height = resolve_info.height_div_8 * 8;
++  uint32_t scale_x = draw_resolution_scale_x(), scale_y = draw_resolution_scale_y();
++  uint32_t rt_width = rt_key.GetWidth() * scale_x;
++  uint32_t rt_height =
++      GetRenderTargetHeight(rt_key.pitch_tiles_at_32bpp, rt_key.msaa_samples) * scale_y;
++  if (!width || !height || (src_x + width) * scale_x > rt_width ||
++      (src_y + height) * scale_y > rt_height) {
++    return (reason = 8, reject());
++  }
++
++  VulkanTextureCache::Ng2NativeResolve* entry = texture_cache.Ng2AcquireNativeResolve(
++      resolve_info.copy_dest_base, host_format, image_format, width * scale_x, height * scale_y);
++  if (!entry) {
++    return (reason = 9, reject());
++  }
++  entry->extent_start = resolve_info.copy_dest_extent_start;
++  entry->extent_length = resolve_info.copy_dest_extent_length;
++  entry->pitch_div_32 = resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32;
++  entry->width = width;
++  entry->height = height;
++  entry->format = texture_format;
++  entry->endian = uint32_t(dest_info.copy_dest_endian);
++
++  // Render target -> transfer source, snapshot -> transfer destination.
++  command_processor_.PushImageMemoryBarrier(
++      rt.image(), ui::vulkan::util::InitializeSubresourceRange(), rt.current_stage_mask(),
++      VK_PIPELINE_STAGE_TRANSFER_BIT, rt.current_access_mask(), VK_ACCESS_TRANSFER_READ_BIT,
++      rt.current_layout(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++  rt.SetUsage(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
++              VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++  command_processor_.PushImageMemoryBarrier(
++      entry->image, ui::vulkan::util::InitializeSubresourceRange(),
++      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
++      VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
++      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++  command_processor_.SubmitBarriers(true);
++  VkImageBlit region = {};
++  region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++  region.srcSubresource.layerCount = 1;
++  region.dstSubresource = region.srcSubresource;
++  region.srcOffsets[0].x = int32_t(src_x * scale_x);
++  region.srcOffsets[0].y = int32_t(src_y * scale_y);
++  region.srcOffsets[1].x = int32_t((src_x + width) * scale_x);
++  region.srcOffsets[1].y = int32_t((src_y + height) * scale_y);
++  region.srcOffsets[1].z = 1;
++  region.dstOffsets[1].x = int32_t(width * scale_x);
++  region.dstOffsets[1].y = int32_t(height * scale_y);
++  region.dstOffsets[1].z = 1;
++  command_processor_.deferred_command_buffer().CmdVkBlitImage(
++      rt.image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, entry->image,
++      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region, VK_FILTER_NEAREST);
++  entry->layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++  entry->valid = true;
++  ++ng2_native_resolves_recorded_;
++  return true;
++}
+ }  // namespace rex::graphics::vulkan
+diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
+index ecbd940..c34495f 100644
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -34,6 +34,9 @@
+ #include <rex/ui/vulkan/util.h>
+ 
+ REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
++REXCVAR_DEFINE_BOOL(native_resolves, false, "GPU",
++                    "Vulkan, host render targets, resolution scale > 1: copy resolved render target "
++                    "regions into host images and load textures from them (NG2 ADDITION)");
+ 
+ namespace rex::graphics::vulkan {
+ 
+@@ -485,6 +488,7 @@ VulkanTextureCache::~VulkanTextureCache() {
+   // Textures memory is allocated using the Vulkan Memory Allocator, destroy all
+   // textures before destroying VMA.
+   DestroyAllTextures(true);
++  Ng2DestroyNativeResolves(true);  // NG2 ADDITION
+ 
+   if (vma_allocator_ != VK_NULL_HANDLE) {
+     vmaDestroyAllocator(vma_allocator_);
+@@ -493,6 +497,7 @@ VulkanTextureCache::~VulkanTextureCache() {
+ 
+ void VulkanTextureCache::BeginSubmission(uint64_t new_submission_index) {
+   TextureCache::BeginSubmission(new_submission_index);
++  Ng2DestroyNativeResolves(false);  // NG2 ADDITION
+ 
+   if (!null_images_cleared_ && null_image_2d_array_cube_ != VK_NULL_HANDLE &&
+       null_image_3d_ != VK_NULL_HANDLE) {
+@@ -1228,6 +1233,11 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+   }
+   const HostFormat& host_format =
+       host_format_is_signed ? host_format_pair.format_signed : host_format_pair.format_unsigned;
++  // NG2 ADDITION: native resolves - copy the render target snapshot if this texture is one.
++  if (load_base && texture_key.scaled_resolve && REXCVAR_GET(native_resolves) &&
++      Ng2TryLoadFromNativeResolve(vulkan_texture, host_format.format)) {
++    return true;
++  }
+   LoadShaderIndex load_shader = host_format.load_shader;
+   if (load_shader == kLoadShaderIndexUnknown) {
+     return false;
+@@ -3258,4 +3268,154 @@ xenos::ClampMode VulkanTextureCache::NormalizeClampMode(xenos::ClampMode clamp_m
+   return clamp_mode;
+ }
+ 
++// NG2 ADDITION: native resolves (see texture_cache.h).
++VkFormat VulkanTextureCache::Ng2GetTextureHostFormat(xenos::TextureFormat format) const {
++  const HostFormatPair& pair = host_formats_[uint32_t(format) & 63];
++  return pair.format_unsigned.format;
++}
++
++VulkanTextureCache::Ng2NativeResolve* VulkanTextureCache::Ng2AcquireNativeResolve(
++    uint32_t dest_base, VkFormat host_format, VkFormat image_format, uint32_t width_scaled,
++    uint32_t height_scaled) {
++  for (size_t i = 0; i < ng2_native_resolves_.size(); ++i) {
++    Ng2NativeResolve& entry = ng2_native_resolves_[i];
++    if (entry.dest_base != dest_base) {
++      continue;
++    }
++    if (entry.host_format == host_format && entry.image_format == image_format &&
++        entry.width_scaled == width_scaled &&
++        entry.height_scaled == height_scaled) {
++      entry.valid = false;
++      return &entry;
++    }
++    // Same destination, other size or format: retire the old image after the GPU is done.
++    ng2_native_resolves_destroy_.emplace_back(command_processor_.GetCurrentSubmission(),
++                                              std::make_pair(entry.image, entry.allocation));
++    ng2_native_resolves_.erase(ng2_native_resolves_.begin() + i);
++    break;
++  }
++  if (ng2_native_resolves_.size() >= 64) {
++    return nullptr;
++  }
++  VkImageCreateInfo image_create_info = {};
++  image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++  image_create_info.imageType = VK_IMAGE_TYPE_2D;
++  image_create_info.format = image_format;
++  image_create_info.extent.width = width_scaled;
++  image_create_info.extent.height = height_scaled;
++  image_create_info.extent.depth = 1;
++  image_create_info.mipLevels = 1;
++  image_create_info.arrayLayers = 1;
++  image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
++  image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
++  image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++  image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++  image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++  VmaAllocationCreateInfo allocation_create_info = {};
++  allocation_create_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
++  Ng2NativeResolve entry;
++  if (vmaCreateImage(vma_allocator_, &image_create_info, &allocation_create_info, &entry.image,
++                     &entry.allocation, nullptr) != VK_SUCCESS) {
++    return nullptr;
++  }
++  entry.dest_base = dest_base;
++  entry.host_format = host_format;
++  entry.image_format = image_format;
++  entry.width_scaled = width_scaled;
++  entry.height_scaled = height_scaled;
++  REXGPU_INFO("NG2 native resolve: snapshot image {:08X} {}x{} format {}", dest_base,
++              width_scaled, height_scaled, uint32_t(image_format));
++  ng2_native_resolves_.push_back(entry);
++  return &ng2_native_resolves_.back();
++}
++
++void VulkanTextureCache::Ng2InvalidateNativeResolves(uint32_t start, uint32_t length) {
++  for (Ng2NativeResolve& entry : ng2_native_resolves_) {
++    if (entry.valid && start < entry.extent_start + entry.extent_length &&
++        entry.extent_start < start + length) {
++      entry.valid = false;
++    }
++  }
++}
++
++void VulkanTextureCache::Ng2DestroyNativeResolves(bool all) {
++  if (all) {
++    for (Ng2NativeResolve& entry : ng2_native_resolves_) {
++      ng2_native_resolves_destroy_.emplace_back(0, std::make_pair(entry.image, entry.allocation));
++    }
++    ng2_native_resolves_.clear();
++  }
++  uint64_t completed = command_processor_.GetCompletedSubmission();
++  for (size_t i = 0; i < ng2_native_resolves_destroy_.size();) {
++    if (all || ng2_native_resolves_destroy_[i].first <= completed) {
++      vmaDestroyImage(vma_allocator_, ng2_native_resolves_destroy_[i].second.first,
++                      ng2_native_resolves_destroy_[i].second.second);
++      ng2_native_resolves_destroy_.erase(ng2_native_resolves_destroy_.begin() + i);
++    } else {
++      ++i;
++    }
++  }
++}
++
++bool VulkanTextureCache::Ng2TryLoadFromNativeResolve(VulkanTexture& texture,
++                                                     VkFormat host_format) {
++  TextureKey key = texture.key();
++  if (key.dimension != xenos::DataDimension::k2DOrStacked || key.GetDepthOrArraySize() != 1 ||
++      key.mip_max_level != 0 || !key.tiled || key.packed_mips) {
++    return false;
++  }
++  uint32_t base = key.base_page << 12;
++  for (Ng2NativeResolve& entry : ng2_native_resolves_) {
++    if (!entry.valid || entry.dest_base != base || entry.format != key.format ||
++        entry.endian != uint32_t(key.endianness) || entry.pitch_div_32 != key.pitch ||
++        entry.host_format != host_format || entry.width < key.GetWidth() ||
++        entry.height < key.GetHeight()) {
++      continue;
++    }
++    uint32_t width_scaled = key.GetWidth() * draw_resolution_scale_x();
++    uint32_t height_scaled = key.GetHeight() * draw_resolution_scale_y();
++    if (width_scaled > entry.width_scaled || height_scaled > entry.height_scaled) {
++      continue;
++    }
++    // Snapshot: transfer write (or an earlier read) -> transfer read.
++    if (entry.layout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
++      command_processor_.PushImageMemoryBarrier(
++          entry.image, ui::vulkan::util::InitializeSubresourceRange(),
++          VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
++          VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, entry.layout,
++          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++      entry.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
++    }
++    texture.MarkAsUsed();
++    VulkanTexture::Usage old_usage = texture.SetUsage(VulkanTexture::Usage::kTransferDestination);
++    if (old_usage != VulkanTexture::Usage::kTransferDestination) {
++      VkPipelineStageFlags src_stage, dst_stage;
++      VkAccessFlags src_access, dst_access;
++      VkImageLayout old_layout, new_layout;
++      GetTextureUsageMasks(old_usage, src_stage, src_access, old_layout);
++      GetTextureUsageMasks(VulkanTexture::Usage::kTransferDestination, dst_stage, dst_access,
++                           new_layout);
++      command_processor_.PushImageMemoryBarrier(
++          texture.image(), ui::vulkan::util::InitializeSubresourceRange(), src_stage, dst_stage,
++          src_access, dst_access, old_layout, new_layout);
++    }
++    command_processor_.SubmitBarriers(true);
++    VkImageCopy region = {};
++    region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    region.srcSubresource.layerCount = 1;
++    region.dstSubresource = region.srcSubresource;
++    region.extent.width = width_scaled;
++    region.extent.height = height_scaled;
++    region.extent.depth = 1;
++    command_processor_.deferred_command_buffer().CmdVkCopyImage(
++        entry.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, texture.image(),
++        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
++    if ((++ng2_native_resolve_loads_ & 1023) == 1) {
++      REXGPU_INFO("NG2 native resolve: {} texture loads from snapshots (latest {:08X} {}x{})",
++                  ng2_native_resolve_loads_, base, width_scaled, height_scaled);
++    }
++    return true;
++  }
++  return false;
++}
+ }  // namespace rex::graphics::vulkan
 diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
 index 813bb1c..2bdc8d5 100644
 --- a/src/input/input_system.cpp
