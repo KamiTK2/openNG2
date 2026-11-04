@@ -1,6 +1,15 @@
 # openNG2 native Vulkan renderer: design notes
 
-Status: research + first steps (branch `native-vulkan-renderer`, started 2026-11-03).
+Status (2026-11-04): Vulkan renders gameplay, menus and cutscenes correctly with the native
+options on (they are in `project/ng2/ng2.toml`); D3D12 ROV stays the default and is unaffected.
+Branch `native-vulkan-renderer`, started 2026-11-03.
+
+To try Vulkan: add `gpu_backend = "vulkan"` to `ng2.toml` next to ng2.exe (or pass
+`--gpu_backend=vulkan`). Not yet on Vulkan: frame generation (D3D12 presenter only).
+
+5x gameplay GPU time (#106-#112): D3D12 ROV 8.7 ms; Vulkan 19.97 ms baseline -> 16.25 ms
+with `native_render_targets` + `native_resolves` (60 fps) -> 13.36 ms with the
+`ng2_skip_stencil_transfer` experiment (off by default).
 Evidence lives in `notes/findings.md` (#96 onwards); this file is the plan.
 
 ## Goal
