@@ -55,8 +55,8 @@ stream can't express (e.g. CPU reads of a resolved texture: write back on demand
 ## Milestones
 
 1. [x] Vulkan backend builds and runs (emulated) - `--gpu_backend=vulkan` (#98)
-2. [ ] Emulated Vulkan path renders gameplay (3D scene is black today, #98/#99)
-3. [ ] Native render targets (no EDRAM) behind `--native_renderer=true`
+2. [x] Emulated Vulkan path renders gameplay (black 3D was an SPIR-V exp_adjust bug, fixed, #103)
+3. [~] Native render targets behind `--native_render_targets=true`: step 1 (no EDRAM transfers except clears / MSAA switches) correct on D3D12 and Vulkan (#102, #103)
 4. [ ] Native resolves -> host textures
 5. [ ] Drain skipping, per-frame stats vs the emulated path
 6. [ ] Scene-by-scene correctness: title, menus, gameplay, cutscenes, HUD, effects
