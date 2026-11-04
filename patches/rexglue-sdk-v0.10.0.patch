@@ -250,10 +250,10 @@ index 9d2a848..a81c682 100644
      VkBuffer src_buffer;
      VkImage dst_image;
 diff --git a/include/rex/graphics/vulkan/render_target_cache.h b/include/rex/graphics/vulkan/render_target_cache.h
-index 34f7033..6083e64 100644
+index 34f7033..20d7258 100644
 --- a/include/rex/graphics/vulkan/render_target_cache.h
 +++ b/include/rex/graphics/vulkan/render_target_cache.h
-@@ -805,6 +805,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+@@ -805,6 +805,20 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
    bool TryResolveCopyDirectly(const draw_util::ResolveInfo& resolve_info,
                                draw_util::ResolveCopyShaderIndex copy_shader,
                                bool draw_resolution_scaled);
@@ -262,14 +262,23 @@ index 34f7033..6083e64 100644
 +  bool Ng2RecordNativeResolve(const draw_util::ResolveInfo& resolve_info,
 +                              VulkanTextureCache& texture_cache);
 +  uint64_t ng2_native_resolves_recorded_ = 0, ng2_native_resolves_rejected_ = 0;
++  // Native resolves from a 4x MSAA surface read as a 1x surface (NG2 aliases its scene
++  // buffer this way): a compute shader unpacks samples into pixels of the snapshot.
++  bool Ng2InitMsaaUnpack();
++  void Ng2ShutdownMsaaUnpack();
++  bool ng2_msaa_unpack_init_tried_ = false;
++  VkDescriptorSetLayout ng2_msaa_unpack_storage_layout_ = VK_NULL_HANDLE;
++  VkDescriptorPool ng2_msaa_unpack_pool_ = VK_NULL_HANDLE;
++  VkPipelineLayout ng2_msaa_unpack_pipeline_layout_ = VK_NULL_HANDLE;
++  VkPipeline ng2_msaa_unpack_pipelines_[2] = {};  // [source view is uint]
  
    // Writes contents of host render targets within rectangles from
    // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.
 diff --git a/include/rex/graphics/vulkan/texture_cache.h b/include/rex/graphics/vulkan/texture_cache.h
-index 04856ee..4b50073 100644
+index 04856ee..321909c 100644
 --- a/include/rex/graphics/vulkan/texture_cache.h
 +++ b/include/rex/graphics/vulkan/texture_cache.h
-@@ -133,6 +133,30 @@ class VulkanTextureCache final : public TextureCache {
+@@ -133,6 +133,37 @@ class VulkanTextureCache final : public TextureCache {
    void UseScaledResolveBufferForWrite(uint64_t written_start_scaled,
                                        uint64_t written_length_scaled);
  
@@ -288,6 +297,13 @@ index 04856ee..4b50073 100644
 +    VkImage image = VK_NULL_HANDLE;
 +    VmaAllocation allocation = VK_NULL_HANDLE;
 +    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
++    // How the snapshot was last written (blit = transfer, MSAA unpack = compute shader).
++    VkPipelineStageFlags write_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
++    VkAccessFlags write_access = VK_ACCESS_TRANSFER_WRITE_BIT;
++    // Storage view and descriptor set for compute writes (R16G16B16A16_SFLOAT only), created
++    // on demand by the render target cache; the view is destroyed with the image.
++    VkImageView storage_view = VK_NULL_HANDLE;
++    VkDescriptorSet storage_set = VK_NULL_HANDLE;
 +    bool valid = false;
 +  };
 +  VkFormat Ng2GetTextureHostFormat(xenos::TextureFormat format) const;
@@ -300,7 +316,7 @@ index 04856ee..4b50073 100644
   protected:
    bool IsSignedVersionSeparateForFormat(TextureKey key) const override;
    bool IsScaledResolveSupportedForFormat(TextureKey key) const override;
-@@ -327,6 +351,13 @@ class VulkanTextureCache final : public TextureCache {
+@@ -327,6 +358,20 @@ class VulkanTextureCache final : public TextureCache {
  
    xenos::ClampMode NormalizeClampMode(xenos::ClampMode clamp_mode) const;
  
@@ -308,8 +324,15 @@ index 04856ee..4b50073 100644
 +  bool Ng2TryLoadFromNativeResolve(VulkanTexture& texture, VkFormat host_format);
 +  void Ng2DestroyNativeResolves(bool all);
 +  std::vector<Ng2NativeResolve> ng2_native_resolves_;
-+  std::vector<std::pair<uint64_t, std::pair<VkImage, VmaAllocation>>> ng2_native_resolves_destroy_;
++  struct Ng2NativeResolveDestroy {
++    uint64_t submission;
++    VkImage image;
++    VmaAllocation allocation;
++    VkImageView view;
++  };
++  std::vector<Ng2NativeResolveDestroy> ng2_native_resolves_destroy_;
 +  uint64_t ng2_native_resolve_loads_ = 0, ng2_native_resolve_loads_logged_ = 0;
++  uint64_t ng2_native_resolve_misses_logged_ = 0;
 +
    VulkanCommandProcessor& command_processor_;
    VkPipelineStageFlags guest_shader_pipeline_stages_;
@@ -3262,10 +3285,18 @@ index 91ac08f..9734204 100644
    // TODO(Triang3l): Log that the shader has been successfully translated in
    // common code.
 diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
-index 0298f06..f84d20f 100644
+index 0298f06..b9b07c0 100644
 --- a/src/graphics/vulkan/render_target_cache.cpp
 +++ b/src/graphics/vulkan/render_target_cache.cpp
-@@ -37,6 +37,8 @@
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <unordered_set>
+ #include <array>
+ #include <cstddef>
+ #include <cstdint>
+@@ -37,6 +38,8 @@
  #include <rex/math.h>
  #include <rex/ui/vulkan/util.h>
  
@@ -3274,7 +3305,15 @@ index 0298f06..f84d20f 100644
  REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
                        "Vulkan render target implementation path")
      .lifecycle(rex::cvar::Lifecycle::kInitOnly);
-@@ -1288,6 +1290,12 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+@@ -1011,6 +1014,7 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
+     }
+   }
+   direct_resolve_pipelines_.clear();
++  Ng2ShutdownMsaaUnpack();  // NG2 ADDITION
+   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                          direct_resolve_pipeline_layout_depth_);
+   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+@@ -1288,6 +1292,12 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
            // Invalidate textures and mark the range as scaled if needed.
            texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
                                              resolve_info.copy_dest_extent_length);
@@ -3287,7 +3326,7 @@ index 0298f06..f84d20f 100644
            written_address_out = resolve_info.copy_dest_extent_start;
            written_length_out = resolve_info.copy_dest_extent_length;
            copied = true;
-@@ -1900,6 +1908,8 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
+@@ -1900,6 +1910,8 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
        image_create_info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
      }
      image_create_info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
@@ -3296,7 +3335,7 @@ index 0298f06..f84d20f 100644
    }
    if (image_create_info.format == VK_FORMAT_UNDEFINED) {
      REXGPU_ERROR("VulkanRenderTargetCache: Unknown {} render target format {}",
-@@ -6152,4 +6162,157 @@ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dum
+@@ -6152,4 +6164,430 @@ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dum
    return all_pipelines_available;
  }
  
@@ -3305,7 +3344,9 @@ index 0298f06..f84d20f 100644
 +                                                     VulkanTextureCache& texture_cache) {
 +  int reason = 0;
 +  auto reject = [&]() {
-+    if (++ng2_native_resolves_rejected_ <= 200) {
++    ++ng2_native_resolves_rejected_;
++    static std::unordered_set<uint64_t> logged;  // NG2 DIAG: once per destination + reason
++    if (logged.insert((uint64_t(resolve_info.copy_dest_base) << 8) | uint32_t(reason)).second) {
 +      REXGPU_INFO(
 +          "NG2 native resolve rejected (step {}): dest {:08X} src fmt {} msaa {} 64bpp {} "
 +          "dest fmt {} num {} bias {} swap {} endian {} off {},{} base {} pitch {}",
@@ -3330,7 +3371,9 @@ index 0298f06..f84d20f 100644
 +  }
 +  const draw_util::ResolveEdramInfo edram_info = resolve_info.color_edram_info;
 +  const reg::RB_COPY_DEST_INFO dest_info = resolve_info.copy_dest_info;
-+  if (edram_info.msaa_samples != xenos::MsaaSamples::k1X || edram_info.format_is_64bpp ||
++  bool resolve_2x = edram_info.msaa_samples == xenos::MsaaSamples::k2X;
++  if ((edram_info.msaa_samples != xenos::MsaaSamples::k1X && !resolve_2x) ||
++      edram_info.format_is_64bpp ||
 +      dest_info.copy_dest_exp_bias != 0 || dest_info.copy_dest_array ||
 +      resolve_info.copy_dest_coordinate_info.offset_x_div_8 ||
 +      resolve_info.copy_dest_coordinate_info.offset_y_div_8 ||
@@ -3378,8 +3421,34 @@ index 0298f06..f84d20f 100644
 +  }
 +  auto& rt = *static_cast<VulkanRenderTarget*>(rectangle.render_target);
 +  RenderTargetKey rt_key = rt.key();
-+  if (rt_key.is_depth || rt_key.msaa_samples != xenos::MsaaSamples::k1X || rt_key.Is64bpp()) {
-+    return (reason = 70 + uint32_t(rt_key.msaa_samples), reject());
++  // A 4x MSAA owner read as 1x (samples as pixels) needs the compute unpack (16F only).
++  bool msaa_unpack = false;
++  if (rt_key.is_depth || rt_key.Is64bpp()) {
++    return (reason = 70, reject());
++  }
++  // A 2x resolve (sample select / average) from a 2x owner also goes through the compute path.
++  bool msaa_select = false;
++  // A 2x resolve of tiles owned by a 4x surface (horizontal samples read as pixels).
++  bool msaa_4x_as_2x = false;
++  if (resolve_2x) {
++    msaa_4x_as_2x = rt_key.msaa_samples == xenos::MsaaSamples::k4X;
++    if ((rt_key.msaa_samples != xenos::MsaaSamples::k2X && !msaa_4x_as_2x) ||
++        image_format != VK_FORMAT_R16G16B16A16_SFLOAT ||
++        rt_host_format != VK_FORMAT_R16G16B16A16_SFLOAT || !Ng2InitMsaaUnpack()) {
++      return (reason = 730 + int(rt_key.msaa_samples) * 10 +
++                       int(image_format == VK_FORMAT_R16G16B16A16_SFLOAT) * 2 +
++                       int(rt_host_format == VK_FORMAT_R16G16B16A16_SFLOAT),
++              reject());
++    }
++    msaa_select = true;
++  } else if (rt_key.msaa_samples == xenos::MsaaSamples::k4X) {
++    if (image_format != VK_FORMAT_R16G16B16A16_SFLOAT ||
++        rt_host_format != VK_FORMAT_R16G16B16A16_SFLOAT || !Ng2InitMsaaUnpack()) {
++      return (reason = 72, reject());
++    }
++    msaa_unpack = true;
++  } else if (rt_key.msaa_samples != xenos::MsaaSamples::k1X) {
++    return (reason = 71, reject());
 +  }
 +  if (rt_key.pitch_tiles_at_32bpp != edram_info.pitch_tiles) {
 +    return (reason = 75, reject());
@@ -3394,14 +3463,17 @@ index 0298f06..f84d20f 100644
 +                   xenos::kEdramTileCount;
 +  uint32_t src_x = (delta % pitch) * xenos::kEdramTileWidthSamples +
 +                   resolve_info.coordinate_info.edram_offset_x_div_8 * 8;
-+  uint32_t src_y = (delta / pitch) * xenos::kEdramTileHeightSamples +
++  uint32_t src_y = (delta / pitch) * (xenos::kEdramTileHeightSamples >> uint32_t(resolve_2x)) +
 +                   resolve_info.coordinate_info.edram_offset_y_div_8 * 8;
 +  uint32_t width = resolve_info.coordinate_info.width_div_8 * 8;
 +  uint32_t height = resolve_info.height_div_8 * 8;
 +  uint32_t scale_x = draw_resolution_scale_x(), scale_y = draw_resolution_scale_y();
-+  uint32_t rt_width = rt_key.GetWidth() * scale_x;
-+  uint32_t rt_height =
-+      GetRenderTargetHeight(rt_key.pitch_tiles_at_32bpp, rt_key.msaa_samples) * scale_y;
++  // In 1x-view pixels (twice the 4x surface's size in both directions when unpacking).
++  uint32_t view_factor_x = (msaa_unpack || msaa_4x_as_2x) ? 2 : 1;
++  uint32_t view_factor_y = msaa_unpack ? 2 : 1;
++  uint32_t rt_width = rt_key.GetWidth() * scale_x * view_factor_x;
++  uint32_t rt_height = GetRenderTargetHeight(rt_key.pitch_tiles_at_32bpp, rt_key.msaa_samples) *
++                       scale_y * view_factor_y;
 +  if (!width || !height || (src_x + width) * scale_x > rt_width ||
 +      (src_y + height) * scale_y > rt_height) {
 +    return (reason = 8, reject());
@@ -3419,6 +3491,107 @@ index 0298f06..f84d20f 100644
 +  entry->height = height;
 +  entry->format = texture_format;
 +  entry->endian = uint32_t(dest_info.copy_dest_endian);
++
++  if (msaa_unpack || msaa_select) {
++    const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
++    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++    const VkDevice device = vulkan_device->device();
++    if (entry->storage_view == VK_NULL_HANDLE) {
++      VkImageViewCreateInfo view_info = {};
++      view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++      view_info.image = entry->image;
++      view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
++      view_info.format = VK_FORMAT_R16G16B16A16_SFLOAT;
++      view_info.subresourceRange = ui::vulkan::util::InitializeSubresourceRange();
++      if (dfn.vkCreateImageView(device, &view_info, nullptr, &entry->storage_view) !=
++          VK_SUCCESS) {
++        entry->storage_view = VK_NULL_HANDLE;
++        return (reason = 77, reject());
++      }
++    }
++    if (entry->storage_set == VK_NULL_HANDLE) {
++      VkDescriptorSetAllocateInfo set_info = {};
++      set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
++      set_info.descriptorPool = ng2_msaa_unpack_pool_;
++      set_info.descriptorSetCount = 1;
++      set_info.pSetLayouts = &ng2_msaa_unpack_storage_layout_;
++      if (dfn.vkAllocateDescriptorSets(device, &set_info, &entry->storage_set) != VK_SUCCESS) {
++        entry->storage_set = VK_NULL_HANDLE;
++        return (reason = 78, reject());
++      }
++      VkDescriptorImageInfo image_info = {};
++      image_info.imageView = entry->storage_view;
++      image_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
++      VkWriteDescriptorSet write = {};
++      write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++      write.dstSet = entry->storage_set;
++      write.descriptorCount = 1;
++      write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
++      write.pImageInfo = &image_info;
++      dfn.vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
++    }
++    command_processor_.PushImageMemoryBarrier(
++        rt.image(), ui::vulkan::util::InitializeSubresourceRange(), rt.current_stage_mask(),
++        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, rt.current_access_mask(), VK_ACCESS_SHADER_READ_BIT,
++        rt.current_layout(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++    rt.SetUsage(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
++                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++    command_processor_.PushImageMemoryBarrier(
++        entry->image, ui::vulkan::util::InitializeSubresourceRange(),
++        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++        VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
++        VK_IMAGE_LAYOUT_GENERAL);
++    command_processor_.SubmitBarriers(true);
++    bool source_uint = rt.view_color_transfer_separate() != VK_NULL_HANDLE;
++    command_processor_.BindExternalComputePipeline(ng2_msaa_unpack_pipelines_[source_uint]);
++    VkDescriptorSet sets[2] = {rt.GetDescriptorSetTransferSource(), entry->storage_set};
++    DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
++    command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
++                                           ng2_msaa_unpack_pipeline_layout_, 0, 2, sets, 0,
++                                           nullptr);
++    // Mode 0: 4x surface read as 1x (samples to pixels). Mode 1: average of host samples
++    // [sample_a, sample_b] (equal for a single sample) at the same pixel.
++    int32_t mode = 0, sample_a = 0, sample_b = 0;
++    if (msaa_select) {
++      mode = msaa_4x_as_2x ? 2 : 1;
++      auto to_host = [this, msaa_4x_as_2x](uint32_t guest_sample) {
++        if (msaa_4x_as_2x) {
++          return int32_t(guest_sample);  // the shader builds the 4x sample index
++        }
++        // Same as the 2x transfers: native 2x swaps the two samples, 2x-as-4x uses 0 and 3.
++        return int32_t(msaa_2x_attachments_supported_ ? (guest_sample ^ 1)
++                                                      : (guest_sample ? 3 : 0));
++      };
++      switch (resolve_info.copy_dest_coordinate_info.copy_sample_select) {
++        case xenos::CopySampleSelect::k0:
++          sample_a = sample_b = to_host(0);
++          break;
++        case xenos::CopySampleSelect::k1:
++          sample_a = sample_b = to_host(1);
++          break;
++        case xenos::CopySampleSelect::k01:
++        case xenos::CopySampleSelect::k0123:
++          sample_a = to_host(0);
++          sample_b = to_host(1);
++          break;
++        default:
++          return (reason = 79, reject());
++      }
++    }
++    int32_t constants[8] = {int32_t(src_x * scale_x), int32_t(src_y * scale_y),
++                            int32_t(width * scale_x), int32_t(height * scale_y),
++                            mode, sample_a, sample_b, 0};
++    command_buffer.CmdVkPushConstants(ng2_msaa_unpack_pipeline_layout_,
++                                      VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants),
++                                      constants);
++    command_buffer.CmdVkDispatch((width * scale_x + 7) / 8, (height * scale_y + 7) / 8, 1);
++    entry->layout = VK_IMAGE_LAYOUT_GENERAL;
++    entry->write_stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
++    entry->write_access = VK_ACCESS_SHADER_WRITE_BIT;
++    entry->valid = true;
++    ++ng2_native_resolves_recorded_;
++    return true;
++  }
 +
 +  // Render target -> transfer source, snapshot -> transfer destination.
 +  command_processor_.PushImageMemoryBarrier(
@@ -3449,13 +3622,152 @@ index 0298f06..f84d20f 100644
 +      rt.image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, entry->image,
 +      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region, VK_FILTER_NEAREST);
 +  entry->layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++  entry->write_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
++  entry->write_access = VK_ACCESS_TRANSFER_WRITE_BIT;
 +  entry->valid = true;
 +  ++ng2_native_resolves_recorded_;
 +  return true;
 +}
++bool VulkanRenderTargetCache::Ng2InitMsaaUnpack() {
++  if (ng2_msaa_unpack_init_tried_) {
++    return ng2_msaa_unpack_pipelines_[0] != VK_NULL_HANDLE &&
++           ng2_msaa_unpack_pipelines_[1] != VK_NULL_HANDLE;
++  }
++  ng2_msaa_unpack_init_tried_ = true;
++  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++  const VkDevice device = vulkan_device->device();
++  if (descriptor_set_layout_sampled_image_ == VK_NULL_HANDLE) {
++    return false;
++  }
++  VkDescriptorSetLayoutBinding binding = {};
++  binding.binding = 0;
++  binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
++  binding.descriptorCount = 1;
++  binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
++  VkDescriptorSetLayoutCreateInfo layout_info = {};
++  layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
++  layout_info.bindingCount = 1;
++  layout_info.pBindings = &binding;
++  if (dfn.vkCreateDescriptorSetLayout(device, &layout_info, nullptr,
++                                      &ng2_msaa_unpack_storage_layout_) != VK_SUCCESS) {
++    ng2_msaa_unpack_storage_layout_ = VK_NULL_HANDLE;
++    return false;
++  }
++  VkDescriptorPoolSize pool_size = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256};
++  VkDescriptorPoolCreateInfo pool_info = {};
++  pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
++  pool_info.maxSets = 256;
++  pool_info.poolSizeCount = 1;
++  pool_info.pPoolSizes = &pool_size;
++  if (dfn.vkCreateDescriptorPool(device, &pool_info, nullptr, &ng2_msaa_unpack_pool_) !=
++      VK_SUCCESS) {
++    ng2_msaa_unpack_pool_ = VK_NULL_HANDLE;
++    return false;
++  }
++  VkDescriptorSetLayout set_layouts[2] = {descriptor_set_layout_sampled_image_,
++                                          ng2_msaa_unpack_storage_layout_};
++  VkPushConstantRange push_range = {VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(int32_t) * 8};
++  VkPipelineLayoutCreateInfo pipeline_layout_info = {};
++  pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
++  pipeline_layout_info.setLayoutCount = 2;
++  pipeline_layout_info.pSetLayouts = set_layouts;
++  pipeline_layout_info.pushConstantRangeCount = 1;
++  pipeline_layout_info.pPushConstantRanges = &push_range;
++  if (dfn.vkCreatePipelineLayout(device, &pipeline_layout_info, nullptr,
++                                 &ng2_msaa_unpack_pipeline_layout_) != VK_SUCCESS) {
++    ng2_msaa_unpack_pipeline_layout_ = VK_NULL_HANDLE;
++    return false;
++  }
++  // Host 1x-view pixel (x, y) = 4x pixel (x >> 1, y >> 1), sample (x & 1) | ((y & 1) << 1),
++  // the same mapping as the 4x -> 1x ownership transfer shaders.
++  static const char* const kSources[2] = {
++      R"(#version 450
++#extension GL_EXT_samplerless_texture_functions : require
++layout(local_size_x = 8, local_size_y = 8) in;
++layout(set = 0, binding = 0) uniform texture2DMS source_texture;
++layout(set = 1, binding = 0, rgba16f) uniform writeonly image2D dest_image;
++layout(push_constant) uniform Constants { ivec4 rect; ivec4 mode_samples; } constants;
++void main() {
++  ivec2 dest = ivec2(gl_GlobalInvocationID.xy);
++  if (dest.x >= constants.rect.z || dest.y >= constants.rect.w) return;
++  ivec2 view = constants.rect.xy + dest;
++  vec4 value;
++  if (constants.mode_samples.x == 0) {
++    value = texelFetch(source_texture, view >> 1, (view.x & 1) | ((view.y & 1) << 1));
++  } else if (constants.mode_samples.x == 1) {
++    value = 0.5 * (texelFetch(source_texture, view, constants.mode_samples.y) +
++                   texelFetch(source_texture, view, constants.mode_samples.z));
++  } else {
++    ivec2 pixel = ivec2(view.x >> 1, view.y);
++    value = 0.5 * (texelFetch(source_texture, pixel, (view.x & 1) | (constants.mode_samples.y << 1)) +
++                   texelFetch(source_texture, pixel, (view.x & 1) | (constants.mode_samples.z << 1)));
++  }
++  imageStore(dest_image, dest, value);
++}
++)",
++      R"(#version 450
++#extension GL_EXT_samplerless_texture_functions : require
++layout(local_size_x = 8, local_size_y = 8) in;
++layout(set = 0, binding = 0) uniform utexture2DMS source_texture;
++layout(set = 1, binding = 0, rgba16f) uniform writeonly image2D dest_image;
++layout(push_constant) uniform Constants { ivec4 rect; ivec4 mode_samples; } constants;
++void main() {
++  ivec2 dest = ivec2(gl_GlobalInvocationID.xy);
++  if (dest.x >= constants.rect.z || dest.y >= constants.rect.w) return;
++  ivec2 view = constants.rect.xy + dest;
++  vec4 value;
++  if (constants.mode_samples.x == 0) {
++    uvec4 bits = texelFetch(source_texture, view >> 1, (view.x & 1) | ((view.y & 1) << 1));
++    value = vec4(unpackHalf2x16(bits.x | (bits.y << 16)), unpackHalf2x16(bits.z | (bits.w << 16)));
++  } else {
++    ivec2 pixel = constants.mode_samples.x == 1 ? view : ivec2(view.x >> 1, view.y);
++    int sample_base = constants.mode_samples.x == 1 ? 0 : (view.x & 1);
++    int shift = constants.mode_samples.x == 1 ? 0 : 1;
++    uvec4 a = texelFetch(source_texture, pixel, sample_base | (constants.mode_samples.y << shift));
++    uvec4 b = texelFetch(source_texture, pixel, sample_base | (constants.mode_samples.z << shift));
++    value = 0.5 * (vec4(unpackHalf2x16(a.x | (a.y << 16)), unpackHalf2x16(a.z | (a.w << 16))) +
++                   vec4(unpackHalf2x16(b.x | (b.y << 16)), unpackHalf2x16(b.z | (b.w << 16))));
++  }
++  imageStore(dest_image, dest, value);
++}
++)"};
++  for (uint32_t i = 0; i < 2; ++i) {
++    std::vector<uint32_t> spirv;
++    std::string error;
++    if (!command_processor_.CompileGlslToSpirv(VK_SHADER_STAGE_COMPUTE_BIT, kSources[i], spirv,
++                                               error)) {
++      REXGPU_ERROR("NG2 native resolve: MSAA unpack shader {} failed to compile: {}", i, error);
++      return false;
++    }
++    ng2_msaa_unpack_pipelines_[i] = ui::vulkan::util::CreateComputePipeline(
++        vulkan_device, ng2_msaa_unpack_pipeline_layout_, spirv.data(),
++        sizeof(uint32_t) * spirv.size());
++    if (ng2_msaa_unpack_pipelines_[i] == VK_NULL_HANDLE) {
++      return false;
++    }
++  }
++  REXGPU_INFO("NG2 native resolve: MSAA unpack pipelines created");
++  return true;
++}
++
++void VulkanRenderTargetCache::Ng2ShutdownMsaaUnpack() {
++  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++  const VkDevice device = vulkan_device->device();
++  for (VkPipeline& pipeline : ng2_msaa_unpack_pipelines_) {
++    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, pipeline);
++  }
++  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
++                                         ng2_msaa_unpack_pipeline_layout_);
++  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
++                                         ng2_msaa_unpack_pool_);
++  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorSetLayout, device,
++                                         ng2_msaa_unpack_storage_layout_);
++}
  }  // namespace rex::graphics::vulkan
 diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
-index ecbd940..c34495f 100644
+index ecbd940..6c0748f 100644
 --- a/src/graphics/vulkan/texture_cache.cpp
 +++ b/src/graphics/vulkan/texture_cache.cpp
 @@ -34,6 +34,9 @@
@@ -3496,7 +3808,7 @@ index ecbd940..c34495f 100644
    LoadShaderIndex load_shader = host_format.load_shader;
    if (load_shader == kLoadShaderIndexUnknown) {
      return false;
-@@ -3258,4 +3268,154 @@ xenos::ClampMode VulkanTextureCache::NormalizeClampMode(xenos::ClampMode clamp_m
+@@ -3258,4 +3268,177 @@ xenos::ClampMode VulkanTextureCache::NormalizeClampMode(xenos::ClampMode clamp_m
    return clamp_mode;
  }
  
@@ -3521,8 +3833,8 @@ index ecbd940..c34495f 100644
 +      return &entry;
 +    }
 +    // Same destination, other size or format: retire the old image after the GPU is done.
-+    ng2_native_resolves_destroy_.emplace_back(command_processor_.GetCurrentSubmission(),
-+                                              std::make_pair(entry.image, entry.allocation));
++    ng2_native_resolves_destroy_.push_back({command_processor_.GetCurrentSubmission(), entry.image,
++                                            entry.allocation, entry.storage_view});
 +    ng2_native_resolves_.erase(ng2_native_resolves_.begin() + i);
 +    break;
 +  }
@@ -3541,6 +3853,10 @@ index ecbd940..c34495f 100644
 +  image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
 +  image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
 +  image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++  if (image_format == VK_FORMAT_R16G16B16A16_SFLOAT) {
++    // Written by the 4x MSAA -> 1x unpack compute shader in the render target cache.
++    image_create_info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
++  }
 +  image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 +  image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 +  VmaAllocationCreateInfo allocation_create_info = {};
@@ -3573,15 +3889,21 @@ index ecbd940..c34495f 100644
 +void VulkanTextureCache::Ng2DestroyNativeResolves(bool all) {
 +  if (all) {
 +    for (Ng2NativeResolve& entry : ng2_native_resolves_) {
-+      ng2_native_resolves_destroy_.emplace_back(0, std::make_pair(entry.image, entry.allocation));
++      ng2_native_resolves_destroy_.push_back(
++          {0, entry.image, entry.allocation, entry.storage_view});
 +    }
 +    ng2_native_resolves_.clear();
 +  }
 +  uint64_t completed = command_processor_.GetCompletedSubmission();
 +  for (size_t i = 0; i < ng2_native_resolves_destroy_.size();) {
-+    if (all || ng2_native_resolves_destroy_[i].first <= completed) {
-+      vmaDestroyImage(vma_allocator_, ng2_native_resolves_destroy_[i].second.first,
-+                      ng2_native_resolves_destroy_[i].second.second);
++    if (all || ng2_native_resolves_destroy_[i].submission <= completed) {
++      const Ng2NativeResolveDestroy& destroy = ng2_native_resolves_destroy_[i];
++      if (destroy.view != VK_NULL_HANDLE) {
++        const ui::vulkan::VulkanDevice* vulkan_device = command_processor_.GetVulkanDevice();
++        vulkan_device->functions().vkDestroyImageView(vulkan_device->device(), destroy.view,
++                                                      nullptr);
++      }
++      vmaDestroyImage(vma_allocator_, destroy.image, destroy.allocation);
 +      ng2_native_resolves_destroy_.erase(ng2_native_resolves_destroy_.begin() + i);
 +    } else {
 +      ++i;
@@ -3598,6 +3920,20 @@ index ecbd940..c34495f 100644
 +  }
 +  uint32_t base = key.base_page << 12;
 +  for (Ng2NativeResolve& entry : ng2_native_resolves_) {
++    if (entry.dest_base == base && ng2_native_resolve_misses_logged_ < 100 &&
++        (!entry.valid || entry.format != key.format ||
++         entry.endian != uint32_t(key.endianness) || entry.pitch_div_32 != key.pitch ||
++         entry.host_format != host_format || entry.width < key.GetWidth() ||
++         entry.height < key.GetHeight())) {
++      ++ng2_native_resolve_misses_logged_;
++      REXGPU_INFO(
++          "NG2 native resolve miss {:08X}: valid {} format {}/{} endian {}/{} pitch {}/{} host "
++          "{}/{} size {}x{} / texture {}x{}",
++          base, entry.valid, uint32_t(entry.format), uint32_t(key.format), entry.endian,
++          uint32_t(key.endianness), entry.pitch_div_32, uint32_t(key.pitch),
++          uint32_t(entry.host_format), uint32_t(host_format), entry.width, entry.height,
++          key.GetWidth(), key.GetHeight());
++    }
 +    if (!entry.valid || entry.dest_base != base || entry.format != key.format ||
 +        entry.endian != uint32_t(key.endianness) || entry.pitch_div_32 != key.pitch ||
 +        entry.host_format != host_format || entry.width < key.GetWidth() ||
@@ -3613,9 +3949,8 @@ index ecbd940..c34495f 100644
 +    if (entry.layout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
 +      command_processor_.PushImageMemoryBarrier(
 +          entry.image, ui::vulkan::util::InitializeSubresourceRange(),
-+          VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-+          VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, entry.layout,
-+          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++          entry.write_stage, VK_PIPELINE_STAGE_TRANSFER_BIT, entry.write_access,
++          VK_ACCESS_TRANSFER_READ_BIT, entry.layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 +      entry.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 +    }
 +    texture.MarkAsUsed();
@@ -3642,7 +3977,7 @@ index ecbd940..c34495f 100644
 +    command_processor_.deferred_command_buffer().CmdVkCopyImage(
 +        entry.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, texture.image(),
 +        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
-+    if ((++ng2_native_resolve_loads_ & 1023) == 1) {
++    if (++ng2_native_resolve_loads_ <= 40 || (ng2_native_resolve_loads_ & 1023) == 1) {
 +      REXGPU_INFO("NG2 native resolve: {} texture loads from snapshots (latest {:08X} {}x{})",
 +                  ng2_native_resolve_loads_, base, width_scaled, height_scaled);
 +    }
