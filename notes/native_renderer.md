@@ -1,0 +1,71 @@
+# openNG2 native Vulkan renderer: design notes
+
+Status: research + first steps (branch `native-vulkan-renderer`, started 2026-11-03).
+Evidence lives in `notes/findings.md` (#96 onwards); this file is the plan.
+
+## Goal
+
+Render NG2 with Vulkan without emulating the Xenos GPU's EDRAM:
+- faster on weak GPUs (no ROV / interlock, no EDRAM dumps, no resolve -> guest memory -> texture reload chain),
+- the same renderer later runs on Linux (Vulkan only, no D3D12),
+- opt-in (cvar) until it matches the emulated renderer, which stays the default.
+
+## What we learned (findings #96-#98)
+
+1. NG2 links the XDK Direct3D library (TU2 `0x83758000-0x83773000`) with link-time code
+   generation: library functions are specialised per call pattern (DrawIndexedVertices
+   `sub_83762240` has the primitive type folded to triangle strip) and some are inlined into
+   the engine. Hooking every D3D entry point (the Unleashed Recompiled way) would need every
+   specialised copy found and kept in sync: fragile.
+2. The D3D device is a GPU register shadow + dirty masks. Every draw's full state reaches
+   the GPU as plain register writes, shader loads (IM_LOAD from memory), constant loads
+   (LOAD_ALU_CONST) and a DRAW_INDX packet. The register stream *is* the D3D state.
+3. ~2/3 of the GPU's draws are D3D pipeline drains (24 one-point draws after each GPR split
+   change, static IB `1F037980`), not rendering.
+4. The emulated cost is in EDRAM: ROV for every pixel, ~30 resolves per frame that write guest
+   memory then get re-untiled by the texture cache (findings #61-#63, #82: texture loads +
+   uploads ~2.3 ms of a 4.8 ms GPU frame at 1x).
+
+## Architecture (chosen)
+
+Keep the command stream as the *source of state* (cheap, on the GPU thread, game-agnostic,
+covers every D3D path incl. inlined ones), but replace everything EDRAM-shaped:
+
+```
+guest D3D (unchanged) --PM4--> command processor (register file, packets)
+                                   |
+                                   v
+                     NativeRenderer (Vulkan, new)
+                       - render targets: host images keyed by
+                         (EDRAM base, pitch, format, MSAA); no EDRAM buffer, no ROV,
+                         native blending / depth
+                       - resolve: image copy RT -> "resolved texture" keyed by guest
+                         address + format + size; texture fetches of that address use
+                         the host image directly (no guest memory write, no untile)
+                       - drains: draws with no colour/depth effect are skipped
+                       - shaders: SDK SPIR-V translator (host render target mode)
+                       - textures / vertex data: SDK texture cache + shared memory
+                         (static data still comes from guest memory)
+                       - present: SDK Vulkan presenter (ImGui, Recomp Settings)
+```
+
+Game-specific knowledge (D3D map, #96) is used for diagnostics and for the cases the
+stream can't express (e.g. CPU reads of a resolved texture: write back on demand).
+
+## Milestones
+
+1. [x] Vulkan backend builds and runs (emulated) - `--gpu_backend=vulkan` (#98)
+2. [ ] Emulated Vulkan path renders gameplay (3D scene is black today, #98/#99)
+3. [ ] Native render targets (no EDRAM) behind `--native_renderer=true`
+4. [ ] Native resolves -> host textures
+5. [ ] Drain skipping, per-frame stats vs the emulated path
+6. [ ] Scene-by-scene correctness: title, menus, gameplay, cutscenes, HUD, effects
+7. [ ] Port features on Vulkan: internal resolution, FSR / CAS, frame generation, ultrawide
+8. [ ] Linux build
+
+## Testing
+
+- `--gpu_backend=vulkan` selects the Vulkan backend (SDK cvar `gpu_backend`).
+- Unattended gameplay route (Chapter 3 start) via `tools/menu_probe.ps1` with test settings
+  (1x, windowed) swapped in and restored afterwards.
+- `--ng2_ib_census=N` + `tools/pm4_decode.py` show what the GPU receives in a frame.
