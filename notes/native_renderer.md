@@ -5,7 +5,7 @@ options on (they are in `project/ng2/ng2.toml`); D3D12 ROV stays the default and
 Branch `native-vulkan-renderer`, started 2026-11-03.
 
 To try Vulkan: add `gpu_backend = "vulkan"` to `ng2.toml` next to ng2.exe (or pass
-`--gpu_backend=vulkan`). Not yet on Vulkan: frame generation (D3D12 presenter only).
+`--gpu_backend=vulkan`). Frame generation works on Vulkan too (#114); not yet: the 30 fps half-rate cap.
 
 5x gameplay GPU time (#106-#112): D3D12 ROV 8.7 ms; Vulkan 19.97 ms baseline -> 16.25 ms
 with `native_render_targets` + `native_resolves` (60 fps) -> 13.36 ms with the
@@ -69,7 +69,7 @@ stream can't express (e.g. CPU reads of a resolved texture: write back on demand
 4. [~] Native resolves -> host textures: step 1 on Vulkan (`--native_resolves=true`, 1x colour RTs, blit snapshot -> texture copy), scene buffer via MSAA unpack compute (#111); -2.0 ms at 5x; depth and k_16_16 not yet
 5. [ ] Drain skipping, per-frame stats vs the emulated path
 6. [ ] Scene-by-scene correctness: title, menus, gameplay, cutscenes, HUD, effects
-7. [ ] Port features on Vulkan: internal resolution, FSR / CAS, frame generation, ultrawide
+7. [~] Port features on Vulkan: internal resolution, FSR / CAS, FXAA work; frame generation ported (#114); half-rate cap and ultrawide not checked
 8. [ ] Linux build
 
 ## Where the time goes (5x Vulkan, #107)
