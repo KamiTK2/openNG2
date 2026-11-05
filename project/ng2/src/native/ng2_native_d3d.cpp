@@ -31,6 +31,9 @@
 REXCVAR_DEFINE_BOOL(ng2_native_d3d, false, "NG2",
                     "Truly native renderer: no PM4, no command processor (needs gpu_backend=vulkan)");
 
+REXCVAR_DEFINE_BOOL(ng2_native_force_flip, false, "NG2",
+                    "NG2 DIAG: flip at the next vblank whatever swap interval the game asked for");
+
 namespace {
 
 // Guest D3D device fields (findings #96, notes/native/d3d_api.md).
@@ -45,6 +48,7 @@ constexpr uint32_t kDevIndexBuffer = 12428;   // guest index buffer object
 
 // Time in the recompiled library draw functions, for the PM4 removal (design.md).
 std::atomic<uint64_t> g_library_draw_ticks{0};
+double g_flip_wait_ms = 0.0;
 struct DrawTimer {
   LARGE_INTEGER t0;
   DrawTimer() { QueryPerformanceCounter(&t0); }
@@ -87,6 +91,12 @@ void Store(uint32_t guest, uint32_t value) {
 // the CPU wait for that: this is the game's frame pacing. Nothing stalls now, so wait here until
 // the flips caught up with the swaps. The timeout covers a stopped vblank.
 void WaitForFlip(uint32_t dev) {
+  if (REXCVAR_GET(ng2_native_force_flip)) {
+    // Queue entries are 8 bytes at +16556: flip value, target vblank. 0 flips at the next vblank.
+    for (uint32_t i = Load(dev + 16684); i != Load(dev + 16688); ++i) {
+      Store(dev + 16556 + ((i << 3) & 0x78) + 4, 0);
+    }
+  }
   const int64_t limit = int64_t(GetTickCount64()) + 100;
   while (Load(dev + kDevFlips) != Load(dev + kDevFlipRequests)) {
     if (int64_t(GetTickCount64()) > limit) {
@@ -120,8 +130,10 @@ void LogStats() {
     QueryPerformanceFrequency(&frequency);
     static uint64_t last_ticks = 0;
     const uint64_t ticks = g_library_draw_ticks.load();
-    REXLOG_INFO("NG2 NATIVE library draw cpu {:.3f} ms/frame",
-                double(ticks - last_ticks) * 1000.0 / double(frequency.QuadPart) / 120.0);
+    REXLOG_INFO("NG2 NATIVE library draw cpu {:.3f} ms/frame, flip wait {:.2f} ms/frame",
+                double(ticks - last_ticks) * 1000.0 / double(frequency.QuadPart) / 120.0,
+                g_flip_wait_ms / 120.0);
+    g_flip_wait_ms = 0.0;
     last_ticks = ticks;
   }
   ng2::native::RendererLogStats(swaps);
@@ -343,9 +355,15 @@ extern "C" REX_FUNC(sub_8376A9F8) {
   const uint32_t dev = ctx.r3.u32, front = ctx.r4.u32;
   __imp__sub_8376A9F8(ctx, base);
   if (!NativeOn()) return;
-  g_stats.swaps.fetch_add(1, std::memory_order_relaxed);
   ng2::native::RendererSwap(dev, front);
-  WaitForFlip(dev);
+  {
+    LARGE_INTEGER t0, t1, frequency;
+    QueryPerformanceCounter(&t0);
+    WaitForFlip(dev);
+    QueryPerformanceCounter(&t1);
+    QueryPerformanceFrequency(&frequency);
+    g_flip_wait_ms += double(t1.QuadPart - t0.QuadPart) * 1000.0 / double(frequency.QuadPart);
+  }
   LogStats();
 }
 

@@ -188,6 +188,14 @@ void Ng2AutopilotPad(uint32_t user_index, rex::input::X_INPUT_STATE* st) {
 
 void Ng2AutopilotOnPresent() {
   if (REXCVAR_GET(ng2_autopilot).empty()) return;
+  {
+    static int cutscene = -1;
+    const int up = Ng2CutsceneUp() ? 1 : 0;
+    if (up != cutscene) {
+      cutscene = up;
+      REXLOG_INFO("NG2 AUTOPILOT cutscene {} at t={}", up ? "start" : "end", NowMs() - g_ap.start_ms);
+    }
+  }
   // Frame-paced screens (fades, chapter card) run unthrottled until the goal, as Fast Loading
   // does for the loading screen; measurements after the goal run at the normal 60 Hz.
   static bool normal_vsync_restored = false;
