@@ -156,7 +156,7 @@ try {
     $measureEnd = $clock.Elapsed.TotalSeconds + $MeasureSec
     # GPU clocks and power (#131): capped frame times mean nothing without them
     if (Test-Path $smiFile) { Remove-Item $smiFile -Force }
-    $smi = Start-Process nvidia-smi -PassThru -WindowStyle Hidden -ArgumentList '--query-gpu=clocks.gr,utilization.gpu,power.draw', '--format=csv,noheader,nounits', '-lms', '500' -RedirectStandardOutput $smiFile
+    $smi = Start-Process nvidia-smi -PassThru -WindowStyle Hidden -ArgumentList '--query-gpu=clocks.gr,utilization.gpu,power.draw,memory.used', '--format=csv,noheader,nounits', '-lms', '500' -RedirectStandardOutput $smiFile
     for ($i = 1; $i -le $Shots; ++$i) {
       Start-Sleep -Milliseconds ([int]($MeasureSec * 1000 / ($Shots + 1)))
       if (-not $p.HasExited) { Shot "shot$i" }
@@ -191,26 +191,28 @@ if ($gpuVals.Count) {
 }
 
 # Medians over the settled tail, like the frame time
-$mhz = 'n/a'; $util = 'n/a'; $watts = 'n/a'
+$mhz = 'n/a'; $util = 'n/a'; $watts = 'n/a'; $vram = 'n/a'
 if (Test-Path $smiFile) {
-  $rows = @(Get-Content $smiFile | ForEach-Object { $f = $_ -split ',\s*'; if ($f.Count -ge 3) { , $f } })
+  $rows = @(Get-Content $smiFile | ForEach-Object { $f = $_ -split ',\s*'; if ($f.Count -ge 4) { , $f } })
   $rows = @($rows | Select-Object -Last ([math]::Max(1, [int]($rows.Count * 0.4))))
   function Med($i) { $v = @($rows | ForEach-Object { [double]$_[$i] } | Sort-Object); if ($v.Count) { $v[[int]($v.Count / 2)] } else { 'n/a' } }
-  if ($rows.Count) { $mhz = Med 0; $util = Med 1; $watts = Med 2 }
+  if ($rows.Count) { $mhz = Med 0; $util = Med 1; $watts = Med 2; $vram = Med 3 }
 }
 
 $csv = Join-Path $native 'results.csv'
-if (-not (Test-Path $csv)) { 'time,name,route,backend,scale,status,goal_s,fps,gpu_ms,measure_s,cvars,mhz,util,watts' | Set-Content $csv -Encoding ascii }
-elseif ((Get-Content $csv -TotalCount 1) -notmatch ',mhz,') {
-  # Older rows just lack the three new columns
-  $old = Get-Content $csv; $old[0] = "$($old[0]),mhz,util,watts"; $old | Set-Content $csv -Encoding ascii
+if (-not (Test-Path $csv)) { 'time,name,route,backend,scale,status,goal_s,fps,gpu_ms,measure_s,cvars,mhz,util,watts,vram_mb' | Set-Content $csv -Encoding ascii }
+elseif ((Get-Content $csv -TotalCount 1) -notmatch ',vram_mb') {
+  # Older rows just lack the new columns
+  $old = Get-Content $csv
+  $old[0] = if ($old[0] -match ',mhz,') { "$($old[0]),vram_mb" } else { "$($old[0]),mhz,util,watts,vram_mb" }
+  $old | Set-Content $csv -Encoding ascii
 }
 $baseline = ''
 if ($gpu -ne 'n/a' -and $Backend -ne 'd3d12' -and $comparable) {
   $ref = @(Import-Csv $csv | Where-Object { $_.backend -eq 'd3d12' -and $_.scale -eq "$Scale" -and $_.route -eq $Route -and $_.status -eq 'PASS' -and $_.gpu_ms -ne 'n/a' -and -not $_.cvars -and [int]$_.measure_s -ge 15 }) | Select-Object -Last 1
   if ($ref) { $baseline = " | D3D12 baseline $($ref.gpu_ms) ms, delta $([math]::Round($gpu - [double]$ref.gpu_ms, 2)) ms" }
 }
-"$(Get-Date -Format s),$Name,$Route,$Backend,$Scale,$status,$goalSec,$fps,$gpu,$MeasureSec,$($Cvars -join ' '),$mhz,$util,$watts" | Add-Content $csv -Encoding ascii
+"$(Get-Date -Format s),$Name,$Route,$Backend,$Scale,$status,$goalSec,$fps,$gpu,$MeasureSec,$($Cvars -join ' '),$mhz,$util,$watts,$vram" | Add-Content $csv -Encoding ascii
 
 # The real folder must be untouched
 $alert = $false
@@ -220,7 +222,7 @@ if ((Get-FileHash $settingsReal).Hash -ne $settingsHash) {
 }
 if ((Fingerprint) -ne $before) { $alert = $true }
 
-"$status $Name route=$Route backend=$Backend scale=${Scale}x goal=${goalSec}s fps=$fps gpu=${gpu}ms$(if (-not $comparable) { '(short window)' }) ${mhz}MHz ${util}% ${watts}W$baseline $reason"
+"$status $Name route=$Route backend=$Backend scale=${Scale}x goal=${goalSec}s fps=$fps gpu=${gpu}ms$(if (-not $comparable) { '(short window)' }) ${mhz}MHz ${util}% ${watts}W ${vram}MB$baseline $reason"
 if ($status -ne 'PASS') {
   if (Test-Path (Join-Path $bin 'ng2_crash.dmp')) { "crash dump: $(Join-Path $bin 'ng2_crash.dmp')" }
   '--- autopilot'; $all | Select-String -SimpleMatch 'NG2 AUTOPILOT' | Select-Object -Last 12 | ForEach-Object { $_.Line }
