@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -25,7 +26,7 @@ namespace {
 
 constexpr uint32_t kPackMagic = 0x4E32474E;  // 'NG2N'
 // Bump when translated output changes: a player's generated pack is rebuilt on a mismatch.
-constexpr uint32_t kPackVersion = 2;
+constexpr uint32_t kPackVersion = 3;
 
 void PutU32(std::vector<uint8_t>& out, uint32_t v) {
   const auto* p = reinterpret_cast<const uint8_t*>(&v);
@@ -199,6 +200,7 @@ constexpr MemberOffset kSystemConstantOffsets[] = {
     {"edram_blend_constant", 496},
 };
 static_assert(sizeof(NativeSystemConstants) == 512);
+static_assert(offsetof(NativeSystemConstants, history_bases) == 328);
 
 std::string SpirvString(const std::vector<uint32_t>& spirv, size_t word) {
   return reinterpret_cast<const char*>(spirv.data() + word);

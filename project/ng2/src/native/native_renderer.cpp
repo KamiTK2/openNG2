@@ -7,6 +7,8 @@
 // redirected (to a per-frame area past the mirror). Bytes stay in guest order, shaders swap them.
 #include "native_renderer.h"
 
+#include "shaders/motion_frag.h"
+
 #include <windows.h>
 
 #include <rex/system/user_module.h>
@@ -63,6 +65,9 @@ REXCVAR_DEFINE_INT32(ng2_native_skip_from, 0, "NG2", "NG2 DIAG: first draw of ng
 REXCVAR_DEFINE_INT32(ng2_native_skip_to, 100000, "NG2", "NG2 DIAG: end of the range");
 REXCVAR_DEFINE_STRING(ng2_native_skip_ps, "", "NG2",
                       "Native renderer debug: skip draws with these pixel shader hashes");
+REXCVAR_DEFINE_BOOL(ng2_native_motion, false, "NG2", "Write motion vectors for the scene");
+REXCVAR_DEFINE_INT32(ng2_native_show_motion, 0, "NG2",
+                     "NG2 DIAG: show motion vectors instead of the game, this many times magnified");
 REXCVAR_DEFINE_INT32(ng2_native_dump_frame, 0, "NG2",
                      "Native renderer debug: log the passes of this frame");
 
@@ -109,6 +114,7 @@ constexpr uint32_t kSysAlphaFuncShift = 16;
 
 // Per-frame ring areas. Vertex streams and immediate vertices are copied here each frame.
 constexpr VkDeviceSize kHeapSize = 128ull * 1024 * 1024;
+constexpr uint32_t kHistoryPositions = 2u * 1024 * 1024;  // Per half of the history buffer.
 constexpr uint64_t kStreamSlack = 64 * 1024;
 // Constants and index data the GPU reads directly: video memory, so small.
 constexpr VkDeviceSize kUploadSize = 48ull * 1024 * 1024;
@@ -220,6 +226,7 @@ struct PipelineKey {
   uint32_t blend[4] = {};
   uint32_t depth_control = 0;  // With disabled parts zeroed.
   uint32_t set_counts[4] = {};
+  uint32_t motion = 0;  // Replays a scene draw into the velocity image, see FlushMotion.
 };
 
 struct Frame {
@@ -244,6 +251,24 @@ struct PendingImmediate {
   bool index_32 = false, quads = false;
 };
 
+// A scene draw to repeat into the velocity image once its pass ends.
+struct MotionDraw {
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+  VkDescriptorSet vs_set = VK_NULL_HANDLE;
+  uint32_t offsets[5] = {};
+  Surface* depth = nullptr;
+  VkViewport viewport = {};
+  VkRect2D scissor = {};
+  float bias_constant = 0.0f, bias_scale = 0.0f;
+  VkDeviceSize index_offset = 0;
+  VkIndexType index_type = VK_INDEX_TYPE_UINT16;
+  uint32_t index_count = 0, count = 0, first_vertex = 0;
+};
+struct HistoryEntry {
+  uint32_t first = 0, min_vertex = 0, max_vertex = 0;
+};
+
 struct R {
   const VulkanDevice* device = nullptr;
   rex::ui::Presenter* presenter = nullptr;
@@ -253,6 +278,17 @@ struct R {
   VkDevice dev = VK_NULL_HANDLE;
   VkPhysicalDeviceMemoryProperties memory = {};
   bool usable = false;
+
+  // Motion vectors. Each vertex's clip position goes in one half of the history buffer per frame,
+  // found again by what the draw is (draw_key) and read by the same draw next frame.
+  VkBuffer history = VK_NULL_HANDLE;
+  VkShaderModule motion_fs = VK_NULL_HANDLE;
+  Image velocity;
+  std::vector<MotionDraw> motion_draws;
+  std::unordered_map<uint64_t, HistoryEntry> history_now, history_last;
+  std::unordered_map<uint64_t, uint32_t> draw_occurrences;
+  uint32_t history_half = 0, history_used = 0;
+  bool velocity_cleared = false, flushing_motion = false;
 
   VkBuffer heap = VK_NULL_HANDLE, upload = VK_NULL_HANDLE, staging = VK_NULL_HANDLE;
   uint8_t* heap_map = nullptr;
@@ -715,11 +751,19 @@ bool Init() {
     return false;
   }
 
-  VkDescriptorSetLayoutBinding heap_binding = {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
-                                               VK_SHADER_STAGE_ALL_GRAPHICS, nullptr};
+  uint8_t* history_map = nullptr;
+  if (!MakeMappedBuffer(VkDeviceSize(kHistoryPositions) * 2 * 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                        r.history, history_map)) {
+    REXLOG_ERROR("NG2 NATIVE: history buffer setup failed");
+    return false;
+  }
+  r.motion_fs = MakeModule(kMotionFrag, sizeof(kMotionFrag));
+  const VkDescriptorSetLayoutBinding heap_bindings[2] = {
+      {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL_GRAPHICS, nullptr},
+      {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL_GRAPHICS, nullptr}};
   VkDescriptorSetLayoutCreateInfo set_info = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-  set_info.bindingCount = 1;
-  set_info.pBindings = &heap_binding;
+  set_info.bindingCount = 2;
+  set_info.pBindings = heap_bindings;
   vk.vkCreateDescriptorSetLayout(r.dev, &set_info, nullptr, &r.heap_layout);
   VkDescriptorSetLayoutBinding constant_bindings[5];
   for (uint32_t i = 0; i < 5; ++i) {
@@ -730,7 +774,7 @@ bool Init() {
   set_info.pBindings = constant_bindings;
   vk.vkCreateDescriptorSetLayout(r.dev, &set_info, nullptr, &r.constants_layout);
 
-  VkDescriptorPoolSize static_sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1},
+  VkDescriptorPoolSize static_sizes[] = {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2},
                                          {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 5 * kFrames},
                                          {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4096}};
   VkDescriptorPoolCreateInfo pool_info = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -744,12 +788,17 @@ bool Init() {
   alloc.pSetLayouts = &r.heap_layout;
   vk.vkAllocateDescriptorSets(r.dev, &alloc, &r.heap_set);
   VkDescriptorBufferInfo heap_info = {r.heap, 0, VK_WHOLE_SIZE};
-  VkWriteDescriptorSet write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-  write.dstSet = r.heap_set;
-  write.descriptorCount = 1;
-  write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-  write.pBufferInfo = &heap_info;
-  vk.vkUpdateDescriptorSets(r.dev, 1, &write, 0, nullptr);
+  VkDescriptorBufferInfo history_info = {r.history, 0, VK_WHOLE_SIZE};
+  VkWriteDescriptorSet writes[2] = {};
+  for (uint32_t i = 0; i < 2; ++i) {
+    writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[i].dstSet = r.heap_set;
+    writes[i].dstBinding = i;
+    writes[i].descriptorCount = 1;
+    writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    writes[i].pBufferInfo = i ? &history_info : &heap_info;
+  }
+  vk.vkUpdateDescriptorSets(r.dev, 2, writes, 0, nullptr);
 
   VkCommandPoolCreateInfo cmd_pool = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
   cmd_pool.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -932,11 +981,92 @@ uint32_t HeapAlloc(uint32_t bytes) {
   return uint32_t(offset);
 }
 
+void FlushMotion();
+void RetireTexture(Image& image);
+
 void EndPass() {
   if (!r.in_pass) return;
   vk.vkCmdEndRendering(r.f->main_cb);
   r.in_pass = false;
   r.pass_width = 0;
+  FlushMotion();
+}
+
+// Repeats the opaque scene draws with a depth-equal test into the velocity image. Pixel shaders
+// stay out of it: alpha-tested holes are in the depth, and the one fragment shader needs no
+// knowledge of the game. This pass is also what writes the history for the next frame.
+void FlushMotion() {
+  if (r.motion_draws.empty() || r.flushing_motion) return;
+  r.flushing_motion = true;
+  VkCommandBuffer cb = r.f->main_cb;
+  size_t next = 0;
+  while (next < r.motion_draws.size()) {
+    Surface* depth = r.motion_draws[next].depth;
+    if (r.velocity.width != depth->image.width || r.velocity.height != depth->image.height) {
+      if (r.velocity.image != VK_NULL_HANDLE) RetireTexture(r.velocity);
+      r.velocity = {};
+      if (!MakeImage(r.velocity, VK_FORMAT_R16G16_SFLOAT, depth->image.width, depth->image.height, 1,
+                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                         VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+        r.motion_draws.clear();
+        break;
+      }
+      ToGeneral(cb, r.velocity);
+      r.velocity_cleared = false;
+    }
+    FullBarrier(cb);
+    if (!r.velocity_cleared) {
+      const VkClearColorValue zero = {};
+      const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+      vk.vkCmdClearColorImage(cb, r.velocity.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+      FullBarrier(cb);
+      r.velocity_cleared = true;
+    }
+    VkRenderingAttachmentInfo color = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    color.imageView = r.velocity.view;
+    color.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingAttachmentInfo depth_attachment = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    depth_attachment.imageView = depth->image.view;
+    depth_attachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    depth_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo info = {VK_STRUCTURE_TYPE_RENDERING_INFO};
+    info.renderArea.extent = {r.velocity.width, r.velocity.height};
+    info.layerCount = 1;
+    info.colorAttachmentCount = 1;
+    info.pColorAttachments = &color;
+    info.pDepthAttachment = &depth_attachment;
+    info.pStencilAttachment = &depth_attachment;
+    vk.vkCmdBeginRendering(cb, &info);
+    const float blend_constants[4] = {};
+    vk.vkCmdSetBlendConstants(cb, blend_constants);
+    vk.vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
+    vk.vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
+    vk.vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
+    for (; next < r.motion_draws.size() && r.motion_draws[next].depth == depth; ++next) {
+      const MotionDraw& d = r.motion_draws[next];
+      vk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipeline);
+      const VkDescriptorSet sets[2] = {r.heap_set, r.f->constants};
+      vk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d.layout, 0, 2, sets, 5, d.offsets);
+      if (d.vs_set != VK_NULL_HANDLE) {
+        vk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d.layout, 2, 1, &d.vs_set, 0, nullptr);
+      }
+      vk.vkCmdSetViewport(cb, 0, 1, &d.viewport);
+      vk.vkCmdSetScissor(cb, 0, 1, &d.scissor);
+      vk.vkCmdSetDepthBias(cb, d.bias_constant, 0.0f, d.bias_scale);
+      if (d.index_count) {
+        vk.vkCmdBindIndexBuffer(cb, r.upload, r.f->upload_base + d.index_offset, d.index_type);
+        vk.vkCmdDrawIndexed(cb, d.index_count, 1, 0, 0, 0);
+      } else {
+        vk.vkCmdDraw(cb, d.count, 1, d.first_vertex, 0);
+      }
+    }
+    vk.vkCmdEndRendering(cb);
+  }
+  r.motion_draws.clear();
+  r.flushing_motion = false;
 }
 
 void ApplyPendingClears(Surface& surface) {
@@ -1212,7 +1342,16 @@ VkPipeline GetPipeline(const PipelineKey& key, const NativeShader* vs, const Nat
   };
   add(VK_SHADER_STAGE_VERTEX_BIT, ModuleFor(*vs));
   if (key.rect) add(VK_SHADER_STAGE_GEOMETRY_BIT, r.rect_gs);
-  if (ps) add(VK_SHADER_STAGE_FRAGMENT_BIT, ModuleFor(*ps));
+  // Specialization constant 0 turns the translator's motion path on.
+  const VkBool32 motion_on = VK_TRUE;
+  const VkSpecializationMapEntry motion_entry = {0, 0, sizeof(motion_on)};
+  const VkSpecializationInfo motion_specialization = {1, &motion_entry, sizeof(motion_on), &motion_on};
+  if (key.motion) {
+    stages[0].pSpecializationInfo = &motion_specialization;
+    add(VK_SHADER_STAGE_FRAGMENT_BIT, r.motion_fs);
+  } else if (ps) {
+    add(VK_SHADER_STAGE_FRAGMENT_BIT, ModuleFor(*ps));
+  }
 
   VkPipelineVertexInputStateCreateInfo vertex = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
   VkPipelineInputAssemblyStateCreateInfo assembly = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
@@ -1247,6 +1386,12 @@ VkPipeline GetPipeline(const PipelineKey& key, const NativeShader* vs, const Nat
     depth.back.depthFailOp = VkStencilOp((dc >> 29) & 7);
   } else {
     depth.back = depth.front;
+  }
+  if (key.motion) {
+    depth.depthTestEnable = VK_TRUE;
+    depth.depthWriteEnable = VK_FALSE;
+    depth.depthCompareOp = VK_COMPARE_OP_EQUAL;
+    depth.stencilTestEnable = VK_FALSE;
   }
 
   VkPipelineColorBlendAttachmentState blends[4] = {};
@@ -1920,9 +2065,13 @@ void RendererDraw(const DrawCall& d) {
   // Vertex data.
   uint32_t fetch[32 * 6];
   SwapDwords(fetch, Virt(dev + kDevFetch), 32 * 6);
+  uint64_t draw_parts[12] = {vs->ucode_hash, ps ? ps->ucode_hash : 0,
+                             (uint64_t(d.index_guest) << 32) | d.first_vertex, d.count};
+  uint32_t draw_part_count = 4;
   for (uint32_t slot : vs->vertex_fetch_slots) {
     uint32_t* words = fetch + slot * 2;
     if ((words[0] & 3) != 3) continue;
+    if (draw_part_count < 12) draw_parts[draw_part_count++] = words[0];
     const uint32_t heap_offset = CopyToHeap(words[0] & 0xFFFFFFFC, ((words[1] >> 2) & 0xFFFFFF) * 4);
     if (heap_offset != UINT32_MAX) words[0] = heap_offset | (words[0] & 3);
   }
@@ -2006,6 +2155,48 @@ void RendererDraw(const DrawCall& d) {
   };
   set_signs(*vs);
   if (ps) set_signs(*ps);
+  system.history_bases[0] = system.history_bases[1] = UINT32_MAX;
+  system.motion_debug = float(REXCVAR_GET(ng2_native_show_motion));
+  const bool triangles = key.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST ||
+                         key.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ||
+                         key.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
+  // The scene pass: smaller than the 1280x720 surface the frame ends on, with depth. Blended and
+  // depth-writing shaders stay out, their pixels have no single surface to follow.
+  bool motion = REXCVAR_GET(ng2_native_motion) && depth && color[0] && w >= 640.0f && w < 1280.0f &&
+                triangles && !key.rect && !d.immediate && (depth_control & 6) == 6 &&
+                !(ps && (ps->flags & kShaderFlagWritesDepth));
+  if (motion) {
+    uint32_t low = d.first_vertex, high = d.first_vertex + d.count - 1;
+    if (d.indexed) {
+      low = UINT32_MAX;
+      high = 0;
+      const uint8_t* in = Virt(d.index_guest);
+      for (uint32_t i = 0; i < d.count; ++i) {
+        const uint32_t index = d.index_32
+                                   ? rex::memory::load_and_swap<uint32_t>(in + size_t(i) * 4)
+                                   : rex::memory::load_and_swap<uint16_t>(in + size_t(i) * 2);
+        if (index == (d.index_32 ? UINT32_MAX : 0xFFFFu)) continue;
+        low = std::min(low, index);
+        high = std::max(high, index);
+      }
+    }
+    const uint32_t positions = high >= low ? high - low + 1 : 0;
+    if (!positions || r.history_used + positions > kHistoryPositions) {
+      motion = false;
+    } else {
+      const uint64_t base_key = XXH3_64bits(draw_parts, draw_part_count * 8);
+      const uint64_t draw_key = base_key + r.draw_occurrences[base_key]++;
+      HistoryEntry entry = {r.history_half * kHistoryPositions + r.history_used, low, high};
+      r.history_used += positions;
+      r.history_now[draw_key] = entry;
+      system.history_bases[0] = entry.first - low;
+      const auto last = r.history_last.find(draw_key);
+      if (last != r.history_last.end() && last->second.min_vertex == low &&
+          last->second.max_vertex == high) {
+        system.history_bases[1] = last->second.first - low;
+      }
+    }
+  }
   const VkDeviceSize system_offset = UploadAlloc(sizeof(system));
   const VkDeviceSize vs_offset =
       PackFloatConstants(dev + kDevVsFloat, vs->float_bitmap, vs->float_constant_count,
@@ -2105,6 +2296,36 @@ void RendererDraw(const DrawCall& d) {
     vk.vkCmdDrawIndexed(cb, index_count, 1, 0, 0, 0);
   } else {
     vk.vkCmdDraw(cb, d.count, 1, d.first_vertex, 0);
+  }
+  if (motion) {
+    PipelineKey motion_key = key;
+    motion_key.motion = 1;
+    motion_key.ps = 0;
+    for (uint32_t i = 0; i < 4; ++i) {
+      motion_key.color_formats[i] = 0;
+      motion_key.color_masks[i] = 0;
+      motion_key.blend[i] = 0;
+    }
+    motion_key.color_formats[0] = VK_FORMAT_R16G16_SFLOAT;
+    motion_key.color_masks[0] = 3;
+    motion_key.blend[0] = 0x00010001;
+    motion_key.depth_control = 0;
+    MotionDraw m;
+    m.pipeline = GetPipeline(motion_key, vs, nullptr, layout);
+    m.layout = layout;
+    m.vs_set = vs_set;
+    std::memcpy(m.offsets, offsets, sizeof(offsets));
+    m.depth = depth;
+    m.viewport = viewport;
+    m.scissor = scissor;
+    m.bias_constant = bias_constant;
+    m.bias_scale = bias_scale;
+    m.index_offset = index_offset;
+    m.index_type = index_type;
+    m.index_count = index_count;
+    m.count = d.count;
+    m.first_vertex = d.first_vertex;
+    if (m.pipeline != VK_NULL_HANDLE) r.motion_draws.push_back(m);
   }
   ++g_s.drawn;
   if (r.dumping) {
@@ -2415,6 +2636,15 @@ void RendererSwap(uint32_t dev, uint32_t front_texture) {
   if (REXCVAR_GET(ng2_native_dump_frame) == -1) rex::cvar::SetFlagByName("ng2_native_dump_frame", "0");
   (void)dev;
 
+  EndPass();
+  FlushMotion();
+  if (REXCVAR_GET(ng2_native_show_motion) && r.velocity.image != VK_NULL_HANDLE) r.show_override = &r.velocity;
+  r.history_last.swap(r.history_now);
+  r.history_now.clear();
+  r.draw_occurrences.clear();
+  r.history_half ^= 1;
+  r.history_used = 0;
+  r.velocity_cleared = false;
   Image* front = r.show_override;
   if (!front && front_texture) {
     uint32_t words[6];
