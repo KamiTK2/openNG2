@@ -53,11 +53,12 @@ bool PromptsUseKeyboard();
 
 namespace {
 // Only the native renderer goes past 5x: the emulated path is limited to 7x by the SDK.
-int MaxResolutionScale() {
+bool NativeRendererRunning() {
   return rex::cvar::GetFlagByName("ng2_native_d3d") == "true" &&
-                 rex::cvar::GetFlagByName("gpu_backend") == "vulkan"
-             ? 10
-             : 5;
+         rex::cvar::GetFlagByName("gpu_backend") == "vulkan";
+}
+int MaxResolutionScale() {
+  return NativeRendererRunning() ? 10 : 5;
 }
 
 // ---- helpers -----------------------------------------------------------------------
@@ -99,6 +100,9 @@ double AspectForMode(int mode, float width, float height) {
 const char* AaCvarValue(int aa) { return aa == 2 ? "fxaa_extreme" : aa == 1 ? "fxaa" : "none"; }
 int AaFromCvar(const std::string& v) { return v == "fxaa_extreme" ? 2 : v == "fxaa" ? 1 : 0; }
 const char* UpscalerCvarValue(int u) { return u == 2 ? "cas" : u == 1 ? "fsr" : "bilinear"; }
+constexpr int kUpscalerFsrTemporal = 3, kUpscalerDlss = 4;
+// ng2_upscaler for the Upscaling row: 0 off, 1 DLSS, 2 FSR.
+int TemporalCvarValue(int u) { return u == kUpscalerDlss ? 1 : u == kUpscalerFsrTemporal ? 2 : 0; }
 int UpscalerFromCvar(std::string v) {
   if (v.size() >= 2 && v.front() == '"' && v.back() == '"') v = v.substr(1, v.size() - 2);
   return v == "cas" ? 2 : v == "fsr" ? 1 : 0;
@@ -714,7 +718,14 @@ bool RecompSettings::Load(const std::filesystem::path& path) {
     else if (k == "gpu_backend") renderer = v == "d3d12" ? 1 : 0;
     else if (k == "resolution_scale") resolution_scale = ParseInt(v, resolution_scale, 1, 10);
     else if (k == "swap_post_effect") anti_aliasing = AaFromCvar(v);
-    else if (k == "present_effect") upscaler = UpscalerFromCvar(v);
+    else if (k == "present_effect") {
+      if (upscaler < kUpscalerFsrTemporal) upscaler = UpscalerFromCvar(v);
+    } else if (k == "ng2_upscaler") {
+      const int temporal = ParseInt(v, 0, 0, 2);
+      if (temporal) upscaler = temporal == 1 ? kUpscalerDlss : kUpscalerFsrTemporal;
+    } else if (k == "ng2_upscale_quality") {
+      upscale_quality = ParseInt(v, upscale_quality, 0, 4);
+    }
     else if (k == "ng2_sharpness") sharpness = ParseInt(v, sharpness, 0, 10);
     else if (k == "ng2_aspect_mode") aspect_mode = ParseInt(v, aspect_mode, 0, 3);
     else if (k == "ng2_fov_percent") fov_percent = ParseInt(v, fov_percent, 70, 150);
@@ -780,9 +791,12 @@ bool RecompSettings::Save(const std::filesystem::path& path) const {
       << "resolution_scale = " << resolution_scale << "\n"
       << "swap_post_effect = \"" << AaCvarValue(anti_aliasing) << "\"\n"
       << "present_effect = \"" << UpscalerCvarValue(upscaler) << "\"\n"
+      << "ng2_upscaler = " << TemporalCvarValue(upscaler) << "\n"
+      << "ng2_upscale_quality = " << upscale_quality << "\n"
       << "ng2_sharpness = " << sharpness << "\n"
       << "present_fsr_sharpness_reduction = " << FsrSharpnessReduction(sharpness) << "\n"
       << "present_cas_additional_sharpness = " << CasAdditionalSharpness(sharpness) << "\n"
+      << "ng2_upscale_sharpness = " << sharpness / 10.0 << "\n"
       << "ng2_aspect_mode = " << aspect_mode << "\n"
       << "ng2_fov_percent = " << fov_percent << "\n"
       << "ng2_framerate_cap = " << framerate_cap << "\n"
@@ -1232,6 +1246,14 @@ RecompOptionsPane::RecompOptionsPane(rex::ui::ImGuiDrawer* drawer, rex::ui::Wind
   settings_.anti_aliasing = AaFromCvar(rex::cvar::GetFlagByName("swap_post_effect"));
   // Upscaling is live, but show what is running (it may come from the command line).
   settings_.upscaler = UpscalerFromCvar(rex::cvar::GetFlagByName("present_effect"));
+  if (NativeRendererRunning()) {
+    const int temporal = std::atoi(rex::cvar::GetFlagByName("ng2_upscaler").c_str());
+    if (temporal == 1 || temporal == 2) {
+      settings_.upscaler = temporal == 1 ? kUpscalerDlss : kUpscalerFsrTemporal;
+    }
+    settings_.upscale_quality =
+        std::clamp(std::atoi(rex::cvar::GetFlagByName("ng2_upscale_quality").c_str()), 0, 4);
+  }
   {
     const std::string r = rex::cvar::GetFlagByName("present_fsr_sharpness_reduction");
     if (!r.empty()) {
@@ -1288,10 +1310,13 @@ void RecompOptionsPane::ApplyAndSave() {
   rex::cvar::SetFlagByName("swap_post_effect", AaCvarValue(settings_.anti_aliasing));
   rex::cvar::SetFlagByName("ng2_fov_percent", std::to_string(settings_.fov_percent));
   rex::cvar::SetFlagByName("present_effect", UpscalerCvarValue(settings_.upscaler));
+  rex::cvar::SetFlagByName("ng2_upscaler", std::to_string(TemporalCvarValue(settings_.upscaler)));
+  rex::cvar::SetFlagByName("ng2_upscale_quality", std::to_string(settings_.upscale_quality));
   rex::cvar::SetFlagByName("present_fsr_sharpness_reduction",
                            std::to_string(FsrSharpnessReduction(settings_.sharpness)));
   rex::cvar::SetFlagByName("present_cas_additional_sharpness",
                            std::to_string(CasAdditionalSharpness(settings_.sharpness)));
+  rex::cvar::SetFlagByName("ng2_upscale_sharpness", std::to_string(settings_.sharpness / 10.0));
   ApplyUpscalerLive(imgui_drawer(), settings_);
   rex::cvar::SetFlagByName("frame_generation", settings_.framerate_cap == 120 ? "true" : "false");
   rex::cvar::SetFlagByName("present_half_rate", settings_.framerate_cap == 30 ? "true" : "false");
@@ -1818,18 +1843,43 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
                           return true;
                         }});
       }
+      const bool temporal = s.upscaler >= kUpscalerFsrTemporal;
       std::snprintf(buf, sizeof(buf), "%dx", s.resolution_scale);
-      step_row("Internal Resolution", buf, s.resolution_scale, 1, MaxResolutionScale(), 1,
-               [&s](int v) { s.resolution_scale = v; });
+      step_row("Internal Resolution", temporal ? "Auto" : buf, s.resolution_scale, 1,
+               MaxResolutionScale(), 1, [&s](int v) { s.resolution_scale = v; });
+      if (temporal) {  // Upscaling Quality sets the render size
+        rows.back().disabled = true;
+        rows.back().can_dec = rows.back().can_inc = false;
+        rows.back().change = nullptr;
+      }
       const char* aa[] = {"Off", "FXAA", "FXAA Extreme"};
       step_row("Anti-Aliasing", aa[s.anti_aliasing], s.anti_aliasing, 0, 2, 1,
                [&s](int v) { s.anti_aliasing = v; });
-      const char* upscalers[] = {"Bilinear", "FSR 1.0", "CAS"};
-      step_row("Upscaling", upscalers[s.upscaler], s.upscaler, 0, 2, 1,
-               [&s](int v) { s.upscaler = v; });
+      // Available choices in order; FSR and DLSS need the native renderer, DLSS an NVIDIA GPU.
+      static const char* const kUpscalers[] = {"Bilinear", "FSR 1.0", "CAS", "FSR", "DLSS"};
+      int choices[5] = {0, 1, 2}, choice_count = 3, choice = 0;
+      if (NativeRendererRunning() && native::UpscalerAvailable(2)) choices[choice_count++] = kUpscalerFsrTemporal;
+      if (NativeRendererRunning() && native::UpscalerAvailable(1)) choices[choice_count++] = kUpscalerDlss;
+      for (int i = 0; i < choice_count; ++i) {
+        if (choices[i] == s.upscaler) choice = i;
+      }
+      step_row("Upscaling", kUpscalers[s.upscaler], choice, 0, choice_count - 1, 1,
+               [&s, choices](int v) { s.upscaler = choices[v]; });
+      {
+        const char* const fsr[] = {"Ultra Performance", "Performance", "Balanced", "Quality", "Native AA"};
+        const char* const dlss[] = {"Ultra Performance", "Performance", "Balanced", "Quality", "DLAA"};
+        step_row("Upscaling Quality",
+                 (s.upscaler == kUpscalerDlss ? dlss : fsr)[s.upscale_quality], s.upscale_quality, 0,
+                 4, 1, [&s](int v) { s.upscale_quality = v; });
+        if (!temporal) {
+          rows.back().disabled = true;
+          rows.back().can_dec = rows.back().can_inc = false;
+          rows.back().change = nullptr;
+        }
+      }
       std::snprintf(buf, sizeof(buf), "%d", s.sharpness);
       step_row("Sharpness", buf, s.sharpness, 0, 10, 1, [&s](int v) { s.sharpness = v; });
-      if (s.upscaler == 0) {  // Bilinear has no sharpening pass
+      if (s.upscaler == 0 || s.upscaler == kUpscalerDlss) {  // No sharpening pass
         rows.back().disabled = true;
         rows.back().can_dec = rows.back().can_inc = false;
         rows.back().change = nullptr;
@@ -2248,6 +2298,20 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
       std::strcmp(rows[row_].label, "Preset") == 0) {
     text_at(X(L.label_x), fy, kGrey,
             "Low suits weaker PCs. Ultra renders at 4x and needs a strong GPU.", false, note_px);
+    fy += note_px * 1.5f;
+  }
+  if (focused_ && row_ >= 0 && row_ < int(rows.size()) &&
+      std::strcmp(rows[row_].label, "Upscaling") == 0 && s.upscaler >= kUpscalerFsrTemporal) {
+    text_at(X(L.label_x), fy, kGrey,
+            s.upscaler == kUpscalerDlss ? "NVIDIA DLSS, part of NVIDIA RTX." : "AMD FSR.", false, note_px);
+    fy += note_px * 1.5f;
+  }
+  if (focused_ && row_ >= 0 && row_ < int(rows.size()) &&
+      std::strcmp(rows[row_].label, "Upscaling Quality") == 0 && s.upscaler >= kUpscalerFsrTemporal) {
+    text_at(X(L.label_x), fy, kGrey,
+            s.upscale_quality == 4 ? "Renders at your screen's resolution and uses the upscaler as anti-aliasing."
+                                   : "Lower settings render fewer pixels and run faster.",
+            false, note_px);
     fy += note_px * 1.5f;
   }
   if (focused_ && row_ >= 0 && row_ < int(rows.size()) &&

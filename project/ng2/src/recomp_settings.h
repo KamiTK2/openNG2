@@ -93,8 +93,10 @@ struct RecompSettings {
   int resolution_scale = 1;  // 1..5, 1..10 on the native renderer (live)
   int anti_aliasing = 0;     // 0 off, 1 FXAA, 2 FXAA extreme (live)
   // Scaling of the game image to the window: 0 bilinear, 1 AMD FSR 1.0 (EASU + RCAS),
-  // 2 AMD CAS. Drives cvar present_effect (applied live through the presenter).
+  // 2 AMD CAS, drive cvar present_effect (applied live through the presenter). 3 FSR, 4 DLSS are
+  // temporal, on the native renderer only: cvars ng2_upscaler and ng2_upscale_quality (live).
   int upscaler = 0;
+  int upscale_quality = 3;  // 0 Ultra Performance .. 3 Quality, 4 DLAA / Native AA
   int sharpness = 8;  // 0..10 for FSR / CAS (present_fsr_sharpness_reduction / cas sharpness)
   // 30 = present every other frame (game still runs at 60), 60, 120 = frame generation.
   // Drives cvars present_half_rate / frame_generation (live).

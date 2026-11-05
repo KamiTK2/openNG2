@@ -249,3 +249,17 @@ g2_trace_karmaon.txt`, `ng2_trace_karmaoff.txt`; generated code of the named fun
 - observed: the Renderer row in a capture (pane3.png, run by key input in the sandbox): D3D12 selected, restart note and hint shown, `gpu_backend = "d3d12"` saved.
 - observed: both the dev and install-layout logs hold the same 12 error lines, 11 duplicate cvar registrations (the translator compiled into ng2 as well as the plugin) and one ResolvePath(\\Device). Not new.
 - unknown: the fallback to D3D12 on a PC without Vulkan 1.3 has not run; the RTX 4090 always passes `HostSupportsNative`. A device that passes that check and still fails native setup is not handled.
+
+## #150: DLSS and FSR on the native renderer: motion vectors, jitter, fractional scale
+
+- observed: a gameplay frame (dump up-dump): shadow pass, scene 1120x584 HDR with depth (496 draws), post, one composite draw into the scene surface, resolve to a 1120x584 texture, then a 1280x720 surface with one stretch draw and the HUD. All temporal work fits between the composite resolve and the stretch.
+- observed: draws can be found again by (VS, PS, index address, first vertex, count, vertex stream addresses, occurrence): 95.5% of scene draws and 92.5% of vertices match the last frame (up-census, nearly idle camera).
+- observed: motion vectors from per-vertex clip position history, no game matrices. Debug view up-mv2 with the camera turning: near railing large with smooth gradients, cut-out leaves crisp, Ryu near zero because the camera follows him.
+- observed: scaling the luminance chain below 1x darkens the whole image (up-s1, up-s4, Performance): its 2x2 textures collapse. Only surfaces of the scene's shape follow the input scale now; others stay at 1x or above (up-s9, Ultra Performance, correct exposure).
+- observed: DLSS 310.9.16 and FSR SDK 2.4.0 both create and run through ng2_upscalers.dll on the RTX 4090. On that GPU FSR is the 3.x path, FSR 4 needs AMD hardware (inferred from AMD's docs, version not read back).
+- observed: jitter sign, static scene, DLSS Ultra Performance, Laplacian energy: +1 gives 73.0, -1 gives 50.1. +1 is the default.
+- observed, 2560x1440 output, gameplay, 15 s, capped at 60 so ms are not comparable: plain native 2x 60.1 fps 4.85 ms 52 W; DLAA 60.1 fps 5.4 ms 67 W; DLSS Quality 60.1 fps 5.29 ms 62 W; Performance 60.1 fps 5.22 ms 65 W; Ultra Performance 53.1 fps 5.44 ms 56 W; FSR Quality 60.1 fps 4.97 ms 57 W. The cutscene route with DLSS Quality passed (m-cut).
+- unknown: why the Ultra Performance run averaged 53.1 fps; the log shows a 51.6 fps window. A single run.
+- unknown: everything past one courtyard. Moving enemies, particles, other chapters and fast cuts haven't been compared. Temporal modes have not been compared against D3D12 at a high scale, and not by a person.
+- known gap, observed: the sky writes no motion (up-mv2), so it counts as still while the camera turns. Draws with no match on their first visible frame are also still for one frame.
+- inferred: the near, far and field of view given to FSR are placeholders, not read from the game.

@@ -69,6 +69,7 @@ REXCVAR_DEFINE_STRING(ng2_native_skip_ps, "", "NG2",
 REXCVAR_DEFINE_BOOL(ng2_native_motion, false, "NG2", "Write motion vectors for the scene");
 REXCVAR_DEFINE_INT32(ng2_upscaler, 0, "NG2", "Temporal upscaler: 0 off, 1 DLSS, 2 FSR, 3 plain scaling (test)");
 REXCVAR_DEFINE_INT32(ng2_upscale_jitter_sign, 1, "NG2", "NG2 DIAG: sign of the jitter given to the upscaler");
+REXCVAR_DEFINE_DOUBLE(ng2_upscale_sharpness, 0.8, "NG2", "FSR sharpening, 0 to 1");
 REXCVAR_DEFINE_INT32(ng2_upscale_quality, 3, "NG2",
                      "0 Ultra Performance, 1 Performance, 2 Balanced, 3 Quality, 4 DLAA / Native AA");
 REXCVAR_DEFINE_INT32(ng2_native_show_motion, 0, "NG2",
@@ -190,6 +191,7 @@ struct Fn {
 constexpr int kMaxScale = 10;
 std::atomic<int> g_desired_scale{1};
 std::atomic<int> g_output_width{0}, g_output_height{0};
+std::atomic<bool> g_dlss_available{false}, g_fsr_available{false};
 
 struct Image {
   VkImage image = VK_NULL_HANDLE;
@@ -917,7 +919,10 @@ void DestroyScaledImage(Image& image) {
 // recreated on demand. Happens between frames; the next frame's history is simply gone.
 void ApplyResolutionScale() {
   const uint32_t want = uint32_t(std::clamp(g_desired_scale.load(), 1, kMaxScale));
-  const bool temporal = REXCVAR_GET(ng2_upscaler) != 0;
+  // A saved choice this PC can't run (a changed GPU, no bridge DLL) leaves the game as it was.
+  const int kind = REXCVAR_GET(ng2_upscaler);
+  const bool temporal = kind == 3 || (kind == kNg2UpscaleDlss && g_dlss_available) ||
+                        (kind == kNg2UpscaleFsr && g_fsr_available);
   uint32_t output_height = 0, output_width = 0, input_width = 0, input_height = 0;
   if (temporal) {
     static constexpr float kRatios[5] = {1.0f / 3.0f, 0.5f, 0.58f, 2.0f / 3.0f, 1.0f};
@@ -956,8 +961,11 @@ void ApplyResolutionScale() {
   r.scale = want;
 }
 
+void LoadBridge();
+
 void BeginFrame() {
   if (r.recording) return;
+  LoadBridge();
   ApplyResolutionScale();
   r.f = &r.frames[r.frame_index];
   Frame& f = *r.f;
@@ -2564,6 +2572,14 @@ void LoadBridge() {
   r.bridge_create = reinterpret_cast<Ng2UpscaleCreateFn>(GetProcAddress(module, "Ng2UpscaleCreate"));
   r.bridge_evaluate = reinterpret_cast<Ng2UpscaleEvaluateFn>(GetProcAddress(module, "Ng2UpscaleEvaluate"));
   r.bridge_destroy = reinterpret_cast<Ng2UpscaleDestroyFn>(GetProcAddress(module, "Ng2UpscaleDestroy"));
+  const auto available = reinterpret_cast<Ng2UpscaleAvailableFn>(GetProcAddress(module, "Ng2UpscaleAvailable"));
+  if (available) {
+    const Ng2UpscaleDevice device = BridgeDevice();
+    g_dlss_available = available(kNg2UpscaleDlss, &device);
+    g_fsr_available = available(kNg2UpscaleFsr, &device);
+    REXLOG_INFO("NG2 NATIVE: upscalers available: DLSS {}, FSR {}", g_dlss_available.load(),
+                g_fsr_available.load());
+  }
 }
 
 void TransitionImages(VkCommandBuffer cb, Image* const* images, uint32_t count, VkImageLayout from, VkImageLayout to) {
@@ -2642,7 +2658,7 @@ bool EvaluateUpscaler(VkCommandBuffer cb, Image& source) {
   frame.jitter_x = r.jitter_pixels[0] * float(REXCVAR_GET(ng2_upscale_jitter_sign));
   frame.jitter_y = r.jitter_pixels[1] * float(REXCVAR_GET(ng2_upscale_jitter_sign));
   frame.frame_ms = std::chrono::duration<float, std::milli>(now - r.last_upscale_time).count();
-  frame.sharpness = 0.0f;
+  frame.sharpness = kind == kNg2UpscaleFsr ? float(REXCVAR_GET(ng2_upscale_sharpness)) : 0.0f;
   frame.reset = r.upscaler_reset;
   r.last_upscale_time = now;
   const bool ok = r.bridge_evaluate(kind, &frame);
@@ -3030,6 +3046,10 @@ void RendererSwap(uint32_t dev, uint32_t front_texture) {
   if (!submitted) submit();
   r.recording = false;
   r.frame_index = (r.frame_index + 1) % kFrames;
+}
+
+bool UpscalerAvailable(int kind) {
+  return kind == kNg2UpscaleDlss ? g_dlss_available.load() : kind == kNg2UpscaleFsr && g_fsr_available.load();
 }
 
 void SetOutputSize(int width, int height) {
