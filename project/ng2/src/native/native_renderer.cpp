@@ -52,10 +52,6 @@
 REXCVAR_DEFINE_STRING(ng2_native_shader_pack, "ng2_native_shaders.pack", "NG2",
                       "Native renderer shader pack, relative to the executable");
 REXCVAR_DEFINE_BOOL(ng2_native_log_resolves, false, "NG2", "NG2 DIAG: log resolves that clear");
-REXCVAR_DEFINE_BOOL(ng2_native_msaa_depth_clear, true, "NG2",
-                    "Native renderer: clear the 2x session depth on a full colour clear (#129)");
-REXCVAR_DEFINE_BOOL(ng2_native_alias_depth_clear, true, "NG2",
-                    "Native renderer: a colour clear also clears depth surfaces placed inside it");
 REXCVAR_DEFINE_INT32(ng2_native_texture_mb, 2048, "NG2",
                      "Native renderer: game texture memory budget in MB; least recently used are freed");
 REXCVAR_DEFINE_INT32(ng2_native_show_resolve, -1, "NG2",
@@ -210,7 +206,6 @@ struct Surface {
   bool has_pending_clear = false;
   VkClearColorValue pending_clear = {};
   uint32_t tiles = 0;  // Size in guest layout units, only to find what a clear covers.
-  uint64_t depth_fit_frame = UINT64_MAX;  // Last frame the 2x scene depth clear ran.
 };
 
 struct PipelineKey {
@@ -2148,18 +2143,6 @@ void ClearColorSurface(Surface& s, const VkClearColorValue& value) {
       other.pending_clear = value;
     }
   }
-  // The game lays its surfaces out so that some depth surfaces lie inside a colour surface, and it
-  // relies on the colour clear to reset them: the scene colour at base 0 covers the reflection
-  // depth at 0x20, which only ever gets a stencil clear.
-  if (REXCVAR_GET(ng2_native_alias_depth_clear)) {
-    for (auto& [key, other] : r.surfaces) {
-      if (other.depth && other.base >= s.base && other.base < s.base + s.tiles) {
-        const VkClearDepthStencilValue depth = {0.0f, 0};
-        const VkImageSubresourceRange all = {VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1};
-        vk.vkCmdClearDepthStencilImage(r.f->main_cb, other.image.image, VK_IMAGE_LAYOUT_GENERAL, &depth, 1, &all);
-      }
-    }
-  }
 }
 
 // mask: 1 stencil, 2 depth.
@@ -2248,20 +2231,14 @@ void RendererClear(uint32_t dev, uint32_t rect_count, uint32_t rects, uint32_t f
     value.float32[3] = float(argb >> 24) / 255.0f;
   }
   FullBarrier(r.f->main_cb);
-  // Flags: bits 0-3 colour targets, 0x10 stencil, 0x20 depth (seen as 0x3F, 0x1F, 0x30).
+  // Flags: bits 0-3 colour targets, 0x10 depth, 0x20 stencil: sub_8375D698 builds RB_DEPTHCONTROL
+  // 0x76 (z write, always) from 0x10 and 0x8701 (stencil replace) from 0x20.
   for (uint32_t i = 0; i < 4; ++i) {
     if (!(flags & (1u << i))) continue;
     if (Surface* s = CurrentSurface(dev, i)) ClearColorSurface(*s, value);
   }
   if (Surface* s = GetSurface(Load(dev + kDevDepthSurface), true)) {
-    // Still a fit: the 2x session asks for colour only (0x0F where the 1x session asks for 0x3F), its
-    // depth at 0x3FE sits just past the 2x scene colour so the rule above doesn't reach it, and no
-    // other clear of it arrives, yet the frame needs it cleared (#129). Once per frame per surface,
-    // so a later colour-only clear in the same scene keeps its depth.
-    const bool msaa_scene_clear = REXCVAR_GET(ng2_native_msaa_depth_clear) && (flags & 0xF) == 0xF &&
-                                  s->msaa_y > 1 && s->depth_fit_frame != r.frame_count;
-    if (msaa_scene_clear) s->depth_fit_frame = r.frame_count;
-    const uint32_t mask = (flags >> 4) | (msaa_scene_clear ? 2 : 0);
+    const uint32_t mask = ((flags & 0x20) ? 1 : 0) | ((flags & 0x10) ? 2 : 0);
     if (mask & 3) ClearDepthSurface(*s, z, stencil, mask);
   }
   FullBarrier(r.f->main_cb);
