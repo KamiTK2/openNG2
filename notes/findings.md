@@ -285,3 +285,10 @@ g2_trace_karmaon.txt`, `ng2_trace_karmaoff.txt`; generated code of the named fun
 - observed, user session 19:25:41: "NG2 fast loading: on" at boot and no "off" before the window closed at 19:26:02; game fps 512 to 684 for those 21 s, seen by the user as fast forward.
 - observed: the latch's 3D scene exit reads rex::graphics::LastFrameDrawCount(), set only by the command processor (command_processor.cpp:2031), so on native that exit never fired. Same bug as GitHub #6: a cutscene right after a load would run unthrottled on native too.
 - fix: the native renderer publishes its own draw count. Separately, the boot load now ends on the main menu or 1 s after the icon goes, since its 15 s fade wait left the title and menus unthrottled.
+
+## #154: presets on the native renderer follow the screen
+
+- decision (user): Ultra is native resolution, not higher. All four presets use Match Window; DLSS or FSR at Performance, Balanced, Quality, DLAA / Native AA, with FXAA off. With neither upscaler: 720, 1080, 1440 capped at the screen and FSR 1.0, Ultra at the screen. D3D12 keeps 1x-4x.
+
+- observed: stepping the row in the sandbox on a 16:9 window: Ultra set Match Window, DLSS, DLAA, FXAA off; High on the way rendered 853x365 -> 1279x548 with Aspect Ratio 21:9.
+- observed, not new code: with a fixed Aspect Ratio wider than the window, the picture letterboxes and the Recomp Settings rows keep the full window's layout, so they overlap the Options title. Not fixed.

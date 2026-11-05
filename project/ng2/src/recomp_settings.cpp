@@ -1871,39 +1871,66 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
       }
       {
         // Presets set the image rows below together (not the Framerate Cap); "Custom" when
-        // they match none of them.
-        struct Preset { const char* name; int res, aa, upscaler, sharpness, height; };
+        // they match none of them. On the native renderer they all output at the screen's
+        // resolution and differ in how much of it is rendered: Ultra renders all of it.
+        struct Preset { const char* name; int res, aa, upscaler, sharpness, quality, fallback_height; };
         static const Preset kPresets[] = {
-            {"Low", 1, 0, 1, 8, 720},
-            {"Medium", 2, 1, 1, 8, 1080},
-            {"High", 3, 1, 1, 8, 1440},
-            {"Ultra", 4, 2, 1, 8, 2160},
+            {"Low", 1, 0, 1, 8, 1, 720},
+            {"Medium", 2, 1, 1, 8, 2, 1080},
+            {"High", 3, 1, 1, 8, 3, 1440},
+            {"Ultra", 4, 2, 1, 8, 4, -1},
+        };
+        const bool native_presets = NativeRendererRunning();
+        // A chosen temporal upscaler stays; otherwise DLSS, then FSR. 0: neither can run here.
+        const int preferred = !native_presets                 ? 0
+                              : s.upscaler >= kUpscalerFsrTemporal ? s.upscaler
+                              : native::UpscalerAvailable(1)  ? kUpscalerDlss
+                              : native::UpscalerAvailable(2)  ? kUpscalerFsrTemporal
+                                                              : 0;
+        const int screen_height = int(ImGui::GetIO().DisplaySize.y);
+        const auto fallback_height = [screen_height](const Preset& p) {
+          return p.fallback_height >= screen_height ? -1 : p.fallback_height;
         };
         int match = -1;
         for (int i = 0; i < 4; ++i) {
           const Preset& p = kPresets[i];
-          const bool same_size = NativeRendererRunning() ? s.internal_height == p.height
-                                                         : s.resolution_scale == p.res;
-          if (same_size && s.anti_aliasing == p.aa && s.upscaler == p.upscaler &&
-              s.sharpness == p.sharpness) {
-            match = i;
+          bool same = s.sharpness == p.sharpness;
+          if (preferred) {
+            same = same && s.internal_height < 0 && s.upscaler == preferred &&
+                   s.upscale_quality == p.quality && s.anti_aliasing == 0;
+          } else {
+            same = same && s.anti_aliasing == p.aa && s.upscaler == p.upscaler &&
+                   (native_presets ? s.internal_height == fallback_height(p) : s.resolution_scale == p.res);
           }
+          if (same) match = i;
         }
-        // From Custom, Left / Right start at the preset nearest the current resolution.
-        const int cur = match >= 0 ? match : std::clamp(s.resolution_scale, 1, 4) - 1;
+        // From Custom, Left / Right start at the preset nearest the current setting.
+        const int cur = match >= 0 ? match
+                        : preferred ? std::clamp(s.upscale_quality - 1, 0, 3)
+                                    : std::clamp(s.resolution_scale, 1, 4) - 1;
         rows.push_back({"Preset", Kind::kStepper, match >= 0 ? kPresets[match].name : "Custom",
                         match < 0 || cur > 0, match < 0 || cur < 3, nullptr, nullptr, false,
-                        [&s, cur, match](int dir, bool) {
+                        [&s, cur, match, preferred, native_presets, fallback_height](int dir, bool) {
                           if (!dir) return false;
                           const int v = match < 0 ? cur : std::clamp(cur + dir, 0, 3);
                           if (v == match) return false;
                           const Preset& p = kPresets[v];
                           s.resolution_scale = p.res;
-                          s.internal_height = p.height;
-                          s.internal_width = 0;  // The aspect ratio's list picks it.
-                          s.anti_aliasing = p.aa;
-                          s.upscaler = p.upscaler;
                           s.sharpness = p.sharpness;
+                          if (preferred) {
+                            s.internal_width = 0;
+                            s.internal_height = -1;
+                            s.upscaler = preferred;
+                            s.upscale_quality = p.quality;
+                            s.anti_aliasing = 0;
+                          } else {
+                            if (native_presets) {
+                              s.internal_width = 0;
+                              s.internal_height = fallback_height(p);
+                            }
+                            s.upscaler = p.upscaler;
+                            s.anti_aliasing = p.aa;
+                          }
                           return true;
                         }});
       }
@@ -2373,7 +2400,7 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
   if (focused_ && row_ >= 0 && row_ < int(rows.size()) &&
       std::strcmp(rows[row_].label, "Preset") == 0) {
     text_at(X(L.label_x), fy, kGrey,
-            NativeRendererRunning() ? "Low suits weaker PCs. Ultra renders at 4K and needs a strong GPU."
+            NativeRendererRunning() ? "Low suits weaker PCs. Ultra renders at your screen's full resolution."
                                     : "Low suits weaker PCs. Ultra renders at 4x and needs a strong GPU.", false, note_px);
     fy += note_px * 1.5f;
   }
