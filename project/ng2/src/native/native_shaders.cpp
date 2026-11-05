@@ -2,11 +2,15 @@
 
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
 
 #ifdef NG2_NATIVE_WITH_TRANSLATOR
+namespace rex::graphics {
+extern bool g_ng2_native_output_clamp;  // spirv_translator_rb.cpp
+}
 #include <rex/graphics/pipeline/shader/spirv.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/string/buffer.h>
@@ -231,6 +235,7 @@ bool RewriteSystemConstantLayout(std::vector<uint32_t>& spirv) {
 }
 
 rg::SpirvShaderTranslator& Translator() {
+  rex::graphics::g_ng2_native_output_clamp = true;
   // Host render target mode: fragment outputs, no interlock, no EDRAM access. Features(true) is
   // the desktop baseline, SPIR-V 1.5 with float controls. Denorm flushing is off: drivers don't
   // all offer it (the RTX 4090's doesn't), and declaring it is then invalid SPIR-V for the device.
@@ -254,6 +259,11 @@ bool TranslateShader(ShaderStage stage, const uint32_t* ucode_guest_order, uint3
   if (!shader.is_ucode_analyzed()) {
     if (error) *error = "ucode analysis failed";
     return false;
+  }
+  if (const char* dir = std::getenv("NG2_NATIVE_DISASM_DIR")) {  // Tool diagnostics; game-derived.
+    char name[64];
+    std::snprintf(name, sizeof(name), "/%016llX.ucode.txt", (unsigned long long)ucode_hash);
+    std::ofstream(std::string(dir) + name) << shader.ucode_disassembly();
   }
 
   // 16 interpolators on both sides: locations then equal interpolator indices and pairs always

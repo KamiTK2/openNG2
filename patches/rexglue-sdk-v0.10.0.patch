@@ -3123,6 +3123,65 @@ index 9ce3bb4..d193916 100644
                                    builder_->makeUintConstant(13), builder_->makeUintConstant(6)));
          {
            uint32_t result_remaining_components = used_result_nonzero_components;
+diff --git a/src/graphics/pipeline/shader/spirv_translator_rb.cpp b/src/graphics/pipeline/shader/spirv_translator_rb.cpp
+index 765c141..1774c86 100644
+--- a/src/graphics/pipeline/shader/spirv_translator_rb.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator_rb.cpp
+@@ -23,6 +23,9 @@
+ 
+ namespace rex::graphics {
+ 
++// NG2 ADDITION: set by tools/native-shader-tool only.
++bool g_ng2_native_output_clamp = false;
++
+ spv::Id SpirvShaderTranslator::PreClampedFloat32To7e3(SpirvBuilder& builder, spv::Id f32_scalar,
+                                                       spv::Id ext_inst_glsl_std_450) {
+   // https://github.com/Microsoft/DirectXTex/blob/master/DirectXTex/DirectXTexConvert.cpp
+@@ -927,12 +930,38 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
+       id_vector_temp_.clear();
+       id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantColorExpBias));
+       id_vector_temp_.push_back(builder_->makeIntConstant(int32_t(color_target_index)));
+-      color = builder_->createNoContractionBinOp(
+-          spv::OpVectorTimesScalar, type_float4_, color,
+-          builder_->createLoad(
+-              builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+-                                          id_vector_temp_),
+-              spv::NoPrecision));
++      spv::Id color_exp_bias = builder_->createLoad(
++          builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
++                                      id_vector_temp_),
++          spv::NoPrecision);
++      // NG2 ADDITION: native renderer (no EDRAM): a negative bias marks a 7e3 target, stored as
++      // float16 by the host, where the pixel's output must still take the format's range before
++      // blending, or an alpha above 1 gives negative colour.
++      spv::Id ng2_clamp_output = spv::NoResult;
++      if (g_ng2_native_output_clamp) {
++        ng2_clamp_output = builder_->createBinOp(spv::OpFOrdLessThan, type_bool_, color_exp_bias,
++                                                 const_float_0_);
++        color_exp_bias = builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
++                                                          GLSLstd450FAbs, color_exp_bias);
++      }
++      color = builder_->createNoContractionBinOp(spv::OpVectorTimesScalar, type_float4_, color,
++                                                 color_exp_bias);
++      if (ng2_clamp_output != spv::NoResult) {
++        spv::Id clamped = builder_->createTriBuiltinCall(
++            type_float4_, ext_inst_glsl_std_450_, GLSLstd450NClamp, color,
++            builder_->makeCompositeConstant(type_float4_,
++                                            {const_float_0_, const_float_0_, const_float_0_,
++                                             const_float_0_}),
++            builder_->makeCompositeConstant(
++                type_float4_,
++                {builder_->makeFloatConstant(31.875f), builder_->makeFloatConstant(31.875f),
++                 builder_->makeFloatConstant(31.875f), const_float_1_}));
++        id_vector_temp_.clear();
++        for (uint32_t i = 0; i < 4; ++i) id_vector_temp_.push_back(ng2_clamp_output);
++        color = builder_->createTriOp(
++            spv::OpSelect, type_float4_,
++            builder_->createCompositeConstruct(type_bool4_, id_vector_temp_), clamped, color);
++      }
+ 
+       if (edram_fragment_shader_interlock_) {
+         // Write the color to the target in the EDRAM only it was written on the
 diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
 index 76f5600..ce34e70 100644
 --- a/src/graphics/pipeline/texture/cache.cpp

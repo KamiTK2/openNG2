@@ -17,6 +17,7 @@ param(
   [int]$Scale = 1,
   [int]$MeasureSec = 15,
   [int]$TimeoutSec = 60,
+  [int]$StallSec = 15,   # no autopilot progress for this long fails the run (a dialog, a hang); 0 = off
   [string[]]$Cvars = @(),
   [string[]]$Settings = @(),   # recomp_settings.toml keys, 'k=v', over the pinned test values
   [string[]]$SavePatch = @(),  # sandbox saves only: 'ng2stryd20.dat:0x24=05' (file:offset=hex byte)
@@ -96,6 +97,16 @@ foreach ($sp in @($SavePatch | ForEach-Object { $_ -split ',' } | Where-Object {
   $bytes[0x7882] = [byte](($sum -shr 8) -band 255); $bytes[0x7883] = [byte]($sum -band 255)
   [IO.File]::WriteAllBytes($f.FullName, $bytes)
 }
+# A story save with a bad checksum puts the game's damaged-save dialog on screen (#136): never launch.
+foreach ($f in @(Get-ChildItem $sandbox -Recurse -File -Filter 'ng2stryd*.dat' | Where-Object { $_.Length -eq 31744 })) {
+  $bytes = [IO.File]::ReadAllBytes($f.FullName)
+  [uint64]$sum = 0
+  for ($i = 0; $i -lt 0x7880; $i += 4) {
+    $sum += ([uint64]$bytes[$i] -shl 24) -bor ([uint64]$bytes[$i + 1] -shl 16) -bor ([uint64]$bytes[$i + 2] -shl 8) -bor [uint64]$bytes[$i + 3]
+  }
+  $stored = ([uint64]$bytes[0x7880] -shl 24) -bor ([uint64]$bytes[0x7881] -shl 16) -bor ([uint64]$bytes[0x7882] -shl 8) -bor [uint64]$bytes[0x7883]
+  if (($sum -band 0xFFFFFFFFL) -ne $stored) { Fail-Early "sandbox save $($f.Name) has a bad checksum, the game would show its damaged-save dialog" }
+}
 $settingsHash = (Get-FileHash $settingsReal).Hash
 
 # Test settings: the user's file with the display / audio / update keys pinned
@@ -163,13 +174,19 @@ function Read-Log {
 $status = 'FAIL'; $reason = ''; $goalSec = -1; $fps = 'n/a'; $gpu = 'n/a'; $exitCode = 1
 $smi = $null; $smiFile = Join-Path $out 'gpu_clocks.csv'
 $clock = [Diagnostics.Stopwatch]::StartNew()
+$progressLines = 0; $progressAt = 0.0
 $p = Start-Process (Join-Path $bin 'ng2.exe') -WorkingDirectory $bin -PassThru -ArgumentList $argList
 try {
   while ($true) {
     if ($p.HasExited) { $reason = "exited early, code $($p.ExitCode)"; break }
     if ($clock.Elapsed.TotalSeconds -ge $TimeoutSec) { Shot "timeout"; $reason = "timeout after $TimeoutSec s"; break }
-    if (Read-Log | Select-String -SimpleMatch 'NG2 AUTOPILOT' | Select-String -SimpleMatch ' GOAL ') {
+    $autopilot = @(Read-Log | Select-String -SimpleMatch 'NG2 AUTOPILOT')
+    if ($autopilot | Select-String -SimpleMatch ' GOAL ') {
       $goalSec = [math]::Round($clock.Elapsed.TotalSeconds, 1); break
+    }
+    if ($autopilot.Count -ne $progressLines) { $progressLines = $autopilot.Count; $progressAt = $clock.Elapsed.TotalSeconds }
+    if ($StallSec -gt 0 -and -not $Movies -and $clock.Elapsed.TotalSeconds - $progressAt -ge $StallSec) {
+      Shot 'stalled'; $reason = "no autopilot progress for $StallSec s (a dialog or a hang, see stalled.png)"; break
     }
     Start-Sleep -Milliseconds 100
   }

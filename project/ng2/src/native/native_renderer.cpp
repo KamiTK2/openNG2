@@ -15,6 +15,7 @@
 #include <cstring>
 #include <filesystem>
 #include <map>
+#include <set>
 #include <mutex>
 #include <string>
 #include <tuple>
@@ -55,6 +56,9 @@ REXCVAR_DEFINE_INT32(ng2_native_texture_mb, 2048, "NG2",
                      "Native renderer: game texture memory budget in MB; least recently used are freed");
 REXCVAR_DEFINE_INT32(ng2_native_show_resolve, -1, "NG2",
                      "Native renderer debug: present the Nth resolve of the frame instead");
+REXCVAR_DEFINE_STRING(ng2_native_nodepth_ps, "", "NG2", "NG2 DIAG: pixel shader hashes drawn with no depth test");
+REXCVAR_DEFINE_INT32(ng2_native_skip_from, 0, "NG2", "NG2 DIAG: first draw of ng2_native_skip_ps to skip in a frame");
+REXCVAR_DEFINE_INT32(ng2_native_skip_to, 100000, "NG2", "NG2 DIAG: end of the range");
 REXCVAR_DEFINE_STRING(ng2_native_skip_ps, "", "NG2",
                       "Native renderer debug: skip draws with these pixel shader hashes");
 REXCVAR_DEFINE_INT32(ng2_native_dump_frame, 0, "NG2",
@@ -178,7 +182,7 @@ struct Image {
   VkFormat format = VK_FORMAT_UNDEFINED;
   uint32_t width = 0, height = 0, levels = 1;
   bool depth = false;
-  std::map<uint32_t, VkImageView> sample_views;  // By swizzle.
+  std::map<uint64_t, VkImageView> sample_views;  // By swizzle, bit 32 = signed view.
   // Game textures only: these are freed and reloaded, so they use the VMA heap.
   VmaAllocation allocation = nullptr;
   uint64_t content_hash = 0, last_frame = 0, bytes = 0;
@@ -392,10 +396,36 @@ bool BindImageMemory(VkImage image) {
 
 bool IsDepthFormat(VkFormat format) { return format == kDepthFormat; }
 
+// The same texels read as two's complement, for fetch constants with a signed component. A format
+// with no such view (BC1-3) stays unsigned; that combination is logged, see NoteTextureSigns.
+VkFormat SignedViewFormat(VkFormat format) {
+  switch (format) {
+    case VK_FORMAT_R8_UNORM:
+      return VK_FORMAT_R8_SNORM;
+    case VK_FORMAT_R8G8_UNORM:
+      return VK_FORMAT_R8G8_SNORM;
+    case VK_FORMAT_R8G8B8A8_UNORM:
+      return VK_FORMAT_R8G8B8A8_SNORM;
+    case VK_FORMAT_R16G16_UNORM:
+      return VK_FORMAT_R16G16_SNORM;
+    case VK_FORMAT_R16G16B16A16_UNORM:
+      return VK_FORMAT_R16G16B16A16_SNORM;
+    case VK_FORMAT_BC4_UNORM_BLOCK:
+      return VK_FORMAT_BC4_SNORM_BLOCK;
+    case VK_FORMAT_BC5_UNORM_BLOCK:
+      return VK_FORMAT_BC5_SNORM_BLOCK;
+    default:
+      return format;
+  }
+}
+
 bool MakeImage(Image& out, VkFormat format, uint32_t width, uint32_t height, uint32_t levels,
                VkImageUsageFlags usage, uint32_t layers = 1, VkImageCreateFlags flags = 0,
                VkImageType type = VK_IMAGE_TYPE_2D, bool pooled = false) {
   VkImageCreateInfo info = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  if ((usage & VK_IMAGE_USAGE_SAMPLED_BIT) && SignedViewFormat(format) != format) {
+    flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+  }
   info.flags = flags;
   info.imageType = type;
   info.format = format;
@@ -463,13 +493,14 @@ void FullBarrier(VkCommandBuffer cb) {
                           0, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
-VkImageView SampleView(Image& image, uint32_t swizzle_key) {
-  const auto found = image.sample_views.find(swizzle_key);
+VkImageView SampleView(Image& image, uint32_t swizzle_key, bool is_signed = false) {
+  const uint64_t key = uint64_t(swizzle_key) | (uint64_t(is_signed) << 32);
+  const auto found = image.sample_views.find(key);
   if (found != image.sample_views.end()) return found->second;
   VkImageViewCreateInfo view = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
   view.image = image.image;
   view.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-  view.format = image.format;
+  view.format = is_signed ? SignedViewFormat(image.format) : image.format;
   view.components.r = VkComponentSwizzle(swizzle_key & 0xFF);
   view.components.g = VkComponentSwizzle((swizzle_key >> 8) & 0xFF);
   view.components.b = VkComponentSwizzle((swizzle_key >> 16) & 0xFF);
@@ -479,7 +510,7 @@ VkImageView SampleView(Image& image, uint32_t swizzle_key) {
   view.subresourceRange.layerCount = 1;
   VkImageView out = VK_NULL_HANDLE;
   vk.vkCreateImageView(r.dev, &view, nullptr, &out);
-  image.sample_views[swizzle_key] = out;
+  image.sample_views[key] = out;
   return out;
 }
 
@@ -1227,8 +1258,10 @@ VkFormat ResolvedTextureFormat(uint32_t xenos_format) {
     case 22:
     case 23:
       return kDepthFormat;
+    case 28:  // k_16_16_EXPAND
     case 31:
       return VK_FORMAT_R16G16_SFLOAT;
+    case 29:  // k_16_16_16_16_EXPAND
     case 32:
       return VK_FORMAT_R16G16B16A16_SFLOAT;
     case 36:
@@ -1331,7 +1364,7 @@ void EvictTextures() {
   }
 }
 
-VkImageView LoadStaticTexture(const uint32_t words[6]) {
+VkImageView LoadStaticTexture(const uint32_t words[6], bool is_signed) {
   TextureDesc desc;
   if (!ParseTextureFetch(words, desc)) return VK_NULL_HANDLE;
   const uint32_t swizzle =
@@ -1341,9 +1374,9 @@ VkImageView LoadStaticTexture(const uint32_t words[6]) {
   auto found = r.textures.find(key);
   if (found != r.textures.end()) {
     Image& image = found->second;
-    if (image.last_frame == r.frame_count) return SampleView(image, swizzle);
+    if (image.last_frame == r.frame_count) return SampleView(image, swizzle, is_signed);
     image.last_frame = r.frame_count;
-    if (HashTextureContent(desc) == image.content_hash) return SampleView(image, swizzle);
+    if (HashTextureContent(desc) == image.content_hash) return SampleView(image, swizzle, is_signed);
     ++g_s.texture_reloads;
     RetireTexture(image);
     r.textures.erase(found);
@@ -1391,10 +1424,47 @@ VkImageView LoadStaticTexture(const uint32_t words[6]) {
   r.texture_bytes += image.bytes;
   auto& stored = r.textures[key];
   stored = std::move(image);
-  return SampleView(stored, swizzle);
+  return SampleView(stored, swizzle, is_signed);
 }
 
-VkImageView TextureView(uint32_t dev, uint32_t slot) {
+// Per component after the fetch swizzle, two bits each: what the shader does with the sample
+// (xenos::TextureSign). The shader reads its signed binding for kSigned components.
+uint8_t TextureSwizzledSigns(const uint32_t words[6]) {
+  uint32_t signs = 0, constant_mask = 0;
+  bool any_signed = false, any_not_signed = false;
+  const uint32_t swizzle = (words[3] >> 1) & 0xFFF;
+  for (uint32_t i = 0; i < 4; ++i) {
+    const uint32_t component = (swizzle >> (i * 3)) & 7;
+    if (component & 4) {
+      constant_mask |= 1u << (i * 2);
+      continue;
+    }
+    const uint32_t sign = (words[0] >> (2 + component * 2)) & 3;
+    signs |= sign << (i * 2);
+    (sign == 1 ? any_signed : any_not_signed) = true;
+  }
+  uint32_t constants_sign = 0;
+  if (constant_mask == 0x55) {
+    if (((words[0] >> 2) & 0xFF) == 0x55) constants_sign = 1;
+  } else if (any_signed && !any_not_signed) {
+    constants_sign = 1;
+  }
+  return uint8_t(signs | (constants_sign * constant_mask));
+}
+
+// Logs each texture format + sign combination once, with whether a signed view exists for it.
+void NoteTextureSigns(const uint32_t words[6], VkFormat format, bool resolved) {
+  const uint32_t signs = (words[0] >> 2) & 0xFF;
+  if (!signs) return;
+  static std::set<uint64_t> seen;
+  const uint64_t key = (uint64_t(words[1] & 0x3F) << 32) | (signs << 8) | uint32_t(resolved);
+  if (!seen.insert(key).second) return;
+  REXLOG_INFO("NG2 NATIVE signs format {} signs {:02X} swizzle {:03X} resolved {} signed view {}",
+              words[1] & 0x3F, signs, (words[3] >> 1) & 0xFFF, resolved,
+              SignedViewFormat(format) != format);
+}
+
+VkImageView TextureView(uint32_t dev, uint32_t slot, bool is_signed) {
   uint32_t words[6];
   SwapDwords(words, Virt(dev + kDevFetch + slot * 24), 6);
   if (Image* resolved = FindResolved(words)) {
@@ -1404,9 +1474,10 @@ VkImageView TextureView(uint32_t dev, uint32_t slot) {
     if ((swizzle & 0xFF) == VK_COMPONENT_SWIZZLE_B && ((swizzle >> 16) & 0xFF) == VK_COMPONENT_SWIZZLE_R) {
       swizzle = (swizzle & 0xFF00FF00) | VK_COMPONENT_SWIZZLE_R | (VK_COMPONENT_SWIZZLE_B << 16);
     }
-    return SampleView(*resolved, swizzle);
+    NoteTextureSigns(words, resolved->format, true);
+    return SampleView(*resolved, swizzle, is_signed);
   }
-  const VkImageView view = LoadStaticTexture(words);
+  const VkImageView view = LoadStaticTexture(words, is_signed);
   if (view != VK_NULL_HANDLE) return view;
   return SampleView(r.white_2d, 0);
 }
@@ -1473,7 +1544,8 @@ VkDescriptorSet MakeTextureSet(uint32_t dev, const NativeShader& shader, uint32_
   uint32_t count = 0;
   for (uint32_t i = 0; i < images && count < 64; ++i, ++count) {
     infos[count] = {};
-    infos[count].imageView = TextureView(dev, shader.textures[i].fetch_constant);
+    infos[count].imageView =
+        TextureView(dev, shader.textures[i].fetch_constant, shader.textures[i].is_signed != 0);
     if (r.dumping) {
       uint32_t w[6];
       SwapDwords(w, Virt(dev + kDevFetch + shader.textures[i].fetch_constant * 24), 6);
@@ -1734,6 +1806,10 @@ void RendererDraw(const DrawCall& d) {
   if (!depth) depth_control = 0;
   if (!(depth_control & 2)) depth_control &= ~uint32_t(0x74);
   if (!(depth_control & 1)) depth_control &= 0xFFu & ~uint32_t(0x80);
+  if (ps && !REXCVAR_GET(ng2_native_nodepth_ps).empty() &&
+      REXCVAR_GET(ng2_native_nodepth_ps).find(fmt::format("{:016X}", ps->ucode_hash)) != std::string::npos) {
+    depth_control = 0;
+  }
   key.depth_control = depth_control;
   key.depth_format = depth ? uint32_t(depth->image.format) : 0;
   const uint32_t vs_images = uint32_t(vs->textures.size()), vs_samplers = uint32_t(vs->samplers.size());
@@ -1759,7 +1835,14 @@ void RendererDraw(const DrawCall& d) {
 
   if (ps && !REXCVAR_GET(ng2_native_skip_ps).empty() &&
       REXCVAR_GET(ng2_native_skip_ps).find(fmt::format("{:016X}", ps->ucode_hash)) != std::string::npos) {
-    return;
+    static uint64_t frame = UINT64_MAX;
+    static int count = 0;
+    if (frame != r.frame_count) {
+      frame = r.frame_count;
+      count = 0;
+    }
+    const int nth = count++;
+    if (nth >= REXCVAR_GET(ng2_native_skip_from) && nth < REXCVAR_GET(ng2_native_skip_to)) return;
   }
 
   // Vertex data.
@@ -1836,7 +1919,21 @@ void RendererDraw(const DrawCall& d) {
         color[i]->image.format == VK_FORMAT_R16G16B16A16_SNORM) {
       system.color_exp_bias[i] = 1.0f / 32.0f;
     }
+    // 7e3 (formats 3 and 12), see the translator: negative asks for the format's output range.
+    const uint32_t target_format = (Load(color[i]->guest + 28) >> 16) & 0xF;
+    if (target_format == 3 || target_format == 12) system.color_exp_bias[i] = -1.0f;
   }
+  const auto set_signs = [&](const NativeShader& shader) {
+    for (const NativeTextureBinding& binding : shader.textures) {
+      uint32_t words[6];
+      SwapDwords(words, Virt(dev + kDevFetch + binding.fetch_constant * 24), 6);
+      const uint32_t shift = 8 * (binding.fetch_constant & 3);
+      uint32_t& packed = system.texture_swizzled_signs[binding.fetch_constant >> 2];
+      packed = (packed & ~(0xFFu << shift)) | (uint32_t(TextureSwizzledSigns(words)) << shift);
+    }
+  };
+  set_signs(*vs);
+  if (ps) set_signs(*ps);
   const VkDeviceSize system_offset = UploadAlloc(sizeof(system));
   const VkDeviceSize vs_offset =
       PackFloatConstants(dev + kDevVsFloat, vs->float_bitmap, vs->float_constant_count,
@@ -1941,17 +2038,30 @@ void RendererDraw(const DrawCall& d) {
   if (r.dumping) {
     std::string slots;
     for (uint32_t slot : vs->vertex_fetch_slots) slots += fmt::format("{}({:08X} {:08X}) ", slot, fetch[slot * 2], fetch[slot * 2 + 1]);
+    if (Reg(dev, 0x2204) & 0x3F) {
+      REXLOG_INFO("NG2 NATIVE   clip cntl {:08X} ucp0 {} {} {} {}", Reg(dev, 0x2204), RegFloat(dev, 0x2388),
+                  RegFloat(dev, 0x2389), RegFloat(dev, 0x238A), RegFloat(dev, 0x238B));
+    }
+    REXLOG_INFO("NG2 NATIVE   colorcontrol {:08X} mode {:08X} alpha ref {}", color_control, mode_cntl,
+                system.alpha_test_reference);
     REXLOG_INFO("NG2 NATIVE   vs flags {:X} floats {} slots {} ps floats {} sys flags {:X} ndc {} {} {} {}",
                 vs->flags, vs->float_constant_count, slots, ps ? ps->float_constant_count : 0, flags,
                 system.ndc_scale[0], system.ndc_offset[0], system.ndc_scale[1], system.ndc_offset[1]);
     if (vs->float_constant_count) {
       auto* c = reinterpret_cast<float*>(r.f->upload_map + vs_offset);
-      REXLOG_INFO("NG2 NATIVE   vs c: {} {} {} {} / {} {} {} {}", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]);
+      std::string text;
+      for (uint32_t i = 0; i < vs->float_constant_count; ++i) {
+        text += fmt::format("({} {} {} {}) ", c[i * 4], c[i * 4 + 1], c[i * 4 + 2], c[i * 4 + 3]);
+      }
+      REXLOG_INFO("NG2 NATIVE   vs c: {} bitmap {:X} {:X} {:X} {:X}", text, vs->float_bitmap[0],
+                  vs->float_bitmap[1], vs->float_bitmap[2], vs->float_bitmap[3]);
     }
     if (ps && ps->float_constant_count) {
       auto* c = reinterpret_cast<float*>(r.f->upload_map + ps_offset);
       std::string text;
-      for (uint32_t i = 0; i < ps->float_constant_count; ++i) text += fmt::format("{} ", c[i * 4]);
+      for (uint32_t i = 0; i < ps->float_constant_count; ++i) {
+        text += fmt::format("({} {} {} {}) ", c[i * 4], c[i * 4 + 1], c[i * 4 + 2], c[i * 4 + 3]);
+      }
       REXLOG_INFO("NG2 NATIVE   ps c.x: {} bitmap {:X} {:X}", text, ps->float_bitmap[0], ps->float_bitmap[1]);
     }
     REXLOG_INFO(

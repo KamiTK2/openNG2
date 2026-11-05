@@ -11,6 +11,7 @@
 #include <windows.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <string>
 
@@ -19,6 +20,7 @@
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
 #include <rex/ppc/func.h>
+#include <rex/system/kernel_state.h>
 
 REXCVAR_DEFINE_STRING(ng2_autopilot, "", "NG2",
                       "NG2 DIAG: drive the game unattended to menu / options / gameplay");
@@ -46,6 +48,8 @@ REXCVAR_DEFINE_INT32(ng2_autopilot_freeze_frame, 0, "NG2",
                      "NG2 DIAG: freeze the guest on this swap after the goal (0 = off)");
 REXCVAR_DEFINE_BOOL(ng2_autopilot_story_mode, false, "NG2",
                     "NG2 DIAG: forced stage from Mission Mode runs in story mode");
+REXCVAR_DEFINE_STRING(ng2_autopilot_freeze_dump, "", "NG2",
+                      "NG2 DIAG: at the freeze, write guest physical ranges to files (hex addr:bytes,...)");
 REXCVAR_DEFINE_INT32(ng2_autopilot_entry, 0xFFFF, "NG2", "NG2 DIAG: entry for ng2_autopilot_stage");
 
 bool Ng2InGameplay();          // ng2_hooks.cpp
@@ -281,8 +285,28 @@ void Ng2AutopilotOnPresent() {
   static int scene_swaps = 0;
   const bool scene = REXCVAR_GET(ng2_autopilot) == "cutscene" ? Ng2CutsceneUp() : Ng2InGameplay();
   if (freeze > 0 && scene_swaps == freeze - 2) rex::cvar::SetFlagByName("ng2_native_dump_frame", "-1");
+  if (freeze > 0 && scene_swaps == freeze - 70) {  // ng2_ib_census=-1 picks a frame of this scene
+    if (FILE* f = fopen("ng2_census_now", "wb")) fclose(f);
+  }
   if (freeze > 0 && (scene_swaps > 0 || scene) && ++scene_swaps == freeze) {
     REXLOG_INFO("NG2 AUTOPILOT frozen at frame {}", freeze);
+    // "physical:bytes,..." in hex, each written to freeze_<physical>.bin next to ng2.exe.
+    std::string dump = REXCVAR_GET(ng2_autopilot_freeze_dump);
+    for (size_t at = 0; at < dump.size();) {
+      size_t end = dump.find(',', at);
+      if (end == std::string::npos) end = dump.size();
+      const std::string item = dump.substr(at, end - at);
+      at = end + 1;
+      const size_t colon = item.find(':');
+      if (colon == std::string::npos) continue;
+      const uint32_t address = uint32_t(std::stoul(item.substr(0, colon), nullptr, 16));
+      const uint32_t bytes = uint32_t(std::stoul(item.substr(colon + 1), nullptr, 16));
+      const std::string name = "freeze_" + item.substr(0, colon) + ".bin";
+      if (FILE* f = fopen(name.c_str(), "wb")) {
+        fwrite(REX_KERNEL_STATE()->memory()->TranslatePhysical<uint8_t*>(address), 1, bytes, f);
+        fclose(f);
+      }
+    }
     for (;;) Sleep(1000);
   }
   if (!g_ap.done) return;
