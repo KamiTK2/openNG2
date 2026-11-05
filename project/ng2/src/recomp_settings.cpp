@@ -39,6 +39,7 @@ bool Ng2IngameRecompRowSelected();  // ng2_hooks.cpp
 int64_t Ng2IngameMenuHiddenMs();     // ng2_hooks.cpp
 bool Ng2MainMenuUp();                // ng2_hooks.cpp: the main menu (NEW GAME ...) is on screen
 int Ng2MainMenuCursor();             // ng2_hooks.cpp: its cursor 0..6, -1 when not up
+void Ng2AutopilotPad(uint32_t user_index, rex::input::X_INPUT_STATE* st);  // ng2_autopilot.cpp
 
 REXCVAR_DEFINE_BOOL(ng2_prompt_device_diag, false, "NG2",
                     "Log what switches button prompts between controller and keyboard");
@@ -446,6 +447,7 @@ bool RecompSettingsBlocksGameInput() {
 void InstallRecompInputFilters() {
   rex::input::SetStateFilter([](uint32_t user_index, rex::input::X_INPUT_STATE* st) {
     auto& g = st->gamepad;
+    Ng2AutopilotPad(user_index, st);
     // In-game menu, cursor on Recomp Settings (the old NINJA CINEMA row): Left/Right/A would
     // change the hidden NINJA CINEMA value; A opens our panel instead (read directly by
     // PadInput), so the game sees none of them.

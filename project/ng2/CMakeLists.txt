@@ -14,6 +14,7 @@ include(generated/rexglue.cmake)
 set(NG2_SOURCES
     src/main.cpp
     src/crash_handler.cpp
+    src/ng2_autopilot.cpp
     src/ng2_hooks.cpp
     src/ps_prompts.cpp
     src/recomp_settings.cpp

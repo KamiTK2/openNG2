@@ -323,8 +323,10 @@ extern "C" REX_FUNC(sub_8375E538) {
 }
 REXCVAR_DEFINE_BOOL(ng2_fast_loading, true, "NG2",
                     "Run loading screens unthrottled (guest vblank off while loading)");
+void Ng2AutopilotOnPresent();  // ng2_autopilot.cpp
 void Ng2OnPresent() {
   ng2::RecompCountGameFrame();
+  Ng2AutopilotOnPresent();
   ApplyAspectOverride();
   {
     // Fast Loading (findings #57): NG2 loads a fixed amount of work per frame while its
@@ -479,6 +481,8 @@ std::atomic<bool> g_in_gameplay{false};
 }  // namespace
 
 bool Ng2InGameplay() { return g_in_gameplay.load(std::memory_order_relaxed); }
+bool Ng2LoadingScreenUp() { return g_loading_screen.load(std::memory_order_relaxed); }
+bool Ng2ChapterScreenUp() { return g_chapter_screen.load(std::memory_order_relaxed); }
 
 
 void Ng2IngameMenuFrame(bool drawn);
