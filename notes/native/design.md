@@ -97,7 +97,7 @@ To run it: `--gpu_backend=vulkan --ng2_native_d3d=true`. D3D12 stays the default
 **Not done or unknown**
 - Fullscreen on native has not been seen in a capture: screenshots are black on any Vulkan fullscreen. Only the 60/120 present rates are confirmed.
 - Mission Mode flame blur: no repeatable comparison exists, so it isn't known whether it matches.
-- River in the post-movie 2x session: not viewed.
+- River in the post-movie 2x session: viewed on native (run mv-nat), bridge and water render with a red reflection under the post; D3D12 was on a different shot at that moment, so it is not compared.
 - 14 stage ids stall on both renderers (#145): unknown whether they are unused.
 - 30 fps cap frame pacing not measured.
 - Cutscenes are compared by eye: their camera differs between renderers even at the same frame number.
