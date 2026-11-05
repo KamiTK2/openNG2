@@ -101,3 +101,11 @@ add_custom_command(TARGET ng2 POST_BUILD
         -DDEST=$<TARGET_FILE_DIR:ng2>/ng2_native_shaders.pack
         -P ${CMAKE_CURRENT_SOURCE_DIR}/src/native/deploy_pack.cmake
     VERBATIM)
+# DLSS and FSR: ng2_upscalers.dll and the vendors' DLLs, built by tools/upscaler-bridge. Without
+# them the game builds and runs, and the upscaler rows offer FSR 1.0 only.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/upscalers)
+    add_custom_command(TARGET ng2 POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_CURRENT_SOURCE_DIR}/upscalers $<TARGET_FILE_DIR:ng2>
+        VERBATIM)
+endif()

@@ -249,3 +249,51 @@ g2_trace_karmaon.txt`, `ng2_trace_karmaoff.txt`; generated code of the named fun
 - observed: the Renderer row in a capture (pane3.png, run by key input in the sandbox): D3D12 selected, restart note and hint shown, `gpu_backend = "d3d12"` saved.
 - observed: both the dev and install-layout logs hold the same 12 error lines, 11 duplicate cvar registrations (the translator compiled into ng2 as well as the plugin) and one ResolvePath(\\Device). Not new.
 - unknown: the fallback to D3D12 on a PC without Vulkan 1.3 has not run; the RTX 4090 always passes `HostSupportsNative`. A device that passes that check and still fails native setup is not handled.
+
+## #150: DLSS and FSR on the native renderer: motion vectors, jitter, fractional scale
+
+- observed: a gameplay frame (dump up-dump): shadow pass, scene 1120x584 HDR with depth (496 draws), post, one composite draw into the scene surface, resolve to a 1120x584 texture, then a 1280x720 surface with one stretch draw and the HUD. All temporal work fits between the composite resolve and the stretch.
+- observed: draws can be found again by (VS, PS, index address, first vertex, count, vertex stream addresses, occurrence): 95.5% of scene draws and 92.5% of vertices match the last frame (up-census, nearly idle camera).
+- observed: motion vectors from per-vertex clip position history, no game matrices. Debug view up-mv2 with the camera turning: near railing large with smooth gradients, cut-out leaves crisp, Ryu near zero because the camera follows him.
+- observed: scaling the luminance chain below 1x darkens the whole image (up-s1, up-s4, Performance): its 2x2 textures collapse. Only surfaces of the scene's shape follow the input scale now; others stay at 1x or above (up-s9, Ultra Performance, correct exposure).
+- observed: DLSS 310.9.16 and FSR SDK 2.4.0 both create and run through ng2_upscalers.dll on the RTX 4090. On that GPU FSR is the 3.x path, FSR 4 needs AMD hardware (inferred from AMD's docs, version not read back).
+- observed: jitter sign, static scene, DLSS Ultra Performance, Laplacian energy: +1 gives 73.0, -1 gives 50.1. +1 is the default.
+- observed, 2560x1440 output, gameplay, 15 s, capped at 60 so ms are not comparable: plain native 2x 60.1 fps 4.85 ms 52 W; DLAA 60.1 fps 5.4 ms 67 W; DLSS Quality 60.1 fps 5.29 ms 62 W; Performance 60.1 fps 5.22 ms 65 W; Ultra Performance 53.1 fps 5.44 ms 56 W; FSR Quality 60.1 fps 4.97 ms 57 W. The cutscene route with DLSS Quality passed (m-cut).
+- unknown: why the Ultra Performance run averaged 53.1 fps; the log shows a 51.6 fps window. A single run.
+- unknown: everything past one courtyard. Moving enemies, particles, other chapters and fast cuts haven't been compared. Temporal modes have not been compared against D3D12 at a high scale, and not by a person.
+- known gap, observed: the sky writes no motion (up-mv2), so it counts as still while the camera turns. Draws with no match on their first visible frame are also still for one frame.
+- inferred: the near, far and field of view given to FSR are placeholders, not read from the game.
+
+- observed: the sky colour banding in the New Game cutscene is not from DLSS: the same contours are in m-cut0 with no upscaler. Whether D3D12 has it is unknown.
+
+## #151: Internal Resolution as real resolutions on the native renderer
+
+- observed: `ng2_internal_height` sets a 16:9 render height; with FSR or DLSS it is the output height and Upscaling Quality sets the input. Runs at a 2560x1440 window, capped at 60: 1920x1080 60.2 fps 54 W; 3840x2160 60.2 fps 71 W; 7680x4320 60.1 fps 144 W, 4716 MB; 3840x2160 with DLSS Quality rendered 2560x1440, 60.2 fps, 82 W; Window with FSR Quality rendered 1707x960, 59 fps, 60 W.
+- observed: FSR 1.0 now has room to work: Laplacian energy at 1080p on the 1440p window, bilinear 63.0, FSR 1.0 224.3. That measure counts RCAS sharpening as well as upscaling, and the frames are not guaranteed identical.
+- observed: the row steps live in the sandbox (2880x1620 then 3200x1800) and saves. Old settings map to 720 x their multiple.
+- unknown: the row at ultrawide. Labels and sizes assume the final 16:9 surface. The fallback when a size does not fit has not run on the RTX 4090. Output far above the window goes through the presenter's filter, whose quality has not been judged.
+
+## #152: Internal Resolution follows the aspect ratio, up to 4K (corrects #151)
+
+- observed: the row lists common sizes for the aspect ratio in use, with Auto resolved against the window: 16:9 up to 3840x2160, 21:9 up to 5120x2160, 32:9 up to 7680x2160, other ratios 720, 1080, 1440 and 2160 lines. The stepped list in #151 is gone, and so is its 8K. Old multiples map to at most 4K.
+- observed: the game still draws 16:9 and the presenter stretches it (#37), so a wide output is more pixels across the guest surface: the final surface scale differs per axis.
+- observed, runs: a-219 2520x1080 window on Auto, camera 2.3333, DLSS Quality 2293x960 -> 3440x1440, picture correct by eye; a-snap, 1920x1080 under 21:9 moved to 2560x1080; a-329 32:9 mode, FSR Quality 3413x960 -> 5120x1440; a-169 DLSS Performance 1920x1080 -> 3840x2160.
+- unknown: a real ultrawide monitor. Those runs were windows on a 16:9 display. The 21:9 mode gives 2.3333, so 3440x1440 is a slight stretch on a 2.389 display unless Auto is used. The row list on an ultrawide has been exercised by the size moving, not seen in a capture.
+
+## #153: Fast Loading stuck on with the native renderer
+
+- observed, user session 19:25:41: "NG2 fast loading: on" at boot and no "off" before the window closed at 19:26:02; game fps 512 to 684 for those 21 s, seen by the user as fast forward.
+- observed: the latch's 3D scene exit reads rex::graphics::LastFrameDrawCount(), set only by the command processor (command_processor.cpp:2031), so on native that exit never fired. Same bug as GitHub #6: a cutscene right after a load would run unthrottled on native too.
+- fix: the native renderer publishes its own draw count. Separately, the boot load now ends on the main menu or 1 s after the icon goes, since its 15 s fade wait left the title and menus unthrottled.
+
+## #154: presets on the native renderer follow the screen
+
+- decision (user): Ultra is native resolution, not higher. All four presets use Match Window; DLSS or FSR at Performance, Balanced, Quality, DLAA / Native AA, with FXAA off. With neither upscaler: 720, 1080, 1440 capped at the screen and FSR 1.0, Ultra at the screen. D3D12 keeps 1x-4x.
+
+- observed: stepping the row in the sandbox on a 16:9 window: Ultra set Match Window, DLSS, DLAA, FXAA off; High on the way rendered 853x365 -> 1279x548 with Aspect Ratio 21:9.
+- observed, not new code: with a fixed Aspect Ratio wider than the window, the picture letterboxes and the Recomp Settings rows keep the full window's layout, so they overlap the Options title. Not fixed.
+
+## #155: FSR 1.0 hidden on Vulkan, Recomp Settings aligned when letterboxed
+
+- decision (user): FSR 1.0 leaves the Vulkan list when FSR can run, and a saved FSR 1.0 becomes FSR. It stays on D3D12 and as the fallback.
+- fix: GameViewport took the 16:9 frame from the window. With an aspect ratio wider than the window the picture is letterboxed, so the frame now takes the picture's height. This corrects the note in #154.

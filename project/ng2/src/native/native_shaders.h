@@ -8,6 +8,7 @@
 //                     stream bytes in guest byte order and rewrites word 0 of each vertex fetch
 //                     constant to its heap dword offset << 2. Endian swap happens in the shader
 //                     from bits 0:1 of fetch word 1.
+//          binding 1  storage buffer, vec4[]: clip positions kept for motion vectors
 //   set 1  binding 0  uniform: NativeSystemConstants
 //          binding 1  uniform: vertex float constants, vec4[], from dev+1920, packed by float_bitmap
 //          binding 2  uniform: pixel float constants, vec4[], from dev+6016, packed by float_bitmap
@@ -54,7 +55,12 @@ struct NativeSystemConstants {
   uint32_t texture_swizzled_signs[8];
   float point_constant_diameter[2];
   float point_screen_diameter_to_ndc_radius[2];
-  uint32_t reserved[96];  // bound but never read
+  uint32_t reserved[50];  // bound but never read
+  // Motion vector pipelines only. Offsets are fixed by the translator's edram_stencil_front.
+  uint32_t history_bases[2];  // this frame, last frame: vec4 index of vertex 0, UINT32_MAX for none
+  float motion_jitter_delta[2];  // shaders/motion.frag
+  float motion_debug;
+  uint32_t reserved2[41];
 };
 
 struct NativeTextureBinding {

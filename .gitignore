@@ -45,5 +45,9 @@
 !/assets/
 # Offline shader converter (sources only; output is game-derived)
 !/tools/native-shader-tool/
+!/tools/upscaler-bridge/
+/tools/upscaler-bridge/build/
 /tools/native-shader-tool/build/
 /tools/native-shader-tool/out/
+# Vendor DLLs collected by tools/upscaler-bridge/build.cmd: shipped in releases only.
+/project/ng2/upscalers/

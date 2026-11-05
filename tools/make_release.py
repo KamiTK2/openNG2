@@ -161,14 +161,16 @@ def main():
             "folder in your install folder (ng2_NNN.log; the highest number is the latest session).\n"
             "If the build itself failed, attach openNG2-build.log from the install folder.\n\n"
             "Ninja Gaiden II belongs to Koei Tecmo; use only a copy you own.\n"
-            "Third-party licences: THIRD-PARTY-NOTICES.txt\n"
+            "Third-party licences: THIRD-PARTY-NOTICES.txt, LICENSE-NVIDIA-DLSS.txt, LICENSE-AMD-FSR.txt\n"
+            "This software contains NVIDIA DLSS, licensed by NVIDIA Corporation, and AMD FSR, licensed\n"
+            "by Advanced Micro Devices, Inc. Neither company sponsors or endorses openNG2.\n"
             "Project page: https://github.com/KamiTK2/openNG2\n")
 
     # Project.
     proj_out = os.path.join(OUT, "payload", "project", "ng2")
     for name in ("CMakeLists.txt", "ng2.toml", "ng2_manifest.toml"):
         copy(os.path.join(PROJECT, name), os.path.join(proj_out, name))
-    for sub in ("src", "config", "shaders"):
+    for sub in ("src", "config", "shaders", "upscalers"):
         for base, _, files in os.walk(os.path.join(PROJECT, sub)):
             for name in files:
                 if name in EXCLUDE_SRC:
@@ -229,6 +231,11 @@ def main():
                     copy(s, os.path.join(tr_out, "thirdparty", rel))
 
     write_notices(os.path.join(OUT, "THIRD-PARTY-NOTICES.txt"))
+    # DLSS and FSR ship as binaries under their vendors' own terms, not this project's BSD licence.
+    upscalers = os.path.join(ROOT, "tools", "upscalers")
+    copy(os.path.join(upscalers, "DLSS", "LICENSE.txt"), os.path.join(OUT, "LICENSE-NVIDIA-DLSS.txt"))
+    copy(os.path.join(upscalers, "FidelityFX", "Kits", "FidelityFX", "docs", "license.md"),
+         os.path.join(OUT, "LICENSE-AMD-FSR.txt"))
     total = sum(os.path.getsize(os.path.join(b, f)) for b, _, fs in os.walk(OUT) for f in fs)
     print(f"release folder: {OUT} ({total / 1e6:.0f} MB)")
     # Release archive: openNG2-<version>.zip with the folder inside.

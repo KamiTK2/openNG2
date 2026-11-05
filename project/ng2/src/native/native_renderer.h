@@ -34,6 +34,10 @@ void RendererSwap(uint32_t dev, uint32_t front_texture);
 void RendererDrainImmediate();
 void RendererLogStats(uint64_t swaps);
 
+// Kind: 1 DLSS, 2 FSR (upscale_bridge.h). False until the renderer has started. Any thread.
+bool UpscalerAvailable(int kind);
+// The window's client size and the aspect ratio in use. Any thread.
+void SetOutputSize(int width, int height, double aspect);
 // True when this PC has a Vulkan 1.3 device. Safe before the GPU plugin is loaded.
 bool HostSupportsNative();
 // Builds the shader pack from the loaded game image if it's missing or out of date. The pack is

@@ -50,6 +50,8 @@ REXCVAR_DEFINE_BOOL(ng2_autopilot_story_mode, false, "NG2",
                     "NG2 DIAG: forced stage from Mission Mode runs in story mode");
 REXCVAR_DEFINE_STRING(ng2_autopilot_freeze_dump, "", "NG2",
                       "NG2 DIAG: at the freeze, write guest physical ranges to files (hex addr:bytes,...)");
+REXCVAR_DEFINE_BOOL(ng2_autopilot_move, false, "NG2",
+                    "NG2 DIAG: after the goal, walk forward while the camera turns");
 REXCVAR_DEFINE_INT32(ng2_autopilot_entry, 0xFFFF, "NG2", "NG2 DIAG: entry for ng2_autopilot_stage");
 
 bool Ng2InGameplay();          // ng2_hooks.cpp
@@ -155,6 +157,10 @@ void Ng2AutopilotPad(uint32_t user_index, rex::input::X_INPUT_STATE* st) {
     }
     if (g_ap.pressing && now >= g_ap.press_end_ms) g_ap.pressing = 0;
     if (g_ap.pressing) st->gamepad.buttons = uint16_t(uint16_t(st->gamepad.buttons) | g_ap.pressing);
+    if (REXCVAR_GET(ng2_autopilot_move)) {
+      st->gamepad.thumb_ly = 0x6000;
+      st->gamepad.thumb_rx = 0x3000;
+    }
     return;
   }
   if (!g_ap.start_ms) g_ap.start_ms = now;

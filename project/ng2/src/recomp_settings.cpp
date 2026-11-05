@@ -53,11 +53,12 @@ bool PromptsUseKeyboard();
 
 namespace {
 // Only the native renderer goes past 5x: the emulated path is limited to 7x by the SDK.
-int MaxResolutionScale() {
+bool NativeRendererRunning() {
   return rex::cvar::GetFlagByName("ng2_native_d3d") == "true" &&
-                 rex::cvar::GetFlagByName("gpu_backend") == "vulkan"
-             ? 10
-             : 5;
+         rex::cvar::GetFlagByName("gpu_backend") == "vulkan";
+}
+int MaxResolutionScale() {
+  return NativeRendererRunning() ? 10 : 5;
 }
 
 // ---- helpers -----------------------------------------------------------------------
@@ -96,9 +97,39 @@ double AspectForMode(int mode, float width, float height) {
       return height > 0.0f ? std::max(16.0 / 9.0, double(width) / double(height)) : 16.0 / 9.0;
   }
 }
+// Internal Resolution choices for an aspect ratio: the sizes people actually use, up to 4K.
+struct RenderSize {
+  int width, height;
+};
+std::vector<RenderSize> RenderSizesFor(double aspect) {
+  std::vector<RenderSize> sizes = {{-1, -1}};
+  if (aspect < 1.9) {
+    sizes.insert(sizes.end(), {{1280, 720}, {1600, 900}, {1920, 1080}, {2560, 1440}, {3200, 1800}, {3840, 2160}});
+  } else if (aspect >= 2.2 && aspect < 2.5) {
+    sizes.insert(sizes.end(), {{2560, 1080}, {3440, 1440}, {3840, 1600}, {5120, 2160}});
+  } else if (aspect >= 3.4 && aspect < 3.7) {
+    sizes.insert(sizes.end(), {{3840, 1080}, {5120, 1440}, {7680, 2160}});
+  } else {
+    for (int height : {720, 1080, 1440, 2160}) {
+      sizes.push_back({int(std::lround(height * aspect / 2.0)) * 2, height});
+    }
+  }
+  return sizes;
+}
+// The listed size nearest in height: where a size lands when the aspect ratio changes.
+RenderSize NearestRenderSize(const std::vector<RenderSize>& sizes, int height) {
+  RenderSize best = sizes[1];
+  for (size_t i = 1; i < sizes.size(); ++i) {
+    if (std::abs(sizes[i].height - height) < std::abs(best.height - height)) best = sizes[i];
+  }
+  return best;
+}
 const char* AaCvarValue(int aa) { return aa == 2 ? "fxaa_extreme" : aa == 1 ? "fxaa" : "none"; }
 int AaFromCvar(const std::string& v) { return v == "fxaa_extreme" ? 2 : v == "fxaa" ? 1 : 0; }
 const char* UpscalerCvarValue(int u) { return u == 2 ? "cas" : u == 1 ? "fsr" : "bilinear"; }
+constexpr int kUpscalerFsrTemporal = 3, kUpscalerDlss = 4;
+// ng2_upscaler for the Upscaling row: 0 off, 1 DLSS, 2 FSR.
+int TemporalCvarValue(int u) { return u == kUpscalerDlss ? 1 : u == kUpscalerFsrTemporal ? 2 : 0; }
 int UpscalerFromCvar(std::string v) {
   if (v.size() >= 2 && v.front() == '"' && v.back() == '"') v = v.substr(1, v.size() - 2);
   return v == "cas" ? 2 : v == "fsr" ? 1 : 0;
@@ -412,12 +443,16 @@ SIZE OuterSizeFor(HWND h, int cw, int ch) {
 struct Viewport {
   float x, y, w, h;
 };
+double g_picture_aspect = 16.0 / 9.0;  // The aspect ratio in use, set each frame.
 Viewport GameViewport(const ImGuiIO& io) {
   // Always 16:9: on ultrawide the game's menus are kept at 16:9 in the centre (2D squeeze,
-  // findings #32-#35), so the pane follows the same frame.
+  // findings #32-#35), so the pane follows the same frame. An aspect ratio wider than the window
+  // letterboxes the picture, and that frame takes the picture's height, not the window's.
   const float aspect = 16.0f / 9.0f;
-  float w = std::min(io.DisplaySize.x, io.DisplaySize.y * aspect);
-  float h = w / aspect;
+  const float picture = std::max(float(g_picture_aspect), aspect);
+  const float picture_w = std::min(io.DisplaySize.x, io.DisplaySize.y * picture);
+  const float h = picture_w / picture;
+  const float w = h * aspect;
   return {(io.DisplaySize.x - w) * 0.5f, (io.DisplaySize.y - h) * 0.5f, w, h};
 }
 
@@ -714,7 +749,18 @@ bool RecompSettings::Load(const std::filesystem::path& path) {
     else if (k == "gpu_backend") renderer = v == "d3d12" ? 1 : 0;
     else if (k == "resolution_scale") resolution_scale = ParseInt(v, resolution_scale, 1, 10);
     else if (k == "swap_post_effect") anti_aliasing = AaFromCvar(v);
-    else if (k == "present_effect") upscaler = UpscalerFromCvar(v);
+    else if (k == "present_effect") {
+      if (upscaler < kUpscalerFsrTemporal) upscaler = UpscalerFromCvar(v);
+    } else if (k == "ng2_upscaler") {
+      const int temporal = ParseInt(v, 0, 0, 2);
+      if (temporal) upscaler = temporal == 1 ? kUpscalerDlss : kUpscalerFsrTemporal;
+    } else if (k == "ng2_upscale_quality") {
+      upscale_quality = ParseInt(v, upscale_quality, 0, 4);
+    } else if (k == "ng2_internal_height") {
+      internal_height = ParseInt(v, internal_height, -1, 2160);
+    } else if (k == "ng2_internal_width") {
+      internal_width = ParseInt(v, internal_width, 0, 16384);
+    }
     else if (k == "ng2_sharpness") sharpness = ParseInt(v, sharpness, 0, 10);
     else if (k == "ng2_aspect_mode") aspect_mode = ParseInt(v, aspect_mode, 0, 3);
     else if (k == "ng2_fov_percent") fov_percent = ParseInt(v, fov_percent, 70, 150);
@@ -780,9 +826,14 @@ bool RecompSettings::Save(const std::filesystem::path& path) const {
       << "resolution_scale = " << resolution_scale << "\n"
       << "swap_post_effect = \"" << AaCvarValue(anti_aliasing) << "\"\n"
       << "present_effect = \"" << UpscalerCvarValue(upscaler) << "\"\n"
+      << "ng2_upscaler = " << TemporalCvarValue(upscaler) << "\n"
+      << "ng2_upscale_quality = " << upscale_quality << "\n"
+      << "ng2_internal_width = " << internal_width << "\n"
+      << "ng2_internal_height = " << internal_height << "\n"
       << "ng2_sharpness = " << sharpness << "\n"
       << "present_fsr_sharpness_reduction = " << FsrSharpnessReduction(sharpness) << "\n"
       << "present_cas_additional_sharpness = " << CasAdditionalSharpness(sharpness) << "\n"
+      << "ng2_upscale_sharpness = " << sharpness / 10.0 << "\n"
       << "ng2_aspect_mode = " << aspect_mode << "\n"
       << "ng2_fov_percent = " << fov_percent << "\n"
       << "ng2_framerate_cap = " << framerate_cap << "\n"
@@ -1232,6 +1283,21 @@ RecompOptionsPane::RecompOptionsPane(rex::ui::ImGuiDrawer* drawer, rex::ui::Wind
   settings_.anti_aliasing = AaFromCvar(rex::cvar::GetFlagByName("swap_post_effect"));
   // Upscaling is live, but show what is running (it may come from the command line).
   settings_.upscaler = UpscalerFromCvar(rex::cvar::GetFlagByName("present_effect"));
+  if (NativeRendererRunning()) {
+    const int temporal = std::atoi(rex::cvar::GetFlagByName("ng2_upscaler").c_str());
+    if (temporal == 1 || temporal == 2) {
+      settings_.upscaler = temporal == 1 ? kUpscalerDlss : kUpscalerFsrTemporal;
+    }
+    settings_.upscale_quality =
+        std::clamp(std::atoi(rex::cvar::GetFlagByName("ng2_upscale_quality").c_str()), 0, 4);
+    settings_.internal_height = std::atoi(rex::cvar::GetFlagByName("ng2_internal_height").c_str());
+    settings_.internal_width = std::atoi(rex::cvar::GetFlagByName("ng2_internal_width").c_str());
+    // Older settings hold a multiple of 720p: the nearest listed size, at most 4K.
+    if (!settings_.internal_height) {
+      settings_.internal_height = std::min(settings_.resolution_scale * 720, 2160);
+      settings_.internal_width = 0;
+    }
+  }
   {
     const std::string r = rex::cvar::GetFlagByName("present_fsr_sharpness_reduction");
     if (!r.empty()) {
@@ -1288,10 +1354,17 @@ void RecompOptionsPane::ApplyAndSave() {
   rex::cvar::SetFlagByName("swap_post_effect", AaCvarValue(settings_.anti_aliasing));
   rex::cvar::SetFlagByName("ng2_fov_percent", std::to_string(settings_.fov_percent));
   rex::cvar::SetFlagByName("present_effect", UpscalerCvarValue(settings_.upscaler));
+  rex::cvar::SetFlagByName("ng2_upscaler", std::to_string(TemporalCvarValue(settings_.upscaler)));
+  rex::cvar::SetFlagByName("ng2_upscale_quality", std::to_string(settings_.upscale_quality));
+  if (NativeRendererRunning()) {
+    rex::cvar::SetFlagByName("ng2_internal_width", std::to_string(settings_.internal_width));
+    rex::cvar::SetFlagByName("ng2_internal_height", std::to_string(settings_.internal_height));
+  }
   rex::cvar::SetFlagByName("present_fsr_sharpness_reduction",
                            std::to_string(FsrSharpnessReduction(settings_.sharpness)));
   rex::cvar::SetFlagByName("present_cas_additional_sharpness",
                            std::to_string(CasAdditionalSharpness(settings_.sharpness)));
+  rex::cvar::SetFlagByName("ng2_upscale_sharpness", std::to_string(settings_.sharpness / 10.0));
   ApplyUpscalerLive(imgui_drawer(), settings_);
   rex::cvar::SetFlagByName("frame_generation", settings_.framerate_cap == 120 ? "true" : "false");
   rex::cvar::SetFlagByName("present_half_rate", settings_.framerate_cap == 30 ? "true" : "false");
@@ -1608,6 +1681,29 @@ void RecompOptionsPane::UpdateQuitToDesktop(const ImGuiIO& io) {
 void RecompOptionsPane::OnDraw(ImGuiIO& io) {
   pad_.Poll();
   DrawShaderProgress(io);
+  current_aspect_ = AspectForMode(settings_.aspect_mode, io.DisplaySize.x, io.DisplaySize.y);
+  g_picture_aspect = current_aspect_;
+  native::SetOutputSize(int(io.DisplaySize.x), int(io.DisplaySize.y), current_aspect_);
+  // FSR 1.0 stays for D3D12 and for PCs that can't run FSR. Elsewhere FSR replaces it.
+  if (NativeRendererRunning() && settings_.upscaler == 1 && native::UpscalerAvailable(2)) {
+    settings_.upscaler = kUpscalerFsrTemporal;
+    ApplyAndSave();
+  }
+  // A size from another aspect ratio's list moves to the nearest one in this list.
+  if (NativeRendererRunning() && settings_.internal_height > 0) {
+    const std::vector<RenderSize> sizes = RenderSizesFor(current_aspect_);
+    const bool listed = std::any_of(sizes.begin(), sizes.end(), [this](const RenderSize& size) {
+      return size.width == settings_.internal_width && size.height == settings_.internal_height;
+    });
+    if (!listed) {
+      const RenderSize nearest = NearestRenderSize(sizes, settings_.internal_height);
+      settings_.internal_width = nearest.width;
+      settings_.internal_height = nearest.height;
+      rex::cvar::SetFlagByName("ng2_internal_width", std::to_string(nearest.width));
+      rex::cvar::SetFlagByName("ng2_internal_height", std::to_string(nearest.height));
+      settings_.Save(settings_path_);
+    }
+  }
   UpdatePromptDevice(io, window_);
   DrawPromptGlyphs(io);
   UpdateQuitToDesktop(io);
@@ -1785,50 +1881,121 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
       }
       {
         // Presets set the image rows below together (not the Framerate Cap); "Custom" when
-        // they match none of them.
-        struct Preset { const char* name; int res, aa, upscaler, sharpness; };
+        // they match none of them. On the native renderer they all output at the screen's
+        // resolution and differ in how much of it is rendered: Ultra renders all of it.
+        struct Preset { const char* name; int res, aa, upscaler, sharpness, quality, fallback_height; };
         static const Preset kPresets[] = {
-            {"Low", 1, 0, 1, 8},
-            {"Medium", 2, 1, 1, 8},
-            {"High", 3, 1, 1, 8},
-            {"Ultra", 4, 2, 1, 8},
+            {"Low", 1, 0, 1, 8, 1, 720},
+            {"Medium", 2, 1, 1, 8, 2, 1080},
+            {"High", 3, 1, 1, 8, 3, 1440},
+            {"Ultra", 4, 2, 1, 8, 4, -1},
+        };
+        const bool native_presets = NativeRendererRunning();
+        // A chosen temporal upscaler stays; otherwise DLSS, then FSR. 0: neither can run here.
+        const int preferred = !native_presets                 ? 0
+                              : s.upscaler >= kUpscalerFsrTemporal ? s.upscaler
+                              : native::UpscalerAvailable(1)  ? kUpscalerDlss
+                              : native::UpscalerAvailable(2)  ? kUpscalerFsrTemporal
+                                                              : 0;
+        const int screen_height = int(ImGui::GetIO().DisplaySize.y);
+        const auto fallback_height = [screen_height](const Preset& p) {
+          return p.fallback_height >= screen_height ? -1 : p.fallback_height;
         };
         int match = -1;
         for (int i = 0; i < 4; ++i) {
           const Preset& p = kPresets[i];
-          if (s.resolution_scale == p.res && s.anti_aliasing == p.aa && s.upscaler == p.upscaler &&
-              s.sharpness == p.sharpness) {
-            match = i;
+          bool same = s.sharpness == p.sharpness;
+          if (preferred) {
+            same = same && s.internal_height < 0 && s.upscaler == preferred &&
+                   s.upscale_quality == p.quality && s.anti_aliasing == 0;
+          } else {
+            same = same && s.anti_aliasing == p.aa && s.upscaler == p.upscaler &&
+                   (native_presets ? s.internal_height == fallback_height(p) : s.resolution_scale == p.res);
           }
+          if (same) match = i;
         }
-        // From Custom, Left / Right start at the preset nearest the current resolution.
-        const int cur = match >= 0 ? match : std::clamp(s.resolution_scale, 1, 4) - 1;
+        // From Custom, Left / Right start at the preset nearest the current setting.
+        const int cur = match >= 0 ? match
+                        : preferred ? std::clamp(s.upscale_quality - 1, 0, 3)
+                                    : std::clamp(s.resolution_scale, 1, 4) - 1;
         rows.push_back({"Preset", Kind::kStepper, match >= 0 ? kPresets[match].name : "Custom",
                         match < 0 || cur > 0, match < 0 || cur < 3, nullptr, nullptr, false,
-                        [&s, cur, match](int dir, bool) {
+                        [&s, cur, match, preferred, native_presets, fallback_height](int dir, bool) {
                           if (!dir) return false;
                           const int v = match < 0 ? cur : std::clamp(cur + dir, 0, 3);
                           if (v == match) return false;
                           const Preset& p = kPresets[v];
                           s.resolution_scale = p.res;
-                          s.anti_aliasing = p.aa;
-                          s.upscaler = p.upscaler;
                           s.sharpness = p.sharpness;
+                          if (preferred) {
+                            s.internal_width = 0;
+                            s.internal_height = -1;
+                            s.upscaler = preferred;
+                            s.upscale_quality = p.quality;
+                            s.anti_aliasing = 0;
+                          } else {
+                            if (native_presets) {
+                              s.internal_width = 0;
+                              s.internal_height = fallback_height(p);
+                            }
+                            s.upscaler = p.upscaler;
+                            s.anti_aliasing = p.aa;
+                          }
                           return true;
                         }});
       }
-      std::snprintf(buf, sizeof(buf), "%dx", s.resolution_scale);
-      step_row("Internal Resolution", buf, s.resolution_scale, 1, MaxResolutionScale(), 1,
-               [&s](int v) { s.resolution_scale = v; });
+      const bool temporal = s.upscaler >= kUpscalerFsrTemporal;
+      if (NativeRendererRunning()) {
+        const std::vector<RenderSize> sizes = RenderSizesFor(current_aspect_);
+        int index = 0;
+        for (size_t i = 0; i < sizes.size(); ++i) {
+          if (sizes[i].height == s.internal_height && sizes[i].width == s.internal_width) index = int(i);
+        }
+        if (s.internal_height < 0) {
+          std::snprintf(buf, sizeof(buf), "Match Window");
+        } else {
+          std::snprintf(buf, sizeof(buf), "%d x %d", s.internal_width, s.internal_height);
+        }
+        step_row("Internal Resolution", buf, index, 0, int(sizes.size()) - 1, 1, [&s, sizes](int v) {
+          s.internal_width = sizes[v].width > 0 ? sizes[v].width : 0;
+          s.internal_height = sizes[v].height;
+        });
+      } else {
+        std::snprintf(buf, sizeof(buf), "%dx", s.resolution_scale);
+        step_row("Internal Resolution", buf, s.resolution_scale, 1, MaxResolutionScale(), 1,
+                 [&s](int v) { s.resolution_scale = v; });
+      }
       const char* aa[] = {"Off", "FXAA", "FXAA Extreme"};
       step_row("Anti-Aliasing", aa[s.anti_aliasing], s.anti_aliasing, 0, 2, 1,
                [&s](int v) { s.anti_aliasing = v; });
-      const char* upscalers[] = {"Bilinear", "FSR 1.0", "CAS"};
-      step_row("Upscaling", upscalers[s.upscaler], s.upscaler, 0, 2, 1,
-               [&s](int v) { s.upscaler = v; });
+      // Available choices in order; FSR and DLSS need the native renderer, DLSS an NVIDIA GPU.
+      static const char* const kUpscalers[] = {"Bilinear", "FSR 1.0", "CAS", "FSR", "DLSS"};
+      const bool fsr_available = NativeRendererRunning() && native::UpscalerAvailable(2);
+      int choices[5] = {0}, choice_count = 1, choice = 0;
+      if (!fsr_available) choices[choice_count++] = 1;  // FSR 1.0
+      choices[choice_count++] = 2;
+      if (fsr_available) choices[choice_count++] = kUpscalerFsrTemporal;
+      if (NativeRendererRunning() && native::UpscalerAvailable(1)) choices[choice_count++] = kUpscalerDlss;
+      for (int i = 0; i < choice_count; ++i) {
+        if (choices[i] == s.upscaler) choice = i;
+      }
+      step_row("Upscaling", kUpscalers[s.upscaler], choice, 0, choice_count - 1, 1,
+               [&s, choices](int v) { s.upscaler = choices[v]; });
+      {
+        const char* const fsr[] = {"Ultra Performance", "Performance", "Balanced", "Quality", "Native AA"};
+        const char* const dlss[] = {"Ultra Performance", "Performance", "Balanced", "Quality", "DLAA"};
+        step_row("Upscaling Quality",
+                 (s.upscaler == kUpscalerDlss ? dlss : fsr)[s.upscale_quality], s.upscale_quality, 0,
+                 4, 1, [&s](int v) { s.upscale_quality = v; });
+        if (!temporal) {
+          rows.back().disabled = true;
+          rows.back().can_dec = rows.back().can_inc = false;
+          rows.back().change = nullptr;
+        }
+      }
       std::snprintf(buf, sizeof(buf), "%d", s.sharpness);
       step_row("Sharpness", buf, s.sharpness, 0, 10, 1, [&s](int v) { s.sharpness = v; });
-      if (s.upscaler == 0) {  // Bilinear has no sharpening pass
+      if (s.upscaler == 0 || s.upscaler == kUpscalerDlss) {  // No sharpening pass
         rows.back().disabled = true;
         rows.back().can_dec = rows.back().can_inc = false;
         rows.back().change = nullptr;
@@ -2246,7 +2413,22 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
   if (focused_ && row_ >= 0 && row_ < int(rows.size()) &&
       std::strcmp(rows[row_].label, "Preset") == 0) {
     text_at(X(L.label_x), fy, kGrey,
-            "Low suits weaker PCs. Ultra renders at 4x and needs a strong GPU.", false, note_px);
+            NativeRendererRunning() ? "Low suits weaker PCs. Ultra renders at your screen's full resolution."
+                                    : "Low suits weaker PCs. Ultra renders at 4x and needs a strong GPU.", false, note_px);
+    fy += note_px * 1.5f;
+  }
+  if (focused_ && row_ >= 0 && row_ < int(rows.size()) &&
+      std::strcmp(rows[row_].label, "Upscaling") == 0 && s.upscaler >= kUpscalerFsrTemporal) {
+    text_at(X(L.label_x), fy, kGrey,
+            s.upscaler == kUpscalerDlss ? "NVIDIA DLSS, part of NVIDIA RTX." : "AMD FSR.", false, note_px);
+    fy += note_px * 1.5f;
+  }
+  if (focused_ && row_ >= 0 && row_ < int(rows.size()) &&
+      std::strcmp(rows[row_].label, "Upscaling Quality") == 0 && s.upscaler >= kUpscalerFsrTemporal) {
+    text_at(X(L.label_x), fy, kGrey,
+            s.upscale_quality == 4 ? "Renders at your screen's resolution and uses the upscaler as anti-aliasing."
+                                   : "Lower settings render fewer pixels and run faster.",
+            false, note_px);
     fy += note_px * 1.5f;
   }
   if (focused_ && row_ >= 0 && row_ < int(rows.size()) &&
@@ -2259,7 +2441,12 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
   if (focused_ && row_ >= 0 && row_ < int(rows.size()) &&
       std::strcmp(rows[row_].label, "Internal Resolution") == 0) {
     text_at(X(L.label_x), fy, kGrey,
-            "Render sizes above 1x may slow the game depending on your hardware.", false, note_px);
+            !NativeRendererRunning()
+                ? "Render sizes above 1x may slow the game depending on your hardware."
+                : s.upscaler >= kUpscalerFsrTemporal
+                      ? "The size FSR or DLSS outputs. Upscaling Quality sets how much of it is rendered."
+                      : "Above your screen is supersampling, below it runs faster.",
+            false, note_px);
     fy += note_px * 1.5f;
   }
   if (focused_ && row_ >= 0 && row_ < int(rows.size()) &&

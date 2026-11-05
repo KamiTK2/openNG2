@@ -78,6 +78,13 @@ Each ends in a run through `tools/native_test.ps1`, reported against D3D12.
 
 Native Vulkan is the default: `ng2.toml` sets `gpu_backend = "vulkan"` and `ng2_native_d3d = true`. Recomp Settings > Graphics > Renderer writes `gpu_backend` to the player's settings and applies at the next start; a file without the key gets Vulkan. A PC with no Vulkan 1.3 device starts on D3D12. The shader pack is game-derived, so releases can't ship it: `EnsureShaderPack` builds it from the loaded image before the game starts, and shaders it can't hold are translated at bind time. After a translator change, bump `kPackVersion` so players' packs rebuild.
 
+## Temporal upscaling (2026-11-05, #150, branch upscalers-dlss-fsr)
+
+- Frame: scene at input size, the game's post and composite, then `Upscale` fills an output-sized image that stands in for the composite texture when the 1280x720 pass samples it. The HUD is drawn after it, at output size, and is never upscaled.
+- Motion: `FlushMotion` repeats opaque scene draws into an R16G16F image with a depth-equal test. The translator's motion path is off unless specialization constant 0 is set. Each vertex's clip position goes in a history buffer, found again next frame by what the draw is.
+- Vendor code: only `tools/upscaler-bridge`. To build it, put the SDKs in `tools/upscalers` (not committed): NVIDIA/DLSS tag v310.9.16 as `DLSS`, FidelityFX-SDK tag v2.4.0 as `FidelityFX`, then run `tools/upscaler-bridge/build.cmd`. It fills `project/ng2/upscalers` (not committed), which ng2's build copies next to ng2.exe at configure time, so re-run CMake the first time.
+- Licences: DLSS only on NVIDIA GPUs, and the vendor DLLs ship in release zips, not git. `make_release.py` needs `tools/upscalers` present to copy both licences.
+
 ## Status for the morning (2026-11-05, findings up to #147)
 
 To run it (now the default): `--gpu_backend=vulkan --ng2_native_d3d=true`. D3D12 is unaffected with `--gpu_backend=d3d12`.

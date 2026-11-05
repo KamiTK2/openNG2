@@ -3027,10 +3027,97 @@ index 953c5fd..24d90df 100644
          // Only perform the copying when actually changing the latest owner, not
          // just the latest host depth owner - the transfer source is expected to
 diff --git a/src/graphics/pipeline/shader/spirv_translator.cpp b/src/graphics/pipeline/shader/spirv_translator.cpp
-index 1774f97..a46dfb6 100644
+index 1774f97..23aede7 100644
 --- a/src/graphics/pipeline/shader/spirv_translator.cpp
 +++ b/src/graphics/pipeline/shader/spirv_translator.cpp
-@@ -3215,6 +3215,29 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
+@@ -28,6 +28,8 @@
+ 
+ namespace rex::graphics {
+ 
++extern bool g_ng2_native_output_clamp;  // spirv_translator_rb.cpp
++
+ SpirvShaderTranslator::Features::Features(bool all)
+     : spirv_version(all ? spv::Spv_1_5 : spv::Spv_1_0),
+       max_storage_buffer_range(all ? UINT32_MAX : (128 * 1024 * 1024)),
+@@ -2574,6 +2576,77 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
+   position_xyz =
+       builder_->createNoContractionBinOp(spv::OpFAdd, type_float3_, position_xyz, ndc_offset_mul_w);
+ 
++  // openNG2 native renderer: per-vertex motion. Compiled out unless specialization constant 0 is
++  // set, which only the motion vector pipelines do. The clip position of each vertex is kept in a
++  // history buffer and read back the next frame, so no game matrix has to be known.
++  if (g_ng2_native_output_clamp && is_vertex_shader()) {
++    spv::Id out_previous = builder_->createVariable(spv::NoPrecision, spv::StorageClassOutput,
++                                                    type_float4_, "ng2_motion_previous");
++    builder_->addDecoration(out_previous, spv::DecorationLocation, 16);
++    main_interface_.push_back(out_previous);
++    spv::Id out_current = builder_->createVariable(spv::NoPrecision, spv::StorageClassOutput,
++                                                   type_float4_, "ng2_motion_current");
++    builder_->addDecoration(out_current, spv::DecorationLocation, 17);
++    main_interface_.push_back(out_current);
++    spv::Id type_positions = builder_->makeRuntimeArray(type_float4_);
++    builder_->addDecoration(type_positions, spv::DecorationArrayStride, 16);
++    id_vector_temp_.clear();
++    id_vector_temp_.push_back(type_positions);
++    spv::Id type_history = builder_->makeStructType(id_vector_temp_, "Ng2History");
++    builder_->addMemberName(type_history, 0, "positions");
++    builder_->addMemberDecoration(type_history, 0, spv::DecorationOffset, 0);
++    builder_->addDecoration(type_history, spv::DecorationBlock);
++    spv::Id history = builder_->createVariable(spv::NoPrecision, spv::StorageClassStorageBuffer,
++                                               type_history, "ng2_history");
++    builder_->addDecoration(history, spv::DecorationDescriptorSet,
++                            int(kDescriptorSetSharedMemoryAndEdram));
++    builder_->addDecoration(history, spv::DecorationBinding, 1);
++    main_interface_.push_back(history);
++
++    id_vector_temp_.clear();
++    for (unsigned int i = 0; i < 3; ++i) {
++      id_vector_temp_.push_back(builder_->createCompositeExtract(position_xyz, type_float_, i));
++    }
++    id_vector_temp_.push_back(position_w);
++    spv::Id clip = builder_->createCompositeConstruct(type_float4_, id_vector_temp_);
++    builder_->createStore(clip, out_current);
++    builder_->createStore(clip, out_previous);
++
++    spv::Id motion_on = builder_->makeBoolConstant(false, true);
++    builder_->addDecoration(motion_on, spv::DecorationSpecId, 0);
++    spv::Builder::If motion_if(motion_on, spv::SelectionControlMaskNone, *builder_);
++    {
++      id_vector_temp_.clear();
++      id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantEdramStencilFront));
++      spv::Id bases = builder_->createLoad(
++          builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
++                                      id_vector_temp_),
++          spv::NoPrecision);
++      spv::Id vertex = builder_->createUnaryOp(
++          spv::OpBitcast, type_uint_, builder_->createLoad(input_vertex_index_, spv::NoPrecision));
++      spv::Id none = builder_->makeUintConstant(UINT32_MAX);
++      auto position_ptr_at = [&](unsigned int component) {
++        spv::Id base = builder_->createCompositeExtract(bases, type_uint_, component);
++        id_vector_temp_.clear();
++        id_vector_temp_.push_back(const_int_0_);
++        id_vector_temp_.push_back(builder_->createBinOp(spv::OpIAdd, type_uint_, base, vertex));
++        return builder_->createAccessChain(spv::StorageClassStorageBuffer, history,
++                                           id_vector_temp_);
++      };
++      spv::Id has_previous = builder_->createBinOp(
++          spv::OpINotEqual, type_bool_, builder_->createCompositeExtract(bases, type_uint_, 1), none);
++      spv::Builder::If previous_if(has_previous, spv::SelectionControlMaskNone, *builder_);
++      builder_->createStore(builder_->createLoad(position_ptr_at(1), spv::NoPrecision), out_previous);
++      previous_if.makeEndIf();
++      spv::Id has_current = builder_->createBinOp(
++          spv::OpINotEqual, type_bool_, builder_->createCompositeExtract(bases, type_uint_, 0), none);
++      spv::Builder::If current_if(has_current, spv::SelectionControlMaskNone, *builder_);
++      builder_->createStore(clip, position_ptr_at(0));
++      current_if.makeEndIf();
++    }
++    motion_if.makeEndIf();
++  }
++
+   spv::Id kill_vertex = spv::NoResult;
+   if (current_shader().writes_point_size_edge_flag_kill_vertex() & 0b100) {
+     assert_true(var_main_point_size_edge_flag_kill_vertex_ != spv::NoResult);
+@@ -3215,6 +3288,29 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
            spv::OpFMul, type_float_, param_gen_x,
            builder_->makeFloatConstant(1.0f / float(draw_resolution_scale_x_)));
      }
@@ -3060,7 +3147,7 @@ index 1774f97..a46dfb6 100644
      param_gen_x = builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_,
                                                     GLSLstd450FAbs, param_gen_x);
      if (!modification.pixel.param_gen_point) {
-@@ -3251,6 +3274,29 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
+@@ -3251,6 +3347,29 @@ void SpirvShaderTranslator::StartFragmentShaderInMain() {
            spv::OpFMul, type_float_, param_gen_y,
            builder_->makeFloatConstant(1.0f / float(draw_resolution_scale_y_)));
      }
@@ -9718,10 +9805,46 @@ index 0000000..135dd95
 +
 +}  // namespace rex::ui::vulkan::ng2_frame_interpolator_spirv
 diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
-index 8197bb4..9edfba8 100644
+index 8197bb4..6c508d6 100644
 --- a/src/ui/vulkan/vulkan_device.cpp
 +++ b/src/ui/vulkan/vulkan_device.cpp
-@@ -639,6 +639,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+@@ -248,6 +248,17 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+ #undef XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION
+ #undef XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION
+ 
++  // NG2 ADDITION: DLSS and FSR, on hardware that has them.
++  static bool ng2_upscaler_extensions[5];
++  {
++    const char* const names[5] = {"VK_NVX_binary_import", "VK_NVX_image_view_handle",
++                                  "VK_KHR_push_descriptor", "VK_KHR_buffer_device_address",
++                                  "VK_EXT_subgroup_size_control"};
++    for (uint32_t i = 0; i < 5; ++i) {
++      ng2_upscaler_extensions[i] = false;
++      requested_extensions.emplace(names[i], &ng2_upscaler_extensions[i]);
++    }
++  }
+   std::vector<const char*> enabled_extensions;
+   {
+     uint32_t supported_extension_count = 0;
+@@ -302,6 +313,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+ 
+   VkPhysicalDeviceFeatures2 supported_features_2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+ 
++  VulkanFeatures<VkPhysicalDeviceVulkan11Features,
++                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES>
++      features_1_1;
+   VulkanFeatures<VkPhysicalDeviceVulkan12Features,
+                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES>
+       features_1_2;
+@@ -338,6 +352,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+ 
+   if (get_physical_device_properties2_supported) {
+     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
++      features_1_1.Link(supported_features_2, device_create_info);
+       features_1_2.Link(supported_features_2, device_create_info);
+     }
+     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0)) {
+@@ -639,6 +654,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
      XE_UI_VULKAN_FEATURE(occlusionQueryPrecise)
      XE_UI_VULKAN_FEATURE(vertexPipelineStoresAndAtomics)
      XE_UI_VULKAN_FEATURE(fragmentStoresAndAtomics)
@@ -9729,6 +9852,44 @@ index 8197bb4..9edfba8 100644
      XE_UI_VULKAN_FEATURE(shaderClipDistance)
      XE_UI_VULKAN_FEATURE(shaderCullDistance)
      XE_UI_VULKAN_FEATURE(sparseBinding)
+@@ -650,6 +666,26 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+       XE_UI_VULKAN_FEATURE_2(features_1_2, samplerMirrorClampToEdge);
+       XE_UI_VULKAN_FEATURE_2(features_1_2, uniformBufferStandardLayout);
+       XE_UI_VULKAN_FEATURE_2(features_1_2, scalarBlockLayout);
++      // NG2 ADDITION: DLSS and FSR.
++      enabled_features.shaderInt16 = supported_features.shaderInt16;
++      enabled_features.shaderStorageImageWriteWithoutFormat =
++          supported_features.shaderStorageImageWriteWithoutFormat;
++      enabled_features.shaderStorageImageReadWithoutFormat =
++          supported_features.shaderStorageImageReadWithoutFormat;
++      features_1_1.enabled.storageBuffer16BitAccess = features_1_1.supported.storageBuffer16BitAccess;
++      features_1_2.enabled.bufferDeviceAddress = features_1_2.supported.bufferDeviceAddress;
++      features_1_2.enabled.shaderFloat16 = features_1_2.supported.shaderFloat16;
++      features_1_2.enabled.shaderInt8 = features_1_2.supported.shaderInt8;
++      features_1_2.enabled.storageBuffer8BitAccess = features_1_2.supported.storageBuffer8BitAccess;
++      features_1_2.enabled.descriptorIndexing = features_1_2.supported.descriptorIndexing;
++      features_1_2.enabled.runtimeDescriptorArray = features_1_2.supported.runtimeDescriptorArray;
++      features_1_2.enabled.shaderSampledImageArrayNonUniformIndexing =
++          features_1_2.supported.shaderSampledImageArrayNonUniformIndexing;
++      features_1_2.enabled.shaderStorageImageArrayNonUniformIndexing =
++          features_1_2.supported.shaderStorageImageArrayNonUniformIndexing;
++      features_1_2.enabled.descriptorBindingPartiallyBound =
++          features_1_2.supported.descriptorBindingPartiallyBound;
++      features_1_2.enabled.timelineSemaphore = features_1_2.supported.timelineSemaphore;
+     }
+   } else {
+     if (ext_1_2_KHR_sampler_mirror_clamp_to_edge) {
+@@ -661,6 +697,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+     if (with_gpu_emulation) {
+       XE_UI_VULKAN_FEATURE_2(features_1_3, shaderDemoteToHelperInvocation);
+       XE_UI_VULKAN_FEATURE_2(features_1_3, dynamicRendering);
++      // NG2 ADDITION: DLSS and FSR.
++      features_1_3.enabled.synchronization2 = features_1_3.supported.synchronization2;
++      features_1_3.enabled.subgroupSizeControl = features_1_3.supported.subgroupSizeControl;
++      features_1_3.enabled.computeFullSubgroups = features_1_3.supported.computeFullSubgroups;
+     }
+   } else {
+     if (ext_1_3_KHR_dynamic_rendering) {
 diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
 index 23645ef..814c2eb 100644
 --- a/src/ui/vulkan/vulkan_presenter.cpp
