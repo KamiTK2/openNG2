@@ -66,6 +66,9 @@ REXCVAR_DEFINE_INT32(ng2_native_skip_to, 100000, "NG2", "NG2 DIAG: end of the ra
 REXCVAR_DEFINE_STRING(ng2_native_skip_ps, "", "NG2",
                       "Native renderer debug: skip draws with these pixel shader hashes");
 REXCVAR_DEFINE_BOOL(ng2_native_motion, false, "NG2", "Write motion vectors for the scene");
+REXCVAR_DEFINE_INT32(ng2_upscaler, 0, "NG2", "Temporal upscaler: 0 off, 1 DLSS, 2 FSR, 3 plain scaling (test)");
+REXCVAR_DEFINE_INT32(ng2_upscale_quality, 3, "NG2",
+                     "0 Ultra Performance, 1 Performance, 2 Balanced, 3 Quality, 4 DLAA / Native AA");
 REXCVAR_DEFINE_INT32(ng2_native_show_motion, 0, "NG2",
                      "NG2 DIAG: show motion vectors instead of the game, this many times magnified");
 REXCVAR_DEFINE_INT32(ng2_native_dump_frame, 0, "NG2",
@@ -184,6 +187,7 @@ struct Fn {
 
 constexpr int kMaxScale = 10;
 std::atomic<int> g_desired_scale{1};
+std::atomic<int> g_output_width{0}, g_output_height{0};
 
 struct Image {
   VkImage image = VK_NULL_HANDLE;
@@ -212,6 +216,8 @@ struct Surface {
   // MSAA surfaces are single-sample images with one pixel per sample: guest 2x doubles the rows,
   // 4x the rows and columns. The resolve filters them back down.
   uint32_t msaa_x = 1, msaa_y = 1;
+  // Image pixels per guest pixel, before MSAA. Differs per axis and per surface with an upscaler.
+  float sx = 1.0f, sy = 1.0f;
   bool has_pending_clear = false;
   VkClearColorValue pending_clear = {};
   uint32_t tiles = 0;  // Size in guest layout units, only to find what a clear covers.
@@ -275,6 +281,17 @@ struct R {
   // Internal resolution: every render target and resolved texture is this many times its guest
   // size. Shaders use normalised coordinates, so they don't need to know. Read once at startup.
   uint32_t scale = 1;
+  // Temporal upscaling. The scene chain renders at input size, the 1280x720 surface the frame ends
+  // on at output size, and the upscaler fills the texture between them.
+  bool temporal = false;
+  uint32_t input_width = 0, input_height = 0, output_width = 0, output_height = 0;
+  float scene_x = 1.0f, scene_y = 1.0f, final_scale = 1.0f;
+  float jitter_pixels[2] = {}, jitter_ndc[2] = {}, jitter_ndc_last[2] = {};
+  uint32_t jitter_index = 0;
+  Surface* scene_color = nullptr;
+  Surface* scene_depth = nullptr;
+  Image upscaled;
+  Image* composite = nullptr;  // The resolved texture the upscaled image stands in for.
   VkDevice dev = VK_NULL_HANDLE;
   VkPhysicalDeviceMemoryProperties memory = {};
   bool usable = false;
@@ -887,9 +904,36 @@ void DestroyScaledImage(Image& image) {
 // recreated on demand. Happens between frames; the next frame's history is simply gone.
 void ApplyResolutionScale() {
   const uint32_t want = uint32_t(std::clamp(g_desired_scale.load(), 1, kMaxScale));
-  if (want == r.scale) return;
+  const bool temporal = REXCVAR_GET(ng2_upscaler) != 0;
+  uint32_t output_height = 0, output_width = 0, input_width = 0, input_height = 0;
+  if (temporal) {
+    static constexpr float kRatios[5] = {1.0f / 3.0f, 0.5f, 0.58f, 2.0f / 3.0f, 1.0f};
+    const float ratio = kRatios[std::clamp(REXCVAR_GET(ng2_upscale_quality), 0, 4)];
+    const int window_w = g_output_width.load(), window_h = g_output_height.load();
+    // The final surface is 16:9 whatever the window is.
+    output_height = uint32_t(window_h > 0 ? std::min(window_h, window_w * 9 / 16) : 1440);
+    output_width = output_height * 16 / 9;
+    input_width = uint32_t(std::lround(float(output_width) * ratio));
+    input_height = uint32_t(std::lround(float(output_height) * ratio));
+  }
+  if (want == r.scale && temporal == r.temporal && output_height == r.output_height &&
+      input_height == r.input_height) {
+    return;
+  }
   for (Frame& frame : r.frames) vk.vkWaitForFences(r.dev, 1, &frame.fence, VK_TRUE, UINT64_MAX);
-  REXLOG_INFO("NG2 NATIVE: internal resolution {}x -> {}x", r.scale, want);
+  REXLOG_INFO("NG2 NATIVE: internal resolution {}x -> {}x, upscaling {} {}x{} -> {}x{}", r.scale, want,
+              temporal, input_width, input_height, output_width, output_height);
+  r.temporal = temporal;
+  r.output_width = output_width;
+  r.output_height = output_height;
+  r.input_width = input_width;
+  r.input_height = input_height;
+  // The game's scene is 1120x584 at every setting seen so far (#150); its pixels are not square.
+  r.scene_x = float(input_width) / 1120.0f;
+  r.scene_y = float(input_height) / 584.0f;
+  r.final_scale = float(output_height) / 720.0f;
+  r.scene_color = r.scene_depth = nullptr;
+  r.composite = nullptr;
   for (auto& [key, surface] : r.surfaces) DestroyScaledImage(surface.image);
   for (auto& [key, image] : r.resolved) DestroyScaledImage(image);
   r.surfaces.clear();
@@ -1159,6 +1203,21 @@ VkFormat ColorFormat(uint32_t format) {
   }
 }
 
+void ScaleFor(uint32_t guest_width, uint32_t guest_height, float& x, float& y) {
+  if (!r.temporal) {
+    x = y = float(r.scale);
+  } else if (guest_width == 1280 && guest_height == 720) {
+    x = y = r.final_scale;
+  } else if (guest_width * 5 > guest_height * 9) {
+    x = r.scene_x;
+    y = r.scene_y;
+  } else {
+    // Shadow maps and the luminance chain are not the scene's shape. Below 1x they lose detail, and
+    // the 2x2 exposure textures collapse and darken the whole image.
+    x = y = std::max(1.0f, r.scene_y);
+  }
+}
+
 Surface* GetSurface(uint32_t guest, bool depth) {
   if (!guest) return nullptr;
   const uint32_t surface_info = Load(guest + 24);
@@ -1183,6 +1242,7 @@ Surface* GetSurface(uint32_t guest, bool depth) {
   s.base = info & 0xFFF;
   s.msaa_x = msaa == 2 ? 2 : 1;
   s.msaa_y = msaa ? 2 : 1;
+  ScaleFor(width, height, s.sx, s.sy);
   {
     const uint32_t color_format = (info >> 16) & 0xF;
     const uint32_t bytes_per_pixel_units =
@@ -1190,12 +1250,14 @@ Surface* GetSurface(uint32_t guest, bool depth) {
     s.tiles = (((surface_info & 0x3FFF) * s.msaa_x + 79) / 80) * ((height * s.msaa_y + 15) / 16) *
               bytes_per_pixel_units;
   }
+  // A temporal upscaler is the anti-aliasing: the game's MSAA becomes one sample.
+  if (r.temporal) s.msaa_x = s.msaa_y = 1;
   const VkImageUsageFlags usage =
       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
       (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
   if (!FitsDevice(width * s.msaa_x, height * s.msaa_y) ||
-      !MakeImage(s.image, format, width * r.scale * s.msaa_x, height * r.scale * s.msaa_y, 1, usage, 1, 0,
-                 VK_IMAGE_TYPE_2D, true)) {
+      !MakeImage(s.image, format, uint32_t(std::lround(width * s.sx)) * s.msaa_x,
+                 uint32_t(std::lround(height * s.sy)) * s.msaa_y, 1, usage, 1, 0, VK_IMAGE_TYPE_2D, true)) {
     REXLOG_ERROR("NG2 NATIVE: surface {:08X} {}x{} failed at {}x", guest, width, height, r.scale);
     ReduceScale(width * s.msaa_x, height * s.msaa_y);
     r.surfaces.erase(key);
@@ -1692,6 +1754,7 @@ VkImageView TextureView(uint32_t dev, uint32_t slot, bool is_signed) {
       swizzle = (swizzle & 0xFF00FF00) | VK_COMPONENT_SWIZZLE_R | (VK_COMPONENT_SWIZZLE_B << 16);
     }
     NoteTextureSigns(words, resolved->format, true);
+    if (resolved == r.composite) resolved = &r.upscaled;
     return SampleView(*resolved, swizzle, is_signed);
   }
   const VkImageView view = LoadStaticTexture(words, is_signed);
@@ -2089,12 +2152,15 @@ void RendererDraw(const DrawCall& d) {
   const uint32_t vte = Reg(dev, kPaClVteCntl);
   const float pass_w = float(r.pass_width), pass_h = float(r.pass_height);
   uint32_t width = UINT32_MAX, height = UINT32_MAX, msaa_x = 1, msaa_y = 1;
+  float surface_sx = float(r.scale), surface_sy = float(r.scale);
   for (Surface* s : color) {
     if (s) {
       width = std::min(width, s->image.width);
       height = std::min(height, s->image.height);
       msaa_x = s->msaa_x;
       msaa_y = s->msaa_y;
+      surface_sx = s->sx;
+      surface_sy = s->sy;
     }
   }
   if (depth) {
@@ -2102,11 +2168,14 @@ void RendererDraw(const DrawCall& d) {
     height = std::min(height, depth->image.height);
     msaa_x = depth->msaa_x;
     msaa_y = depth->msaa_y;
+    surface_sx = depth->sx;
+    surface_sy = depth->sy;
   }
   (void)pass_w;
   (void)pass_h;
   // Guest pixels: the viewport transform and scissor registers are in them.
-  const float w = float(width / (r.scale * msaa_x)), h = float(height / (r.scale * msaa_y));
+  const float w = std::round(float(width) / (surface_sx * float(msaa_x)));
+  const float h = std::round(float(height) / (surface_sy * float(msaa_y)));
   const float sx = (vte & 1) ? RegFloat(dev, kVportXScale) : 1.0f;
   const float ox = (vte & 2) ? RegFloat(dev, kVportXScale + 1) : 0.0f;
   const float sy = (vte & 4) ? RegFloat(dev, kVportXScale + 2) : 1.0f;
@@ -2157,12 +2226,21 @@ void RendererDraw(const DrawCall& d) {
   if (ps) set_signs(*ps);
   system.history_bases[0] = system.history_bases[1] = UINT32_MAX;
   system.motion_debug = float(REXCVAR_GET(ng2_native_show_motion));
+  const bool scene_pass = depth && color[0] && w >= 640.0f && w < 1280.0f;
+  if (r.temporal && scene_pass) {
+    system.ndc_offset[0] += r.jitter_ndc[0];
+    system.ndc_offset[1] += r.jitter_ndc[1];
+    system.motion_jitter_delta[0] = r.jitter_ndc[0] - r.jitter_ndc_last[0];
+    system.motion_jitter_delta[1] = r.jitter_ndc[1] - r.jitter_ndc_last[1];
+    r.scene_color = color[0];
+    r.scene_depth = depth;
+  }
   const bool triangles = key.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST ||
                          key.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP ||
                          key.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
   // The scene pass: smaller than the 1280x720 surface the frame ends on, with depth. Blended and
   // depth-writing shaders stay out, their pixels have no single surface to follow.
-  bool motion = REXCVAR_GET(ng2_native_motion) && depth && color[0] && w >= 640.0f && w < 1280.0f &&
+  bool motion = (REXCVAR_GET(ng2_native_motion) || r.temporal) && scene_pass &&
                 triangles && !key.rect && !d.immediate && (depth_control & 6) == 6 &&
                 !(ps && (ps->flags & kShaderFlagWritesDepth));
   if (motion) {
@@ -2270,9 +2348,9 @@ void RendererDraw(const DrawCall& d) {
   VkViewport viewport = {0.0f, 0.0f, float(width), float(height), 0.0f, 1.0f};
   vk.vkCmdSetViewport(cb, 0, 1, &viewport);
   const uint32_t tl = Reg(dev, kScissorTl), br = Reg(dev, kScissorBr);
-  const int32_t scale_x = int32_t(r.scale * msaa_x), scale_y = int32_t(r.scale * msaa_y);
-  int32_t x0 = (tl & 0x7FFF) * scale_x, y0 = ((tl >> 16) & 0x7FFF) * scale_y;
-  int32_t x1 = (br & 0x7FFF) * scale_x, y1 = ((br >> 16) & 0x7FFF) * scale_y;
+  const float scale_x = surface_sx * float(msaa_x), scale_y = surface_sy * float(msaa_y);
+  int32_t x0 = std::lround(float(tl & 0x7FFF) * scale_x), y0 = std::lround(float((tl >> 16) & 0x7FFF) * scale_y);
+  int32_t x1 = std::lround(float(br & 0x7FFF) * scale_x), y1 = std::lround(float((br >> 16) & 0x7FFF) * scale_y);
   x1 = std::min(x1, int32_t(width));
   y1 = std::min(y1, int32_t(height));
   VkRect2D scissor = {{x0, y0}, {uint32_t(std::max(x1 - x0, 0)), uint32_t(std::max(y1 - y0, 0))}};
@@ -2402,8 +2480,11 @@ Image* GetResolvedImage(uint32_t texture) {
   const uint32_t base = ToPhysical(words[1] & 0xFFFFF000);
   const uint32_t format = words[1] & 0x3F;
   const uint64_t key = ResolvedKey(words);
-  const uint32_t width = ((words[2] & 0x1FFF) + 1) * r.scale;
-  const uint32_t height = (((words[2] >> 13) & 0x1FFF) + 1) * r.scale;
+  const uint32_t guest_width = (words[2] & 0x1FFF) + 1, guest_height = ((words[2] >> 13) & 0x1FFF) + 1;
+  float scale_x, scale_y;
+  ScaleFor(guest_width, guest_height, scale_x, scale_y);
+  const uint32_t width = uint32_t(std::lround(guest_width * scale_x));
+  const uint32_t height = uint32_t(std::lround(guest_height * scale_y));
   const uint32_t levels = std::max<uint32_t>(((words[4] >> 6) & 0xF) + 1, 1);
   const VkFormat vk_format = ResolvedTextureFormat(format);
   r.resolved_latest[ResolvedAddressKey(words)] = key;
@@ -2412,9 +2493,9 @@ Image* GetResolvedImage(uint32_t texture) {
   Image image;
   const VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                                   VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-  if (!FitsDevice(width / r.scale, height / r.scale) ||
+  if (!FitsDevice(guest_width, guest_height) ||
       !MakeImage(image, vk_format, width, height, levels, usage, 1, 0, VK_IMAGE_TYPE_2D, true)) {
-    ReduceScale(width / r.scale, height / r.scale);
+    ReduceScale(guest_width, guest_height);
     return nullptr;
   }
   r.image_bytes += image.bytes;
@@ -2424,6 +2505,29 @@ Image* GetResolvedImage(uint32_t texture) {
   Image& stored = r.resolved[key];
   stored = std::move(image);
   return &stored;
+}
+
+void Upscale(VkCommandBuffer cb, Image& source) {
+  if (r.upscaled.width != r.output_width || r.upscaled.height != r.output_height ||
+      r.upscaled.format != source.format) {
+    if (r.upscaled.image != VK_NULL_HANDLE) RetireTexture(r.upscaled);
+    r.upscaled = {};
+    if (!MakeImage(r.upscaled, source.format, r.output_width, r.output_height, 1,
+                   VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                       VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+      return;
+    }
+    ToGeneral(cb, r.upscaled);
+    FullBarrier(cb);
+  }
+  VkImageBlit blit = {};
+  blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  blit.srcOffsets[1] = {int32_t(source.width), int32_t(source.height), 1};
+  blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  blit.dstOffsets[1] = {int32_t(r.output_width), int32_t(r.output_height), 1};
+  vk.vkCmdBlitImage(cb, source.image, VK_IMAGE_LAYOUT_GENERAL, r.upscaled.image,
+                    VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_LINEAR);
+  r.composite = &source;
 }
 
 bool SameTexelBlock(VkFormat a, VkFormat b) {
@@ -2509,6 +2613,7 @@ void RendererResolve(uint32_t dev, uint32_t flags, uint32_t source_rect, uint32_
   RendererDrainImmediate();
   BeginFrame();
   ++g_s.resolves;
+  const bool after_depthless_pass = r.in_pass && !r.pass_depth;
   EndPass();
   VkCommandBuffer cb = r.f->main_cb;
   FullBarrier(cb);
@@ -2528,16 +2633,16 @@ void RendererResolve(uint32_t dev, uint32_t flags, uint32_t source_rect, uint32_
   if (source && dest) {
     int32_t x0 = 0, y0 = 0, x1 = int32_t(source->image.width), y1 = int32_t(source->image.height);
     if (source_rect) {
-      const int32_t sx = int32_t(r.scale * source->msaa_x), sy = int32_t(r.scale * source->msaa_y);
-      x0 = int32_t(Load(source_rect)) * sx;
-      y0 = int32_t(Load(source_rect + 4)) * sy;
-      x1 = int32_t(Load(source_rect + 8)) * sx;
-      y1 = int32_t(Load(source_rect + 12)) * sy;
+      const float sx = source->sx * float(source->msaa_x), sy = source->sy * float(source->msaa_y);
+      x0 = std::lround(float(int32_t(Load(source_rect))) * sx);
+      y0 = std::lround(float(int32_t(Load(source_rect + 4))) * sy);
+      x1 = std::lround(float(int32_t(Load(source_rect + 8))) * sx);
+      y1 = std::lround(float(int32_t(Load(source_rect + 12))) * sy);
     }
     int32_t dx = 0, dy = 0;
     if (dest_point) {
-      dx = int32_t(Load(dest_point)) * int32_t(r.scale);
-      dy = int32_t(Load(dest_point + 4)) * int32_t(r.scale);
+      dx = std::lround(float(int32_t(Load(dest_point))) * source->sx);
+      dy = std::lround(float(int32_t(Load(dest_point + 4))) * source->sy);
     }
     const int32_t dest_w = int32_t(std::max(dest->width >> level, 1u));
     const int32_t dest_h = int32_t(std::max(dest->height >> level, 1u));
@@ -2581,6 +2686,11 @@ void RendererResolve(uint32_t dev, uint32_t flags, uint32_t source_rect, uint32_
       }
       if (int32_t(r.resolve_index) == REXCVAR_GET(ng2_native_show_resolve)) r.show_override = dest;
       ++r.resolve_index;
+      // The scene surface's last pass has no depth: the game's composite of the finished image.
+      if (r.temporal && !from_depth && source == r.scene_color && after_depthless_pass) {
+        FullBarrier(cb);
+        Upscale(cb, *dest);
+      }
     }
   } else {
     ++g_s.resolves_skipped;
@@ -2645,6 +2755,26 @@ void RendererSwap(uint32_t dev, uint32_t front_texture) {
   r.history_half ^= 1;
   r.history_used = 0;
   r.velocity_cleared = false;
+  if (r.temporal) {
+    // Halton (2, 3), long enough to cover every output pixel a low input pixel spans.
+    const auto halton = [](uint32_t index, uint32_t base) {
+      float f = 1.0f, result = 0.0f;
+      for (; index; index /= base) {
+        f /= float(base);
+        result += f * float(index % base);
+      }
+      return result;
+    };
+    const float ratio = float(r.output_height) / float(r.input_height);
+    const uint32_t phases = uint32_t(std::ceil(8.0f * ratio * ratio));
+    r.jitter_index = r.jitter_index % phases + 1;
+    r.jitter_ndc_last[0] = r.jitter_ndc[0];
+    r.jitter_ndc_last[1] = r.jitter_ndc[1];
+    r.jitter_pixels[0] = halton(r.jitter_index, 2) - 0.5f;
+    r.jitter_pixels[1] = halton(r.jitter_index, 3) - 0.5f;
+    r.jitter_ndc[0] = r.jitter_pixels[0] * 2.0f / float(r.input_width);
+    r.jitter_ndc[1] = r.jitter_pixels[1] * 2.0f / float(r.input_height);
+  }
   Image* front = r.show_override;
   if (!front && front_texture) {
     uint32_t words[6];
@@ -2745,6 +2875,11 @@ void RendererSwap(uint32_t dev, uint32_t front_texture) {
   if (!submitted) submit();
   r.recording = false;
   r.frame_index = (r.frame_index + 1) % kFrames;
+}
+
+void SetOutputSize(int width, int height) {
+  g_output_width = width;
+  g_output_height = height;
 }
 
 bool HostSupportsNative() {

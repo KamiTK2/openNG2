@@ -1608,6 +1608,7 @@ void RecompOptionsPane::UpdateQuitToDesktop(const ImGuiIO& io) {
 void RecompOptionsPane::OnDraw(ImGuiIO& io) {
   pad_.Poll();
   DrawShaderProgress(io);
+  native::SetOutputSize(int(io.DisplaySize.x), int(io.DisplaySize.y));
   UpdatePromptDevice(io, window_);
   DrawPromptGlyphs(io);
   UpdateQuitToDesktop(io);
