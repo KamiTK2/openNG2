@@ -65,4 +65,8 @@ add_custom_command(TARGET ng2 POST_BUILD
         ${CMAKE_CURRENT_SOURCE_DIR}/ng2.toml $<TARGET_FILE_DIR:ng2>/ng2.toml
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         ${CMAKE_CURRENT_SOURCE_DIR}/shaders $<TARGET_FILE_DIR:ng2>/shaders
+    COMMAND ${CMAKE_COMMAND}
+        -DPACK=${CMAKE_CURRENT_SOURCE_DIR}/../../tools/native-shader-tool/out/ng2_native_shaders.pack
+        -DDEST=$<TARGET_FILE_DIR:ng2>/ng2_native_shaders.pack
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/src/native/deploy_pack.cmake
     VERBATIM)

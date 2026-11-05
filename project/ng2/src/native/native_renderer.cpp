@@ -281,6 +281,7 @@ struct R {
 
   std::unordered_map<uint64_t, Surface> surfaces;
   std::unordered_map<uint64_t, Image> resolved;  // Key: ResolvedKey.
+  std::unordered_map<uint64_t, uint64_t> resolved_latest;  // ResolvedAddressKey -> ResolvedKey.
   std::unordered_map<uint64_t, Image> textures;
   Image white_2d, white_3d, white_cube;
   bool white_uploaded = false;
@@ -1158,8 +1159,22 @@ VkFormat ResolvedTextureFormat(uint32_t xenos_format) {
 }
 
 // A texture and its format; the game resolves depth and colour to the same memory (shadow moments).
-uint64_t ResolvedKey(const uint32_t words[6]) {
+// The game resolves to one address at more than one size (1CE10000 at 1120x584 and 1280x720 in the
+// same cutscene frame), so size is part of the identity.
+uint64_t ResolvedAddressKey(const uint32_t words[6]) {
   return (uint64_t(ToPhysical(words[1] & 0xFFFFF000)) << 8) | (words[1] & 0x3F);
+}
+uint64_t ResolvedKey(const uint32_t words[6]) {
+  return (ResolvedAddressKey(words) << 24) ^ (uint64_t(words[2]) & 0x3FFFFFF);
+}
+// What a texture fetch finds: the same size, else the newest resolve at that address and format.
+Image* FindResolved(const uint32_t words[6]) {
+  auto found = r.resolved.find(ResolvedKey(words));
+  if (found != r.resolved.end()) return &found->second;
+  const auto latest = r.resolved_latest.find(ResolvedAddressKey(words));
+  if (latest == r.resolved_latest.end()) return nullptr;
+  found = r.resolved.find(latest->second);
+  return found != r.resolved.end() ? &found->second : nullptr;
 }
 
 // From the swizzle in fetch dword 3: 0-3 RGBA, 4 zero, 5 one.
@@ -1300,15 +1315,14 @@ VkImageView LoadStaticTexture(const uint32_t words[6]) {
 VkImageView TextureView(uint32_t dev, uint32_t slot) {
   uint32_t words[6];
   SwapDwords(words, Virt(dev + kDevFetch + slot * 24), 6);
-  const auto found = r.resolved.find(ResolvedKey(words));
-  if (found != r.resolved.end()) {
+  if (Image* resolved = FindResolved(words)) {
     // The guest's resolve swaps red and blue to the texture's memory order and the fetch swizzle
     // swaps them back. Host images hold the target's components as they are.
     uint32_t swizzle = FetchSwizzleKey(words[3]);
     if ((swizzle & 0xFF) == VK_COMPONENT_SWIZZLE_B && ((swizzle >> 16) & 0xFF) == VK_COMPONENT_SWIZZLE_R) {
       swizzle = (swizzle & 0xFF00FF00) | VK_COMPONENT_SWIZZLE_R | (VK_COMPONENT_SWIZZLE_B << 16);
     }
-    return SampleView(found->second, swizzle);
+    return SampleView(*resolved, swizzle);
   }
   const VkImageView view = LoadStaticTexture(words);
   if (view != VK_NULL_HANDLE) return view;
@@ -1895,10 +1909,9 @@ Image* GetResolvedImage(uint32_t texture) {
   const uint32_t height = (((words[2] >> 13) & 0x1FFF) + 1) * r.scale;
   const uint32_t levels = std::max<uint32_t>(((words[4] >> 6) & 0xF) + 1, 1);
   const VkFormat vk_format = ResolvedTextureFormat(format);
+  r.resolved_latest[ResolvedAddressKey(words)] = key;
   auto found = r.resolved.find(key);
-  if (found != r.resolved.end() && found->second.width == width && found->second.height == height) {
-    return &found->second;
-  }
+  if (found != r.resolved.end()) return &found->second;
   Image image;
   const VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                                   VK_IMAGE_USAGE_TRANSFER_DST_BIT;
@@ -2119,8 +2132,7 @@ void RendererSwap(uint32_t dev, uint32_t front_texture) {
   if (!front && front_texture) {
     uint32_t words[6];
     SwapDwords(words, Virt(front_texture + 28), 6);
-    const auto found = r.resolved.find(ResolvedKey(words));
-    if (found != r.resolved.end()) front = &found->second;
+    front = FindResolved(words);
   }
   Frame& f = *r.f;
   UpdateGammaRamp(dev);

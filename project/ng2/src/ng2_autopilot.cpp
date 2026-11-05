@@ -11,6 +11,7 @@
 #include <windows.h>
 
 #include <cstdint>
+#include <cstring>
 #include <string>
 
 #include <rex/cvar.h>
@@ -24,6 +25,8 @@ REXCVAR_DEFINE_INT32(ng2_autopilot_pulse_ms, 50, "NG2",
 REXCVAR_DEFINE_INT32(ng2_autopilot_menu_item, 1, "NG2",
                      "NG2 DIAG: main menu row the gameplay route selects (1 = LOAD GAME)");
 
+REXCVAR_DEFINE_INT32(ng2_autopilot_list_down, 0, "NG2",
+                     "NG2 DIAG: Down presses on the first list after the main menu (mission or save)");
 REXCVAR_DEFINE_BOOL(ng2_autopilot_turbo, true, "NG2",
                     "NG2 DIAG: guest vblank unthrottled until the autopilot reaches its goal");
 
@@ -35,7 +38,7 @@ bool Ng2CutsceneUp();          // ng2_hooks.cpp
 
 namespace {
 
-constexpr uint16_t kDpadUp = 0x0001, kDpadDown = 0x0002, kStart = 0x0010, kA = 0x1000;
+constexpr uint16_t kDpadUp = 0x0001, kDpadDown = 0x0002, kDpadLeft = 0x0004, kStart = 0x0010, kA = 0x1000;
 constexpr int64_t kGoalHoldMs = 500;  // the goal state must stay up this long
 constexpr int64_t kFpsWindowMs = 2000;
 
@@ -51,6 +54,9 @@ struct Autopilot {
   int64_t next_press_ms = 0;
   uint32_t presses = 0;
   int left_menu = 0;
+  bool confirm_left = false;
+  int list_down_done = 0;
+  int64_t left_menu_ms = 0;
 } g_ap;
 
 void Note(const char* state) {
@@ -82,6 +88,12 @@ void Ng2AutopilotPad(uint32_t user_index, rex::input::X_INPUT_STATE* st) {
   if (route.empty() || user_index != 0 || g_ap.done) return;
   const int64_t now = NowMs();
   if (!g_ap.start_ms) g_ap.start_ms = now;
+  // This route confirms a save overwrite, so it refuses anything but the test sandbox.
+  if (route == "cutscene" && !std::strstr(GetCommandLineA(), "openNG2-test")) {
+    REXLOG_ERROR("NG2 AUTOPILOT: cutscene route needs the sandbox user data, stopping");
+    g_ap.done = true;
+    return;
+  }
 
   const int cursor = Ng2MainMenuCursor();
   const bool gameplay = Ng2InGameplay();
@@ -89,7 +101,7 @@ void Ng2AutopilotPad(uint32_t user_index, rex::input::X_INPUT_STATE* st) {
   const bool cutscene_route = route == "cutscene";
   const bool goal_up = route == "menu"      ? cursor >= 0
                        : route == "options" ? g_ap.left_menu == 2
-                       : cutscene_route     ? Ng2CutsceneUp()
+                       : cutscene_route     ? g_ap.left_menu && Ng2CutsceneUp()
                                             : gameplay;
   if (goal_up) {
     if (!g_ap.goal_since_ms) g_ap.goal_since_ms = now;
@@ -108,7 +120,7 @@ void Ng2AutopilotPad(uint32_t user_index, rex::input::X_INPUT_STATE* st) {
     const int target = route == "options"    ? 5
                        : cutscene_route      ? 0
                                              : REXCVAR_GET(ng2_autopilot_menu_item);
-    if (route == "options" && cursor == target) g_ap.left_menu = 1;
+    if ((route == "options" || cutscene_route) && cursor == target) g_ap.left_menu = 1;
     if (route != "menu") {
       if (cursor < target) Pulse(now, kDpadDown);
       else if (cursor > target) Pulse(now, kDpadUp);
@@ -122,7 +134,24 @@ void Ng2AutopilotPad(uint32_t user_index, rex::input::X_INPUT_STATE* st) {
   } else {
     // Title, save list, costume selection, chapter card, cutscene: A confirms, Start skips.
     Note(Ng2ChapterScreenUp() ? "chapter_or_slots" : "other");
-    if (!goal_up) Pulse(now, cutscene_route ? kA : kA | kStart);
+    if (!g_ap.left_menu_ms) g_ap.left_menu_ms = now;
+    const bool in_list_wait = now - g_ap.left_menu_ms < 800;
+    if (g_ap.list_down_done < REXCVAR_GET(ng2_autopilot_list_down)) {
+      if (!in_list_wait && !g_ap.pressing && now >= g_ap.next_press_ms) {
+        Pulse(now, kDpadDown);
+        g_ap.next_press_ms = now + 150;
+        ++g_ap.list_down_done;
+      }
+    } else if (!goal_up && !cutscene_route) {
+      Pulse(now, kA | kStart);
+    } else if (!goal_up && !g_ap.pressing && now >= g_ap.next_press_ms) {
+      // New Game asks to overwrite a story save for that difficulty: Left picks Yes, then A. Left
+      // does nothing on the screens without that prompt, so this copes with both. Only ever run
+      // on the sandbox user data (tools/native_test.ps1).
+      Pulse(now, g_ap.confirm_left ? kDpadLeft : kA);
+      g_ap.confirm_left = !g_ap.confirm_left;
+      g_ap.next_press_ms = now + 400;
+    }
   }
 
   if (g_ap.pressing && now >= g_ap.press_end_ms) g_ap.pressing = 0;
