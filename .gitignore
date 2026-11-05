@@ -43,3 +43,7 @@
 /launcher/out/
 # Our own artwork (icon)
 !/assets/
+# Offline shader converter (sources only; output is game-derived)
+!/tools/native-shader-tool/
+/tools/native-shader-tool/build/
+/tools/native-shader-tool/out/
