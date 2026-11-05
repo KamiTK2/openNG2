@@ -36,6 +36,7 @@
 #include <rex/system/xmemory.h>
 #include <rex/ui/presenter.h>
 #include <rex/ui/vulkan/device.h>
+#include <rex/ui/vulkan/mem_alloc.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/provider.h>
 
@@ -47,6 +48,8 @@
 
 REXCVAR_DEFINE_STRING(ng2_native_shader_pack, "ng2_native_shaders.pack", "NG2",
                       "Native renderer shader pack, relative to the executable");
+REXCVAR_DEFINE_INT32(ng2_native_texture_mb, 2048, "NG2",
+                     "Native renderer: game texture memory budget in MB; least recently used are freed");
 REXCVAR_DEFINE_INT32(ng2_native_show_resolve, -1, "NG2",
                      "Native renderer debug: present the Nth resolve of the frame instead");
 REXCVAR_DEFINE_INT32(ng2_native_dump_frame, 0, "NG2",
@@ -131,7 +134,7 @@ struct Stats {
   uint64_t drawn = 0, no_vs = 0, no_ps = 0, no_pipeline = 0, no_target = 0, prim_unsupported = 0;
   uint64_t passes = 0, heap_bytes = 0, upload_bytes = 0, textures = 0, texture_misses = 0;
   uint64_t resolves = 0, resolves_skipped = 0, clears = 0, msaa_surfaces = 0, frames = 0;
-  uint64_t upload_full = 0, bad_mode = 0, indexed_seen = 0;
+  uint64_t upload_full = 0, bad_mode = 0, indexed_seen = 0, texture_reloads = 0, texture_evictions = 0;
 } g_s;
 
 #define NG2_VK_FUNCS(F)                                                                       \
@@ -148,7 +151,7 @@ struct Stats {
   F(vkCmdSetStencilReference) F(vkCmdSetStencilCompareMask) F(vkCmdSetStencilWriteMask)        \
   F(vkCmdSetDepthBias) F(vkCmdBeginRendering) F(vkCmdEndRendering) F(vkCmdCopyImage)           \
   F(vkCmdBlitImage) F(vkCmdCopyBufferToImage) F(vkCmdClearColorImage)                          \
-  F(vkCmdClearDepthStencilImage) F(vkCmdClearAttachments) F(vkCmdWriteTimestamp)               \
+  F(vkDestroyImageView) F(vkCmdClearDepthStencilImage) F(vkCmdClearAttachments) F(vkCmdWriteTimestamp)               \
   F(vkCmdResetQueryPool) F(vkCreateQueryPool) F(vkGetQueryPoolResults) F(vkCmdBeginRenderPass) \
   F(vkCmdEndRenderPass) F(vkCreateRenderPass) F(vkCreateFramebuffer) F(vkQueueSubmit)
 
@@ -165,6 +168,17 @@ struct Image {
   uint32_t width = 0, height = 0, levels = 1;
   bool depth = false;
   std::map<uint32_t, VkImageView> sample_views;  // By swizzle.
+  // Game textures only: these are freed and reloaded, so they use the VMA heap.
+  VmaAllocation allocation = nullptr;
+  uint64_t content_hash = 0, last_frame = 0, bytes = 0;
+};
+
+// A freed image the GPU may still be reading.
+struct RetiredImage {
+  VkImage image = VK_NULL_HANDLE;
+  std::vector<VkImageView> views;
+  VmaAllocation allocation = nullptr;
+  uint64_t frame = 0;
 };
 
 struct Surface {
@@ -201,6 +215,10 @@ struct PendingImmediate {
   uint32_t guest = 0;
   VkDeviceSize heap_offset = 0;
   uint32_t bytes = 0;
+  // BeginIndexedVertices: indices the engine writes after the call returns.
+  uint8_t* index_out = nullptr;
+  uint32_t index_count = 0;
+  bool index_32 = false, quads = false;
 };
 
 struct R {
@@ -243,6 +261,9 @@ struct R {
   VkDeviceSize chunk_used = 0;
   uint32_t chunk_type = UINT32_MAX;
   uint64_t image_bytes = 0;
+  VmaAllocator vma = nullptr;
+  std::vector<RetiredImage> retired;
+  uint64_t frame_count = 0, texture_bytes = 0;
 
   ShaderPack pack;
   std::unordered_map<uint64_t, VkShaderModule> modules;
@@ -352,7 +373,7 @@ bool IsDepthFormat(VkFormat format) { return format == kDepthFormat; }
 
 bool MakeImage(Image& out, VkFormat format, uint32_t width, uint32_t height, uint32_t levels,
                VkImageUsageFlags usage, uint32_t layers = 1, VkImageCreateFlags flags = 0,
-               VkImageType type = VK_IMAGE_TYPE_2D) {
+               VkImageType type = VK_IMAGE_TYPE_2D, bool pooled = false) {
   VkImageCreateInfo info = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
   info.flags = flags;
   info.imageType = type;
@@ -364,8 +385,18 @@ bool MakeImage(Image& out, VkFormat format, uint32_t width, uint32_t height, uin
   info.tiling = VK_IMAGE_TILING_OPTIMAL;
   info.usage = usage;
   info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-  if (vk.vkCreateImage(r.dev, &info, nullptr, &out.image) != VK_SUCCESS) return false;
-  if (!BindImageMemory(out.image)) return false;
+  if (pooled) {
+    VmaAllocationCreateInfo pool = {};
+    pool.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    VmaAllocationInfo allocated = {};
+    if (vmaCreateImage(r.vma, &info, &pool, &out.image, &out.allocation, &allocated) != VK_SUCCESS) {
+      return false;
+    }
+    out.bytes = allocated.size;
+  } else {
+    if (vk.vkCreateImage(r.dev, &info, nullptr, &out.image) != VK_SUCCESS) return false;
+    if (!BindImageMemory(out.image)) return false;
+  }
   out.format = format;
   out.width = width;
   out.height = height;
@@ -549,6 +580,7 @@ bool Init() {
   auto* provider = static_cast<rex::ui::vulkan::VulkanProvider*>(graphics->provider());
   r.device = provider->vulkan_device();
   r.presenter = graphics->presenter();
+  r.vma = rex::ui::vulkan::CreateVmaAllocator(r.device, false);
   r.scale = uint32_t(std::clamp(std::atoi(rex::cvar::GetFlagByName("resolution_scale").c_str()), 1, 8));
   REXLOG_INFO("NG2 NATIVE: internal resolution {}x", r.scale);
   r.dev = r.device->device();
@@ -695,6 +727,8 @@ bool Usable() {
 
 // ---- Frame ----------------------------------------------------------------------------------
 
+void FreeRetiredImages();
+
 void BeginFrame() {
   if (r.recording) return;
   r.f = &r.frames[r.frame_index];
@@ -709,6 +743,8 @@ void BeginFrame() {
       r.timestamp_ms = float(stamps[1] - stamps[0]) * period * 1e-6f;
     }
   }
+  ++r.frame_count;
+  FreeRetiredImages();
   vk.vkResetDescriptorPool(r.dev, f.pool, 0);
   f.upload_offset = 0;
   f.immediate_offset = 0;
@@ -1131,6 +1167,67 @@ uint32_t FetchSwizzleKey(uint32_t word3) {
          (uint32_t(kMap[(s >> 6) & 7]) << 16) | (uint32_t(kMap[(s >> 9) & 7]) << 24);
 }
 
+// No write watching in the native path: bound textures are sampled once per frame instead. Small
+// ones whole, large ones at 256 spots, which catches a level load or a reused address. A CPU edit
+// of a few bytes of a large texture could slip through.
+uint64_t HashTextureContent(const TextureDesc& desc) {
+  constexpr uint32_t kWhole = 64 * 1024, kSpots = 256, kSpot = 64;
+  const uint32_t bytes[2] = {desc.base_bytes, desc.mip_address ? desc.mip_bytes : 0};
+  const uint32_t address[2] = {desc.base_address, desc.mip_address};
+  uint64_t hash = 0;
+  for (uint32_t part = 0; part < 2; ++part) {
+    if (!bytes[part] || !address[part]) continue;
+    const uint8_t* data = Phys(address[part]);
+    if (bytes[part] <= kWhole) {
+      hash = XXH3_64bits_withSeed(data, bytes[part], hash);
+      continue;
+    }
+    const uint32_t step = (bytes[part] - kSpot) / (kSpots - 1);
+    for (uint32_t i = 0; i < kSpots; ++i) hash = XXH3_64bits_withSeed(data + i * step, kSpot, hash);
+  }
+  return hash;
+}
+
+void RetireTexture(Image& image) {
+  RetiredImage retired;
+  retired.image = image.image;
+  retired.allocation = image.allocation;
+  retired.frame = r.frame_count;
+  for (const auto& view : image.sample_views) retired.views.push_back(view.second);
+  r.retired.push_back(std::move(retired));
+  r.texture_bytes -= std::min(r.texture_bytes, image.bytes);
+}
+
+void FreeRetiredImages() {
+  size_t kept = 0;
+  for (RetiredImage& image : r.retired) {
+    if (r.frame_count < image.frame + kFrames + 1) {
+      if (&r.retired[kept] != &image) r.retired[kept] = std::move(image);
+      ++kept;
+      continue;
+    }
+    for (VkImageView view : image.views) vk.vkDestroyImageView(r.dev, view, nullptr);
+    vmaDestroyImage(r.vma, image.image, image.allocation);
+  }
+  r.retired.resize(kept);
+}
+
+// Least recently bound first, never anything bound in the last two seconds.
+void EvictTextures() {
+  const uint64_t budget = uint64_t(std::max(REXCVAR_GET(ng2_native_texture_mb), 16)) << 20;
+  if (r.texture_bytes <= budget) return;
+  std::vector<std::pair<uint64_t, uint64_t>> order;
+  for (const auto& entry : r.textures) order.push_back({entry.second.last_frame, entry.first});
+  std::sort(order.begin(), order.end());
+  for (const auto& entry : order) {
+    if (r.texture_bytes <= budget || entry.first + 120 > r.frame_count) break;
+    auto found = r.textures.find(entry.second);
+    RetireTexture(found->second);
+    r.textures.erase(found);
+    ++g_s.texture_evictions;
+  }
+}
+
 VkImageView LoadStaticTexture(const uint32_t words[6]) {
   TextureDesc desc;
   if (!ParseTextureFetch(words, desc)) return VK_NULL_HANDLE;
@@ -1139,7 +1236,15 @@ VkImageView LoadStaticTexture(const uint32_t words[6]) {
       (desc.vk_swizzle[3] << 24);
   const uint64_t key = XXH3_64bits(words, 8) ^ (uint64_t(words[2]) << 32) ^ words[5];
   auto found = r.textures.find(key);
-  if (found != r.textures.end()) return SampleView(found->second, swizzle);
+  if (found != r.textures.end()) {
+    Image& image = found->second;
+    if (image.last_frame == r.frame_count) return SampleView(image, swizzle);
+    image.last_frame = r.frame_count;
+    if (HashTextureContent(desc) == image.content_hash) return SampleView(image, swizzle);
+    ++g_s.texture_reloads;
+    RetireTexture(image);
+    r.textures.erase(found);
+  }
   if (!desc.supported || !desc.base_address) {
     if (!g_s.texture_misses++ || r.missed.insert(key).second) {
       REXLOG_WARN("NG2 NATIVE: texture unsupported format {} {}x{} base {:08X} words {:08X} {:08X} {:08X}",
@@ -1160,7 +1265,8 @@ VkImageView LoadStaticTexture(const uint32_t words[6]) {
   const uint32_t first = loaded.mips.front().level;
   if (!MakeImage(image, VkFormat(desc.vk_format), loaded.mips.front().width, loaded.mips.front().height,
                  uint32_t(loaded.mips.size()),
-                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+                 VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, 1, 0, VK_IMAGE_TYPE_2D,
+                 true)) {
     ++g_s.texture_misses;
     return VK_NULL_HANDLE;
   }
@@ -1177,6 +1283,9 @@ VkImageView LoadStaticTexture(const uint32_t words[6]) {
   vk.vkCmdCopyBufferToImage(r.f->upload_cb, r.upload, image.image, VK_IMAGE_LAYOUT_GENERAL,
                             uint32_t(copies.size()), copies.data());
   ++g_s.textures;
+  image.content_hash = HashTextureContent(desc);
+  image.last_frame = r.frame_count;
+  r.texture_bytes += image.bytes;
   auto& stored = r.textures[key];
   stored = std::move(image);
   return SampleView(stored, swizzle);
@@ -1206,7 +1315,11 @@ VkSampler GetSampler(const NativeSamplerBinding& binding, const uint32_t words[6
   if (binding.mag_filter != 3) mag = binding.mag_filter;
   if (binding.min_filter != 3) min = binding.min_filter;
   if (binding.mip_filter != 3) mip = binding.mip_filter;
-  const uint64_t key = clamp | (mag << 9) | (min << 11) | (mip << 13);
+  uint32_t aniso = (words[3] >> 25) & 7;
+  if (binding.aniso_filter != 7) aniso = binding.aniso_filter;
+  const uint32_t bias = (words[4] >> 12) & 0x3FF, border = words[5] & 3;
+  const uint64_t key = clamp | (mag << 9) | (min << 11) | (mip << 13) | (aniso << 15) | (bias << 18) |
+                       (uint64_t(border) << 28);
   VkSampler& sampler = r.samplers[key];
   if (sampler != VK_NULL_HANDLE) return sampler;
   auto address = [](uint32_t c) {
@@ -1232,7 +1345,14 @@ VkSampler GetSampler(const NativeSamplerBinding& binding, const uint32_t words[6
   info.addressModeV = address((clamp >> 3) & 7);
   info.addressModeW = address((clamp >> 6) & 7);
   info.maxLod = 16.0f;
-  info.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+  info.mipLodBias = float(int32_t(bias << 22) >> 22) / 32.0f;  // Signed, 5 fractional bits.
+  if (aniso >= 2 && aniso <= 5 && r.device->properties().samplerAnisotropy) {
+    info.anisotropyEnable = VK_TRUE;
+    info.maxAnisotropy = float(1u << (aniso - 1));
+  }
+  // The two YCbCr-style blacks fall back to transparent black: they are not seen outside movies.
+  info.borderColor =
+      border == 1 ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
   vk.vkCreateSampler(r.dev, &info, nullptr, &sampler);
   return sampler;
 }
@@ -1345,9 +1465,36 @@ void CopyToHeap(uint32_t address, uint32_t bytes) {
 
 }  // namespace
 
+// Big-endian guest indices to host, with quad lists turned into two triangles each.
+void WriteIndices(uint8_t* out, const uint8_t* in, uint32_t count, bool index_32, bool quads) {
+  auto read = [&](uint32_t i) -> uint32_t {
+    return index_32 ? _byteswap_ulong(reinterpret_cast<const uint32_t*>(in)[i])
+                    : _byteswap_ushort(reinterpret_cast<const uint16_t*>(in)[i]);
+  };
+  auto write = [&](uint32_t i, uint32_t value) {
+    if (index_32) {
+      reinterpret_cast<uint32_t*>(out)[i] = value;
+    } else {
+      reinterpret_cast<uint16_t*>(out)[i] = uint16_t(value);
+    }
+  };
+  if (!quads) {
+    for (uint32_t i = 0; i < count; ++i) write(i, read(i));
+    return;
+  }
+  uint32_t o = 0;
+  for (uint32_t q = 0; q + 3 < count; q += 4) {
+    for (uint32_t corner : {0u, 1u, 2u, 0u, 2u, 3u}) write(o++, read(q + corner));
+  }
+}
+
 void RendererDrainImmediate() {
   std::lock_guard lock(g_mutex);
   for (const PendingImmediate& p : r.pending) {
+    if (p.index_out) {
+      WriteIndices(p.index_out, Virt(p.guest), p.index_count, p.index_32, p.quads);
+      continue;
+    }
     std::memcpy(r.heap_map + p.heap_offset, Virt(p.guest), p.bytes);
     if (r.dumping) {
       uint32_t v[12] = {};
@@ -1450,11 +1597,7 @@ void RendererDraw(const DrawCall& d) {
       break;
     case 13:
       key.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-      if (d.indexed) {
-        ++g_s.prim_unsupported;
-        return;
-      }
-      for (uint32_t q = 0; q + 3 < d.count; q += 4) {
+      for (uint32_t q = 0; !d.indexed && q + 3 < d.count; q += 4) {
         const uint16_t v = uint16_t(d.first_vertex + q);
         for (uint16_t offset : {0, 1, 2, 0, 2, 3}) quad_indices.push_back(uint16_t(v + offset));
       }
@@ -1606,20 +1749,23 @@ void RendererDraw(const DrawCall& d) {
   uint32_t index_count = 0;
   VkIndexType index_type = VK_INDEX_TYPE_UINT16;
   if (d.indexed) {
-    const uint32_t bytes = d.count * (d.index_32 ? 4 : 2);
-    index_offset = UploadAlloc(bytes);
+    const bool quads = d.prim == 13;
+    index_count = quads ? d.count / 4 * 6 : d.count;
+    index_offset = UploadAlloc(index_count * (d.index_32 ? 4 : 2));
     if (index_offset == VK_WHOLE_SIZE) return;
+    if (d.index_32) index_type = VK_INDEX_TYPE_UINT32;
     uint8_t* out = r.f->upload_map + index_offset;
-    const uint8_t* in = Virt(d.index_guest);
-    if (d.index_32) {
-      index_type = VK_INDEX_TYPE_UINT32;
-      SwapDwords(out, in, d.count);
+    if (d.immediate) {
+      PendingImmediate pending;
+      pending.guest = d.index_guest;
+      pending.index_out = out;
+      pending.index_count = d.count;
+      pending.index_32 = d.index_32;
+      pending.quads = quads;
+      r.pending.push_back(pending);
     } else {
-      auto* dst = reinterpret_cast<uint16_t*>(out);
-      auto* src = reinterpret_cast<const uint16_t*>(in);
-      for (uint32_t i = 0; i < d.count; ++i) dst[i] = _byteswap_ushort(src[i]);
+      WriteIndices(out, Virt(d.index_guest), d.count, d.index_32, quads);
     }
-    index_count = d.count;
   } else if (!quad_indices.empty()) {
     const uint32_t bytes = uint32_t(quad_indices.size() * 2);
     index_offset = UploadAlloc(bytes);
@@ -1941,6 +2087,7 @@ void RendererSwap(uint32_t dev, uint32_t front_texture) {
   }
   Frame& f = *r.f;
   UpdateGammaRamp(dev);
+  EvictTextures();
   FullBarrier(f.main_cb);
   vk.vkEndCommandBuffer(f.upload_cb);
   bool submitted = false;
@@ -2031,13 +2178,13 @@ void RendererLogStats(uint64_t swaps) {
       "NG2 NATIVE frames={} drawn/f={:.1f} passes/f={:.1f} no_vs={} no_ps={} no_pipe={} no_target={} "
       "bad_prim={} heap_mb/f={:.1f} upload_mb/f={:.1f} textures={} tex_miss={} resolves/f={:.1f} "
       "skipped={} msaa={} upload_full={} pipelines={} surfaces={} resolved={} image_mb={} bad_mode={} "
-      "indexed={}",
+      "indexed={} tex_mb={} reloads={} evicted={}",
       g_s.frames, float(g_s.drawn) / n, float(g_s.passes) / n, g_s.no_vs, g_s.no_ps, g_s.no_pipeline,
       g_s.no_target, g_s.prim_unsupported, float(g_s.heap_bytes) / n / 1048576.0f,
       float(g_s.upload_bytes) / n / 1048576.0f, g_s.textures, g_s.texture_misses,
       float(g_s.resolves) / n, g_s.resolves_skipped, g_s.msaa_surfaces, g_s.upload_full,
       r.pipelines.size(), r.surfaces.size(), r.resolved.size(), r.image_bytes >> 20, g_s.bad_mode,
-      g_s.indexed_seen);
+      g_s.indexed_seen, r.texture_bytes >> 20, g_s.texture_reloads, g_s.texture_evictions);
 }
 
 }  // namespace ng2::native

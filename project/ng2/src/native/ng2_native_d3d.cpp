@@ -172,10 +172,27 @@ extern "C" REX_FUNC(sub_83761488) {
   if (draw.immediate_guest) ng2::native::RendererDraw(draw);
 }
 
-// BeginIndexedVertices: the library's own path; 0 per frame in gameplay. Not drawn yet.
+// BeginIndexedVertices(dev, prim, base vertex, vertices, indices, format, stride, void** index data,
+// [sp+84] void** vertex data); r3 = 0 on success. Format bit 2 means 32-bit indices. As with
+// BeginVertices the engine fills both after the call and there is no End to hook.
 extern "C" REX_FUNC(sub_83761928) {
-  if (NativeOn()) g_stats.begins.fetch_add(1, std::memory_order_relaxed);
+  if (!NativeOn()) return __imp__sub_83761928(ctx, base);
+  g_stats.begins.fetch_add(1, std::memory_order_relaxed);
+  ng2::native::DrawCall draw;
+  draw.dev = ctx.r3.u32;
+  draw.prim = ctx.r4.u32;
+  draw.count = ctx.r7.u32;
+  draw.indexed = true;
+  draw.immediate = true;
+  draw.index_32 = (ctx.r8.u32 & 4) != 0;
+  draw.immediate_dwords = (ctx.r6.u32 * ctx.r9.u32 + 3) / 4;
+  const uint32_t index_out = ctx.r10.u32, vertex_out = Load(ctx.r1.u32 + 84);
+  ng2::native::RendererDrainImmediate();
   __imp__sub_83761928(ctx, base);
+  if (ctx.r3.u32) return;
+  draw.index_guest = Load(index_out);
+  draw.immediate_guest = Load(vertex_out);
+  if (draw.index_guest && draw.immediate_guest) ng2::native::RendererDraw(draw);
 }
 
 // ---- Targets --------------------------------------------------------------------------------
