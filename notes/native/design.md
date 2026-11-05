@@ -81,7 +81,7 @@ To run it: `--gpu_backend=vulkan --ng2_native_d3d=true`. D3D12 stays the default
 **Done**
 - Game runs with no PM4 reaching the command processor and no EDRAM: gameplay, menus, movies, the New Game cutscene, Mission Mode.
 - Image against D3D12: courtyard 0.41-0.50/255, post-movie 2x session 0.65/255, 4x 0.66/255.
-- Performance at 8x (the fair test): native 7.4 ms at 60 fps, 47% GPU; D3D12 16.7 ms at 56 fps, 100% GPU. At equal clocks in a light scene: 1.37 ms against 5.39 ms. At 5x the same 60 fps takes 87 W against 220 W.
+- Performance at true 7x (the fair test; D3D12 is capped at 7x by the SDK, so its earlier "8x" was 7x, #148): native 6.07 ms at 60 fps, 40% GPU, 144 W; D3D12 16.71 ms at 56 fps, 100% GPU, 225 W. Native at 8x: 7.4 ms, 60 fps, 47% GPU. Native at 10x: 12-22 ms, 59-60 fps, 8.2-10.2 GB VRAM. At equal clocks in a light scene: 1.37 ms against 5.39 ms. At 5x the same 60 fps takes 87 W against 220 W.
 - All shaders work: 634 precompiled, anything else is translated on first use, so a missing shader no longer drops geometry.
 - All 52,505 disk textures load; signed formats, sampler settings, reload and freeing are in.
 - FSR, CAS, FXAA, ultrawide, frame generation, live resolution change, the Recomp Settings pane.
@@ -93,7 +93,7 @@ To run it: `--gpu_backend=vulkan --ng2_native_d3d=true`. D3D12 stays the default
 **Partly done**
 - Story coverage: 44 of 58 stage ids load and render on both renderers with no misses and no dropped draws. They can't be reported by chapter (#145): only stage 9 = Ch. 1 and stage 0xB = Ch. 3 are established. These runs start a stage with the player falling in, so they are not a playthrough.
 - PM4 removal: the draw functions are gone; `sub_83768758` and the library's Swap still write small packets into memory nothing reads (0.06 ms per frame), and the idle command processor thread remains. Removing them means reimplementing vertex shader patching.
-- VRAM: 2936 MB against D3D12 2662 MB at 4x, 5900 MB against 4991 MB at 8x.
+- VRAM: 2936 MB against D3D12 2662 MB at 4x; 4975 MB against 5003 MB at true 7x.
 
 **Not done or unknown**
 - Fullscreen on native has not been seen in a capture: screenshots are black on any Vulkan fullscreen. Only the 60/120 present rates are confirmed.

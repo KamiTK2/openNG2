@@ -50,6 +50,13 @@ int CurrentPromptStyle();  // ps_prompts.cpp
 bool PromptsUseKeyboard();
 
 namespace {
+// Only the native renderer goes past 5x: the emulated path is limited to 7x by the SDK.
+int MaxResolutionScale() {
+  return rex::cvar::GetFlagByName("ng2_native_d3d") == "true" &&
+                 rex::cvar::GetFlagByName("gpu_backend") == "vulkan"
+             ? 10
+             : 5;
+}
 
 // ---- helpers -----------------------------------------------------------------------
 
@@ -702,7 +709,7 @@ bool RecompSettings::Load(const std::filesystem::path& path) {
     // `present_vsync` = host present sync. The old `vsync` key (guest vblank) is ignored.
     else if (k == "present_vsync") vsync = ParseBool(v, vsync);
     else if (k == "monitor") monitor = ParseInt(v, monitor, 0, 16);
-    else if (k == "resolution_scale") resolution_scale = ParseInt(v, resolution_scale, 1, 5);
+    else if (k == "resolution_scale") resolution_scale = ParseInt(v, resolution_scale, 1, 10);
     else if (k == "swap_post_effect") anti_aliasing = AaFromCvar(v);
     else if (k == "present_effect") upscaler = UpscalerFromCvar(v);
     else if (k == "ng2_sharpness") sharpness = ParseInt(v, sharpness, 0, 10);
@@ -1198,7 +1205,7 @@ RecompOptionsPane::RecompOptionsPane(rex::ui::ImGuiDrawer* drawer, rex::ui::Wind
   settings_.Load(settings_path_);
   // Show what this session actually runs with (may come from the command line).
   settings_.resolution_scale =
-      std::clamp(std::atoi(rex::cvar::GetFlagByName("resolution_scale").c_str()), 1, 5);
+      std::clamp(std::atoi(rex::cvar::GetFlagByName("resolution_scale").c_str()), 1, MaxResolutionScale());
   settings_.monitor = std::clamp(std::atoi(rex::cvar::GetFlagByName("monitor").c_str()), 0, 16);
   settings_.anti_aliasing = AaFromCvar(rex::cvar::GetFlagByName("swap_post_effect"));
   // Upscaling is live, but show what is running (it may come from the command line).
@@ -1784,7 +1791,7 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
                         }});
       }
       std::snprintf(buf, sizeof(buf), "%dx", s.resolution_scale);
-      step_row("Internal Resolution", buf, s.resolution_scale, 1, 5, 1,
+      step_row("Internal Resolution", buf, s.resolution_scale, 1, MaxResolutionScale(), 1,
                [&s](int v) { s.resolution_scale = v; });
       const char* aa[] = {"Off", "FXAA", "FXAA Extreme"};
       step_row("Anti-Aliasing", aa[s.anti_aliasing], s.anti_aliasing, 0, 2, 1,

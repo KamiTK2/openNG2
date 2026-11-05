@@ -3183,7 +3183,7 @@ index 765c141..1774c86 100644
        if (edram_fragment_shader_interlock_) {
          // Write the color to the target in the EDRAM only it was written on the
 diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
-index 76f5600..ce34e70 100644
+index 76f5600..cc31ce8 100644
 --- a/src/graphics/pipeline/texture/cache.cpp
 +++ b/src/graphics/pipeline/texture/cache.cpp
 @@ -9,6 +9,7 @@
@@ -3194,6 +3194,15 @@ index 76f5600..ce34e70 100644
  #include <algorithm>
  #include <cstdint>
  #include <utility>
+@@ -74,7 +75,7 @@ REXCVAR_DEFINE_INT32(draw_resolution_scale_y, 1, "GPU", "Draw resolution scale Y
+ REXCVAR_DEFINE_INT32(resolution_scale, 1, "GPU",
+                      "Draw resolution scale for both X and Y axes (same as setting "
+                      "draw_resolution_scale_x and draw_resolution_scale_y)")
+-    .range(1, 8)
++    .range(1, 10)
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+ REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
 @@ -446,6 +447,11 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
    // not up to date anymore.
    texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());

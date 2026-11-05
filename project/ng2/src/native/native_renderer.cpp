@@ -174,6 +174,7 @@ struct Fn {
 #undef NG2_F
 } vk;
 
+constexpr int kMaxScale = 10;
 std::atomic<int> g_desired_scale{1};
 
 struct Image {
@@ -261,6 +262,7 @@ struct R {
   VkCommandPool cmd_pool = VK_NULL_HANDLE;
   VkQueryPool queries = VK_NULL_HANDLE;
   float timestamp_ms = 0, timestamp_period = 1.0f;
+  uint32_t max_image_dimension = 16384;
   uint32_t timestamp_frames = 0;
   Frame frames[kFrames];
   uint32_t frame_index = 0;
@@ -421,6 +423,20 @@ VkFormat SignedViewFormat(VkFormat format) {
     default:
       return format;
   }
+}
+
+// A surface that the device can't make at this scale (too large, or out of memory) lowers the
+// scale for the session: the next frame recreates everything smaller instead of dropping draws.
+bool FitsDevice(uint32_t unscaled_width, uint32_t unscaled_height) {
+  return std::max(unscaled_width, unscaled_height) * r.scale <= r.max_image_dimension;
+}
+
+void ReduceScale(uint32_t unscaled_width, uint32_t unscaled_height) {
+  const uint32_t fit = r.max_image_dimension / std::max({unscaled_width, unscaled_height, 1u});
+  const int lower = int(std::clamp(std::min(fit, r.scale - 1), 1u, r.scale));
+  if (r.scale <= 1 || lower >= g_desired_scale.load()) return;
+  g_desired_scale = lower;
+  REXLOG_WARN("NG2 NATIVE: internal resolution {}x does not fit this device, using {}x", r.scale, lower);
 }
 
 bool MakeImage(Image& out, VkFormat format, uint32_t width, uint32_t height, uint32_t levels,
@@ -640,7 +656,7 @@ bool Init() {
   r.device = provider->vulkan_device();
   r.presenter = graphics->presenter();
   r.vma = rex::ui::vulkan::CreateVmaAllocator(r.device, false);
-  r.scale = uint32_t(std::clamp(std::atoi(rex::cvar::GetFlagByName("resolution_scale").c_str()), 1, 8));
+  r.scale = uint32_t(std::clamp(std::atoi(rex::cvar::GetFlagByName("resolution_scale").c_str()), 1, kMaxScale));
   g_desired_scale = int(r.scale);
   rex::cvar::RegisterChangeCallback("resolution_scale", [](std::string_view, std::string_view value) {
     g_desired_scale = std::atoi(std::string(value).c_str());
@@ -652,6 +668,7 @@ bool Init() {
   VkPhysicalDeviceProperties device_properties;
   ifn.vkGetPhysicalDeviceProperties(r.device->physical_device(), &device_properties);
   r.timestamp_period = device_properties.limits.timestampPeriod;
+  r.max_image_dimension = device_properties.limits.maxImageDimension2D;
 #define NG2_F(name)                                                           \
   vk.name = reinterpret_cast<PFN_##name>(ifn.vkGetDeviceProcAddr(r.dev, #name)); \
   if (!vk.name) REXLOG_ERROR("NG2 NATIVE: no device function " #name);
@@ -818,7 +835,7 @@ void DestroyScaledImage(Image& image) {
 // resolution_scale changed (Recomp Settings applies it live): everything sized by the scale is
 // recreated on demand. Happens between frames; the next frame's history is simply gone.
 void ApplyResolutionScale() {
-  const uint32_t want = uint32_t(std::clamp(g_desired_scale.load(), 1, 8));
+  const uint32_t want = uint32_t(std::clamp(g_desired_scale.load(), 1, kMaxScale));
   if (want == r.scale) return;
   for (Frame& frame : r.frames) vk.vkWaitForFences(r.dev, 1, &frame.fence, VK_TRUE, UINT64_MAX);
   REXLOG_INFO("NG2 NATIVE: internal resolution {}x -> {}x", r.scale, want);
@@ -1044,9 +1061,11 @@ Surface* GetSurface(uint32_t guest, bool depth) {
   const VkImageUsageFlags usage =
       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
       (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
-  if (!MakeImage(s.image, format, width * r.scale * s.msaa_x, height * r.scale * s.msaa_y, 1, usage, 1, 0,
+  if (!FitsDevice(width * s.msaa_x, height * s.msaa_y) ||
+      !MakeImage(s.image, format, width * r.scale * s.msaa_x, height * r.scale * s.msaa_y, 1, usage, 1, 0,
                  VK_IMAGE_TYPE_2D, true)) {
-    REXLOG_ERROR("NG2 NATIVE: surface {:08X} {}x{} failed", guest, width, height);
+    REXLOG_ERROR("NG2 NATIVE: surface {:08X} {}x{} failed at {}x", guest, width, height, r.scale);
+    ReduceScale(width * s.msaa_x, height * s.msaa_y);
     r.surfaces.erase(key);
     return nullptr;
   }
@@ -2170,7 +2189,11 @@ Image* GetResolvedImage(uint32_t texture) {
   Image image;
   const VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                                   VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-  if (!MakeImage(image, vk_format, width, height, levels, usage, 1, 0, VK_IMAGE_TYPE_2D, true)) return nullptr;
+  if (!FitsDevice(width / r.scale, height / r.scale) ||
+      !MakeImage(image, vk_format, width, height, levels, usage, 1, 0, VK_IMAGE_TYPE_2D, true)) {
+    ReduceScale(width / r.scale, height / r.scale);
+    return nullptr;
+  }
   r.image_bytes += image.bytes;
   ToGeneral(r.f->main_cb, image);
   REXLOG_INFO("NG2 NATIVE resolve target {:08X} {}x{} format {} levels {}", base, width, height,
