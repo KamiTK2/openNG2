@@ -33,6 +33,8 @@ REXCVAR_DEFINE_BOOL(ng2_autopilot_turbo, true, "NG2",
 REXCVAR_DEFINE_INT32(ng2_autopilot_scale_change, 0, "NG2",
                      "NG2 DIAG: 4 s after the goal, set resolution_scale live to this (0 = off)");
 
+REXCVAR_DEFINE_STRING(ng2_autopilot_script, "", "NG2",
+                      "NG2 DIAG: steps on the lists after the main menu, e.g. wwadddda");
 REXCVAR_DEFINE_BOOL(ng2_autopilot_open_pane, false, "NG2",
                     "NG2 DIAG: after the options goal, open the Recomp Settings pane");
 
@@ -64,6 +66,8 @@ struct Autopilot {
   int list_down_done = 0;
   int64_t left_menu_ms = 0;
   int64_t done_ms = 0;
+  size_t script_pos = 0;
+  bool menu_seen = false;
 } g_ap;
 
 void Note(const char* state) {
@@ -145,6 +149,8 @@ void Ng2AutopilotPad(uint32_t user_index, rex::input::X_INPUT_STATE* st) {
     Note("loading");
   } else if (cursor >= 0) {
     Note("main_menu");
+    g_ap.menu_seen = true;
+    g_ap.left_menu_ms = 0;
     const int target = route == "options"    ? 5
                        : cutscene_route      ? 0
                                              : REXCVAR_GET(ng2_autopilot_menu_item);
@@ -164,7 +170,18 @@ void Ng2AutopilotPad(uint32_t user_index, rex::input::X_INPUT_STATE* st) {
     Note(Ng2ChapterScreenUp() ? "chapter_or_slots" : "other");
     if (!g_ap.left_menu_ms) g_ap.left_menu_ms = now;
     const bool in_list_wait = now - g_ap.left_menu_ms < 800;
-    if (g_ap.list_down_done < REXCVAR_GET(ng2_autopilot_list_down)) {
+    // Scripted lists after the main menu: 'd' Down, 'a' A, 'l' Left, 'r' Right, 'w' 300 ms wait.
+    const std::string script = REXCVAR_GET(ng2_autopilot_script);
+    if (g_ap.menu_seen && g_ap.script_pos < script.size()) {
+      if (!in_list_wait && !g_ap.pressing && now >= g_ap.next_press_ms) {
+        const char step = script[g_ap.script_pos++];
+        if (step == 'd') Pulse(now, kDpadDown);
+        else if (step == 'a') Pulse(now, kA);
+        else if (step == 'l') Pulse(now, kDpadLeft);
+        else if (step == 'r') Pulse(now, 0x0008);
+        g_ap.next_press_ms = now + (step == 'w' ? 300 : 200);
+      }
+    } else if (g_ap.list_down_done < REXCVAR_GET(ng2_autopilot_list_down)) {
       if (!in_list_wait && !g_ap.pressing && now >= g_ap.next_press_ms) {
         Pulse(now, kDpadDown);
         g_ap.next_press_ms = now + 150;
