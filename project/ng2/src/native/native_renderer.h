@@ -24,7 +24,7 @@ struct DrawCall {
 
 void RendererDraw(const DrawCall& draw);
 void RendererClear(uint32_t dev, uint32_t rect_count, uint32_t rects, uint32_t flags, uint32_t argb,
-                   float z, uint32_t stencil);
+                   float z, uint32_t stencil, uint32_t color_floats = 0);
 void RendererResolve(uint32_t dev, uint32_t flags, uint32_t source_rect, uint32_t texture,
                      uint32_t dest_point, uint32_t level, uint32_t clear_color, float clear_z,
                      uint32_t clear_stencil);

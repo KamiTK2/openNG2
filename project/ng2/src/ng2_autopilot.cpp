@@ -4,6 +4,7 @@
 //   "menu"     stop at the main menu
 //   "options"  open Options from the main menu
 //   "gameplay" load the save: main menu -> ng2_autopilot_menu_item -> ... -> HUD up
+//   "cutscene" NEW GAME, confirming with A only, until a movie or real-time cutscene runs
 // Every state change is logged as "NG2 AUTOPILOT" with milliseconds since launch, and after
 // the goal it logs the presented frame rate; tools/native_test.ps1 reads these lines.
 #define NOMINMAX
@@ -30,6 +31,7 @@ bool Ng2InGameplay();          // ng2_hooks.cpp
 int Ng2MainMenuCursor();       // ng2_hooks.cpp
 bool Ng2LoadingScreenUp();     // ng2_hooks.cpp
 bool Ng2ChapterScreenUp();     // ng2_hooks.cpp
+bool Ng2CutsceneUp();          // ng2_hooks.cpp
 
 namespace {
 
@@ -84,8 +86,10 @@ void Ng2AutopilotPad(uint32_t user_index, rex::input::X_INPUT_STATE* st) {
   const int cursor = Ng2MainMenuCursor();
   const bool gameplay = Ng2InGameplay();
   const bool loading = Ng2LoadingScreenUp();
-  const bool goal_up = route == "menu"    ? cursor >= 0
+  const bool cutscene_route = route == "cutscene";
+  const bool goal_up = route == "menu"      ? cursor >= 0
                        : route == "options" ? g_ap.left_menu == 2
+                       : cutscene_route     ? Ng2CutsceneUp()
                                             : gameplay;
   if (goal_up) {
     if (!g_ap.goal_since_ms) g_ap.goal_since_ms = now;
@@ -101,7 +105,9 @@ void Ng2AutopilotPad(uint32_t user_index, rex::input::X_INPUT_STATE* st) {
     Note("loading");
   } else if (cursor >= 0) {
     Note("main_menu");
-    const int target = route == "options" ? 5 : REXCVAR_GET(ng2_autopilot_menu_item);
+    const int target = route == "options"    ? 5
+                       : cutscene_route      ? 0
+                                             : REXCVAR_GET(ng2_autopilot_menu_item);
     if (route == "options" && cursor == target) g_ap.left_menu = 1;
     if (route != "menu") {
       if (cursor < target) Pulse(now, kDpadDown);
@@ -116,7 +122,7 @@ void Ng2AutopilotPad(uint32_t user_index, rex::input::X_INPUT_STATE* st) {
   } else {
     // Title, save list, costume selection, chapter card, cutscene: A confirms, Start skips.
     Note(Ng2ChapterScreenUp() ? "chapter_or_slots" : "other");
-    if (!goal_up) Pulse(now, kA | kStart);
+    if (!goal_up) Pulse(now, cutscene_route ? kA : kA | kStart);
   }
 
   if (g_ap.pressing && now >= g_ap.press_end_ms) g_ap.pressing = 0;

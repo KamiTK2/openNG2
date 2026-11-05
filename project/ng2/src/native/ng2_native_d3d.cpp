@@ -84,6 +84,14 @@ void WaitForFlip(uint32_t dev) {
   }
 }
 
+// The percentages sub_822F4010 publishes from the frame stamps, and the load-driven fade they steer
+// (notes/native/open_questions.md section 1).
+void LogFrameLoad() {
+  const auto f = [](uint32_t v) { float o; std::memcpy(&o, &v, 4); return o; };
+  REXLOG_INFO("NG2 NATIVE load cpu% {:.1f} gpu% {:.1f} fade {:.3f} skipflag {}", f(Load(0x83C07200)),
+              f(Load(0x83C07200 + 12)), f(Load(0x83C11108)), Load(0x83C07880));
+}
+
 void LogStats() {
   const uint64_t swaps = g_stats.swaps.load();
   if (swaps % 120 != 0) return;
@@ -93,6 +101,7 @@ void LogStats() {
       swaps, g_stats.draws.load(), g_stats.begins.load(), g_stats.clears.load(),
       g_stats.resolves.load(), g_stats.kicks.load(), g_stats.fences.load(),
       g_stats.callbacks.load(), g_stats.drops.load(), g_stats.flip_timeouts.load());
+  LogFrameLoad();
   ng2::native::RendererLogStats(swaps);
 }
 
@@ -195,7 +204,37 @@ extern "C" REX_FUNC(sub_83761928) {
   if (draw.index_guest && draw.immediate_guest) ng2::native::RendererDraw(draw);
 }
 
+// Predicated tiling. Replayed command segments could not work here, so log loudly if it ever runs.
+NG2_IMP(838048E8);
+NG2_IMP(83771E60);
+NG2_IMP(837721D0);
+extern "C" REX_FUNC(sub_838048E8) {
+  if (NativeOn() && (g_stats.swaps.load() % 600) == 0) {
+    REXLOG_INFO("NG2 NATIVE tiling gate obj {:08X} +16 = {}", ctx.r3.u32, Load(ctx.r3.u32 + 16));
+  }
+  __imp__sub_838048E8(ctx, base);
+}
+extern "C" REX_FUNC(sub_83771E60) {
+  if (NativeOn()) REXLOG_WARN("NG2 NATIVE: BeginTiling called");
+  __imp__sub_83771E60(ctx, base);
+}
+extern "C" REX_FUNC(sub_837721D0) {
+  if (NativeOn()) REXLOG_WARN("NG2 NATIVE: EndTiling called");
+  __imp__sub_837721D0(ctx, base);
+}
+
 // ---- Targets --------------------------------------------------------------------------------
+
+// ClearF(dev, flags, rect, float colour[4], f1 z, r8 stencil): the Clear body. Clear itself is
+// replaced below, so this only sees the two callers that go to it directly, sub_83771E60
+// BeginTiling and sub_83772688, which is how the 2x session clears the scene depth (#129).
+NG2_IMP(8375E350);
+extern "C" REX_FUNC(sub_8375E350) {
+  if (!NativeOn()) return __imp__sub_8375E350(ctx, base);
+  g_stats.clears.fetch_add(1, std::memory_order_relaxed);
+  ng2::native::RendererClear(ctx.r3.u32, ctx.r5.u32 ? 1 : 0, ctx.r5.u32, ctx.r4.u32, 0,
+                             float(ctx.f1.f64), ctx.r8.u32, ctx.r6.u32);
+}
 
 // Clear(dev, count, rects, flags, color, z, stencil)
 extern "C" REX_FUNC(sub_8375E290) {

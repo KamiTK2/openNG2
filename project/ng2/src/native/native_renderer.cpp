@@ -185,6 +185,9 @@ struct Surface {
   Image image;
   uint32_t guest = 0, base = 0;  // Guest object, EDRAM base (only for aliased clears, #102).
   bool depth = false;
+  // MSAA surfaces are single-sample images with one pixel per sample: guest 2x doubles the rows,
+  // 4x the rows and columns. The resolve filters them back down.
+  uint32_t msaa_x = 1, msaa_y = 1;
   bool has_pending_clear = false;
   VkClearColorValue pending_clear = {};
 };
@@ -890,20 +893,23 @@ Surface* GetSurface(uint32_t guest, bool depth) {
   const uint32_t height = ((size >> 3) & 0x7FFF) + 1;
   // Formats 3 and 12 are the same bits viewed two ways, so the key is the host format.
   const VkFormat format = depth ? kDepthFormat : ColorFormat((info >> 16) & 0xF);
+  const uint32_t msaa = (surface_info >> 16) & 3;
   const uint64_t key = (uint64_t(info & 0xFFF) << 48) ^ (uint64_t(format) << 32) ^
-                       (uint64_t(width) << 16) ^ (uint64_t(height) << 1) ^ uint64_t(depth);
+                       (uint64_t(width) << 16) ^ (uint64_t(height) << 1) ^ uint64_t(depth) ^
+                       (uint64_t(msaa) << 62);
   const auto found = r.surfaces.find(key);
   if (found != r.surfaces.end()) return &found->second;
-  const uint32_t msaa = (surface_info >> 16) & 3;
   if (msaa) ++g_s.msaa_surfaces;
   Surface& s = r.surfaces[key];
   s.guest = guest;
   s.depth = depth;
   s.base = info & 0xFFF;
+  s.msaa_x = msaa == 2 ? 2 : 1;
+  s.msaa_y = msaa ? 2 : 1;
   const VkImageUsageFlags usage =
       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
       (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
-  if (!MakeImage(s.image, format, width * r.scale, height * r.scale, 1, usage)) {
+  if (!MakeImage(s.image, format, width * r.scale * s.msaa_x, height * r.scale * s.msaa_y, 1, usage)) {
     REXLOG_ERROR("NG2 NATIVE: surface {:08X} {}x{} failed", guest, width, height);
     r.surfaces.erase(key);
     return nullptr;
@@ -1670,21 +1676,25 @@ void RendererDraw(const DrawCall& d) {
   NativeSystemConstants system = {};
   const uint32_t vte = Reg(dev, kPaClVteCntl);
   const float pass_w = float(r.pass_width), pass_h = float(r.pass_height);
-  uint32_t width = UINT32_MAX, height = UINT32_MAX;
+  uint32_t width = UINT32_MAX, height = UINT32_MAX, msaa_x = 1, msaa_y = 1;
   for (Surface* s : color) {
     if (s) {
       width = std::min(width, s->image.width);
       height = std::min(height, s->image.height);
+      msaa_x = s->msaa_x;
+      msaa_y = s->msaa_y;
     }
   }
   if (depth) {
     width = std::min(width, depth->image.width);
     height = std::min(height, depth->image.height);
+    msaa_x = depth->msaa_x;
+    msaa_y = depth->msaa_y;
   }
   (void)pass_w;
   (void)pass_h;
   // Guest pixels: the viewport transform and scissor registers are in them.
-  const float w = float(width / r.scale), h = float(height / r.scale);
+  const float w = float(width / (r.scale * msaa_x)), h = float(height / (r.scale * msaa_y));
   const float sx = (vte & 1) ? RegFloat(dev, kVportXScale) : 1.0f;
   const float ox = (vte & 2) ? RegFloat(dev, kVportXScale + 1) : 0.0f;
   const float sy = (vte & 4) ? RegFloat(dev, kVportXScale + 2) : 1.0f;
@@ -1792,9 +1802,9 @@ void RendererDraw(const DrawCall& d) {
   VkViewport viewport = {0.0f, 0.0f, float(width), float(height), 0.0f, 1.0f};
   vk.vkCmdSetViewport(cb, 0, 1, &viewport);
   const uint32_t tl = Reg(dev, kScissorTl), br = Reg(dev, kScissorBr);
-  const int32_t scale = int32_t(r.scale);
-  int32_t x0 = (tl & 0x7FFF) * scale, y0 = ((tl >> 16) & 0x7FFF) * scale;
-  int32_t x1 = (br & 0x7FFF) * scale, y1 = ((br >> 16) & 0x7FFF) * scale;
+  const int32_t scale_x = int32_t(r.scale * msaa_x), scale_y = int32_t(r.scale * msaa_y);
+  int32_t x0 = (tl & 0x7FFF) * scale_x, y0 = ((tl >> 16) & 0x7FFF) * scale_y;
+  int32_t x1 = (br & 0x7FFF) * scale_x, y1 = ((br >> 16) & 0x7FFF) * scale_y;
   x1 = std::min(x1, int32_t(width));
   y1 = std::min(y1, int32_t(height));
   VkRect2D scissor = {{x0, y0}, {uint32_t(std::max(x1 - x0, 0)), uint32_t(std::max(y1 - y0, 0))}};
@@ -1930,7 +1940,7 @@ bool SameTexelBlock(VkFormat a, VkFormat b) {
 }  // namespace
 
 void RendererClear(uint32_t dev, uint32_t rect_count, uint32_t rects, uint32_t flags, uint32_t argb,
-                   float z, uint32_t stencil) {
+                   float z, uint32_t stencil, uint32_t color_floats) {
   std::lock_guard lock(g_mutex);
   if (!Usable()) return;
   RendererDrainImmediate();
@@ -1940,23 +1950,43 @@ void RendererClear(uint32_t dev, uint32_t rect_count, uint32_t rects, uint32_t f
   (void)rect_count;
   (void)rects;
   VkClearColorValue value = {};
-  value.float32[0] = float((argb >> 16) & 0xFF) / 255.0f;
-  value.float32[1] = float((argb >> 8) & 0xFF) / 255.0f;
-  value.float32[2] = float(argb & 0xFF) / 255.0f;
-  value.float32[3] = float(argb >> 24) / 255.0f;
+  if (color_floats) {
+    for (uint32_t i = 0; i < 4; ++i) {
+      const uint32_t bits = Load(color_floats + i * 4);
+      std::memcpy(&value.float32[i], &bits, 4);
+    }
+  } else {
+    value.float32[0] = float((argb >> 16) & 0xFF) / 255.0f;
+    value.float32[1] = float((argb >> 8) & 0xFF) / 255.0f;
+    value.float32[2] = float(argb & 0xFF) / 255.0f;
+    value.float32[3] = float(argb >> 24) / 255.0f;
+  }
   FullBarrier(r.f->main_cb);
   // Flags: bits 0-3 colour targets, 0x10 stencil, 0x20 depth (seen as 0x3F, 0x1F, 0x30).
   for (uint32_t i = 0; i < 4; ++i) {
     if (!(flags & (1u << i))) continue;
     if (Surface* s = CurrentSurface(dev, i)) ClearColorSurface(*s, value);
   }
-  if (flags & 0x30) {
-    if (Surface* s = GetSurface(Load(dev + kDevDepthSurface), true)) {
-      ClearDepthSurface(*s, z, stencil, flags >> 4);
-    }
+  if (Surface* s = GetSurface(Load(dev + kDevDepthSurface), true)) {
+    // The 2x session asks for colour only (0x0F where the 1x session asks for 0x3F) and no other
+    // clear of this depth surface reaches here, yet the frame needs it cleared (#129). Inferred:
+    // without this, depth from one bad frame blocks the world for good.
+    const bool msaa_scene_clear = (flags & 0xF) == 0xF && s->msaa_y > 1;
+    const uint32_t mask = (flags >> 4) | (msaa_scene_clear ? 2 : 0);
+    if (mask & 3) ClearDepthSurface(*s, z, stencil, mask);
   }
   FullBarrier(r.f->main_cb);
-  if (r.dumping) REXLOG_INFO("NG2 NATIVE CLEAR flags {:X} argb {:08X} z {}", flags, argb, z);
+  if (r.dumping) {
+    REXLOG_INFO("NG2 NATIVE CLEAR flags {:X} argb {:08X} z {} stencil {}", flags, argb, z, stencil);
+    for (uint32_t i = 0; i < 4; ++i) {
+      if (const uint32_t rt = Load(dev + kDevRenderTargets + i * 4)) {
+        REXLOG_INFO("NG2 NATIVE   clear rt{} {:08X} info {:08X} surface_info {:08X}", i, rt, Load(rt + 28), Load(rt + 24));
+      }
+    }
+    if (const uint32_t ds = Load(dev + kDevDepthSurface)) {
+      REXLOG_INFO("NG2 NATIVE   clear depth {:08X} info {:08X} surface_info {:08X}", ds, Load(ds + 28), Load(ds + 24));
+    }
+  }
 }
 
 void RendererResolve(uint32_t dev, uint32_t flags, uint32_t source_rect, uint32_t texture,
@@ -1979,10 +2009,11 @@ void RendererResolve(uint32_t dev, uint32_t flags, uint32_t source_rect, uint32_
   if (source && dest) {
     int32_t x0 = 0, y0 = 0, x1 = int32_t(source->image.width), y1 = int32_t(source->image.height);
     if (source_rect) {
-      x0 = int32_t(Load(source_rect)) * int32_t(r.scale);
-      y0 = int32_t(Load(source_rect + 4)) * int32_t(r.scale);
-      x1 = int32_t(Load(source_rect + 8)) * int32_t(r.scale);
-      y1 = int32_t(Load(source_rect + 12)) * int32_t(r.scale);
+      const int32_t sx = int32_t(r.scale * source->msaa_x), sy = int32_t(r.scale * source->msaa_y);
+      x0 = int32_t(Load(source_rect)) * sx;
+      y0 = int32_t(Load(source_rect + 4)) * sy;
+      x1 = int32_t(Load(source_rect + 8)) * sx;
+      y1 = int32_t(Load(source_rect + 12)) * sy;
     }
     int32_t dx = 0, dy = 0;
     if (dest_point) {
@@ -1991,14 +2022,15 @@ void RendererResolve(uint32_t dev, uint32_t flags, uint32_t source_rect, uint32_
     }
     const int32_t dest_w = int32_t(std::max(dest->width >> level, 1u));
     const int32_t dest_h = int32_t(std::max(dest->height >> level, 1u));
-    x1 = std::min({x1, int32_t(source->image.width), x0 + dest_w - dx});
-    y1 = std::min({y1, int32_t(source->image.height), y0 + dest_h - dy});
+    x1 = std::min({x1, int32_t(source->image.width), x0 + (dest_w - dx) * int32_t(source->msaa_x)});
+    y1 = std::min({y1, int32_t(source->image.height), y0 + (dest_h - dy) * int32_t(source->msaa_y)});
+    const bool msaa_source = source->msaa_x > 1 || source->msaa_y > 1;
     if (x1 > x0 && y1 > y0) {
       const VkImageAspectFlags aspect = from_depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
       if (from_depth != dest->depth) {
         ++g_s.resolves_skipped;
-      } else if (source->image.format == dest->format ||
-                 SameTexelBlock(source->image.format, dest->format)) {
+      } else if (!msaa_source && (source->image.format == dest->format ||
+                                  SameTexelBlock(source->image.format, dest->format))) {
         VkImageCopy copy = {};
         copy.srcSubresource = {aspect, 0, 0, 1};
         copy.srcOffset = {x0, y0, 0};
@@ -2014,13 +2046,18 @@ void RendererResolve(uint32_t dev, uint32_t flags, uint32_t source_rect, uint32_
         blit.srcOffsets[1] = {x1, y1, 1};
         blit.dstSubresource = {aspect, level, 0, 1};
         blit.dstOffsets[0] = {dx, dy, 0};
-        blit.dstOffsets[1] = {dx + x1 - x0, dy + y1 - y0, 1};
+        blit.dstOffsets[1] = {dx + (x1 - x0) / int32_t(source->msaa_x),
+                              dy + (y1 - y0) / int32_t(source->msaa_y), 1};
+        // All fragments averages the samples; a single fragment (flags 0x10, 0x20) and depth take
+        // one sample per pixel.
+        const bool one_sample = from_depth || (flags & 0x30);
         vk.vkCmdBlitImage(cb, source->image.image, VK_IMAGE_LAYOUT_GENERAL, dest->image,
-                          VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_NEAREST);
+                          VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
+                          one_sample || !msaa_source ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
       }
       if (r.dumping) {
-        REXLOG_INFO("NG2 NATIVE RESOLVE #{} rt {} {} -> {:08X} fmt {} -> {} rect {} {} {} {}",
-                    r.resolve_index, which, source->guest, Load(texture + 28 + 4), int(source->image.format),
+        REXLOG_INFO("NG2 NATIVE RESOLVE #{} flags {:X} rt {} {} -> {:08X} fmt {} -> {} rect {} {} {} {}",
+                    r.resolve_index, flags, which, source->guest, Load(texture + 28 + 4), int(source->image.format),
                     int(dest->format), x0, y0, x1, y1);
       }
       if (int32_t(r.resolve_index) == REXCVAR_GET(ng2_native_show_resolve)) r.show_override = dest;

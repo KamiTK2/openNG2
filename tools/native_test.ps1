@@ -8,16 +8,17 @@
 #
 # Usage: powershell -File tools\native_test.ps1 -Name t1 [-Route gameplay|menu|options]
 #          [-Backend d3d12|vulkan] [-Scale 1] [-MeasureSec 15] [-TimeoutSec 60]
-#          [-Cvars 'a=1','b=true'] [-PulseMs 50] [-Shots 1]
+#          [-Cvars 'a=1','b=true'] [-PulseMs 50] [-Shots 1] [-Movies]
 # Results: one line per run in notes\logs\native\results.csv; files in notes\logs\native\<name>\.
 param(
   [Parameter(Mandatory)] [string]$Name,
-  [ValidateSet('gameplay', 'menu', 'options')] [string]$Route = 'gameplay',
+  [ValidateSet('gameplay', 'menu', 'options', 'cutscene')] [string]$Route = 'gameplay',
   [ValidateSet('d3d12', 'vulkan')] [string]$Backend = 'd3d12',
   [int]$Scale = 1,
   [int]$MeasureSec = 15,
   [int]$TimeoutSec = 60,
   [string[]]$Cvars = @(),
+  [switch]$Movies,   # let the boot movie play (it is skipped by the autopilot's Start) instead of Skip Intro
   [int]$PulseMs = 0,
   [int]$Shots = 1,
   [string]$Preset = 'win-amd64-relwithdebinfo'
@@ -83,6 +84,8 @@ $overrides = [ordered]@{
   ng2_fast_loading = 'true'; ng2_window_width = '1280'; ng2_window_height = '720'
   ng2_window_x = '0'; ng2_window_y = '0'
 }
+if ($Movies) { $overrides['ng2_skip_intro'] = 'false' }
+if ($Route -eq 'cutscene') { $overrides['ng2_skip_any_cutscene'] = 'false' }
 $settingsFile = Join-Path $sandbox 'recomp_settings.toml'
 $lines = Get-Content $settingsFile | Where-Object { $overrides.Keys -notcontains (($_ -split '=')[0].Trim()) }
 $lines += $overrides.GetEnumerator() | ForEach-Object { "$($_.Key) = $($_.Value)" }

@@ -1186,6 +1186,12 @@ extern "C" REX_FUNC(sub_836602D0) {
 // the hook sets the seen byte when the button is pressed (the event then ends and would be
 // marked seen anyway) and the game skips it itself (findings #48).
 REXCVAR_DEFINE_BOOL(ng2_skip_any_cutscene, true, "NG2", "Let any cutscene be skipped");
+// A movie scene or a real-time cutscene in its skippable state (test autopilot).
+bool Ng2CutsceneUp() {
+  auto* mem = REX_KERNEL_STATE()->memory();
+  const uint16_t event_skip = rex::memory::load_and_swap<uint16_t>(mem->TranslateVirtual(0x84A69AEA));
+  return event_skip == 1 || int32_t(GuestLoadU32(0x84C5580C)) > 0;
+}
 void Ng2SkipCutsceneFrame() {
   if (!REXCVAR_GET(ng2_skip_any_cutscene)) return;
   constexpr uint32_t kMovieState = 0x84C5580C;   // > 0 while the movie scene runs
