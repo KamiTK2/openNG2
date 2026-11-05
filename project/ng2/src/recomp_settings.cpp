@@ -443,12 +443,16 @@ SIZE OuterSizeFor(HWND h, int cw, int ch) {
 struct Viewport {
   float x, y, w, h;
 };
+double g_picture_aspect = 16.0 / 9.0;  // The aspect ratio in use, set each frame.
 Viewport GameViewport(const ImGuiIO& io) {
   // Always 16:9: on ultrawide the game's menus are kept at 16:9 in the centre (2D squeeze,
-  // findings #32-#35), so the pane follows the same frame.
+  // findings #32-#35), so the pane follows the same frame. An aspect ratio wider than the window
+  // letterboxes the picture, and that frame takes the picture's height, not the window's.
   const float aspect = 16.0f / 9.0f;
-  float w = std::min(io.DisplaySize.x, io.DisplaySize.y * aspect);
-  float h = w / aspect;
+  const float picture = std::max(float(g_picture_aspect), aspect);
+  const float picture_w = std::min(io.DisplaySize.x, io.DisplaySize.y * picture);
+  const float h = picture_w / picture;
+  const float w = h * aspect;
   return {(io.DisplaySize.x - w) * 0.5f, (io.DisplaySize.y - h) * 0.5f, w, h};
 }
 
@@ -1678,7 +1682,13 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
   pad_.Poll();
   DrawShaderProgress(io);
   current_aspect_ = AspectForMode(settings_.aspect_mode, io.DisplaySize.x, io.DisplaySize.y);
+  g_picture_aspect = current_aspect_;
   native::SetOutputSize(int(io.DisplaySize.x), int(io.DisplaySize.y), current_aspect_);
+  // FSR 1.0 stays for D3D12 and for PCs that can't run FSR. Elsewhere FSR replaces it.
+  if (NativeRendererRunning() && settings_.upscaler == 1 && native::UpscalerAvailable(2)) {
+    settings_.upscaler = kUpscalerFsrTemporal;
+    ApplyAndSave();
+  }
   // A size from another aspect ratio's list moves to the nearest one in this list.
   if (NativeRendererRunning() && settings_.internal_height > 0) {
     const std::vector<RenderSize> sizes = RenderSizesFor(current_aspect_);
@@ -1960,8 +1970,11 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
                [&s](int v) { s.anti_aliasing = v; });
       // Available choices in order; FSR and DLSS need the native renderer, DLSS an NVIDIA GPU.
       static const char* const kUpscalers[] = {"Bilinear", "FSR 1.0", "CAS", "FSR", "DLSS"};
-      int choices[5] = {0, 1, 2}, choice_count = 3, choice = 0;
-      if (NativeRendererRunning() && native::UpscalerAvailable(2)) choices[choice_count++] = kUpscalerFsrTemporal;
+      const bool fsr_available = NativeRendererRunning() && native::UpscalerAvailable(2);
+      int choices[5] = {0}, choice_count = 1, choice = 0;
+      if (!fsr_available) choices[choice_count++] = 1;  // FSR 1.0
+      choices[choice_count++] = 2;
+      if (fsr_available) choices[choice_count++] = kUpscalerFsrTemporal;
       if (NativeRendererRunning() && native::UpscalerAvailable(1)) choices[choice_count++] = kUpscalerDlss;
       for (int i = 0; i < choice_count; ++i) {
         if (choices[i] == s.upscaler) choice = i;
@@ -2432,7 +2445,7 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
                 ? "Render sizes above 1x may slow the game depending on your hardware."
                 : s.upscaler >= kUpscalerFsrTemporal
                       ? "The size FSR or DLSS outputs. Upscaling Quality sets how much of it is rendered."
-                      : "Above your screen is supersampling, below it lets FSR 1.0 upscale.",
+                      : "Above your screen is supersampling, below it runs faster.",
             false, note_px);
     fy += note_px * 1.5f;
   }

@@ -292,3 +292,8 @@ g2_trace_karmaon.txt`, `ng2_trace_karmaoff.txt`; generated code of the named fun
 
 - observed: stepping the row in the sandbox on a 16:9 window: Ultra set Match Window, DLSS, DLAA, FXAA off; High on the way rendered 853x365 -> 1279x548 with Aspect Ratio 21:9.
 - observed, not new code: with a fixed Aspect Ratio wider than the window, the picture letterboxes and the Recomp Settings rows keep the full window's layout, so they overlap the Options title. Not fixed.
+
+## #155: FSR 1.0 hidden on Vulkan, Recomp Settings aligned when letterboxed
+
+- decision (user): FSR 1.0 leaves the Vulkan list when FSR can run, and a saved FSR 1.0 becomes FSR. It stays on D3D12 and as the fallback.
+- fix: GameViewport took the 16:9 frame from the window. With an aspect ratio wider than the window the picture is letterboxed, so the frame now takes the picture's height. This corrects the note in #154.
