@@ -5,8 +5,9 @@
 // the segment kick is dropped, GPU fences and callbacks complete at once, and draws, clears,
 // resolves and swaps go to native_renderer.cpp, which reads state from the guest device struct.
 //
-// The library's setters and draw functions still write into their own command segment memory.
-// Those segments are recycled and never read by anything.
+// The draw functions no longer run: only the part of the state flush with an effect beyond the
+// ring is kept (NativeFlush). What still writes command segment memory, which nothing reads, is
+// sub_83768758's shader load packets and the library's Swap.
 #include <windows.h>
 
 #include <atomic>
@@ -41,6 +42,18 @@ constexpr uint32_t kDevFlipRequests = 16548;  // pre-swap callbacks seen
 constexpr uint32_t kDevFlips = 16552;         // flips done (callback or vblank handler)
 
 constexpr uint32_t kDevIndexBuffer = 12428;   // guest index buffer object
+
+// Time in the recompiled library draw functions, for the PM4 removal (design.md).
+std::atomic<uint64_t> g_library_draw_ticks{0};
+struct DrawTimer {
+  LARGE_INTEGER t0;
+  DrawTimer() { QueryPerformanceCounter(&t0); }
+  ~DrawTimer() {
+    LARGE_INTEGER t1;
+    QueryPerformanceCounter(&t1);
+    g_library_draw_ticks.fetch_add(uint64_t(t1.QuadPart - t0.QuadPart), std::memory_order_relaxed);
+  }
+};
 
 struct Stats {
   std::atomic<uint64_t> swaps{0}, draws{0}, begins{0}, clears{0}, resolves{0}, kicks{0}, fences{0},
@@ -102,6 +115,15 @@ void LogStats() {
       g_stats.resolves.load(), g_stats.kicks.load(), g_stats.fences.load(),
       g_stats.callbacks.load(), g_stats.drops.load(), g_stats.flip_timeouts.load());
   LogFrameLoad();
+  {
+    LARGE_INTEGER frequency;
+    QueryPerformanceFrequency(&frequency);
+    static uint64_t last_ticks = 0;
+    const uint64_t ticks = g_library_draw_ticks.load();
+    REXLOG_INFO("NG2 NATIVE library draw cpu {:.3f} ms/frame",
+                double(ticks - last_ticks) * 1000.0 / double(frequency.QuadPart) / 120.0);
+    last_ticks = ticks;
+  }
   ng2::native::RendererLogStats(swaps);
 }
 
@@ -110,6 +132,7 @@ void LogStats() {
 #define NG2_IMP(addr) extern "C" REX_FUNC(__imp__sub_##addr)
 
 NG2_IMP(83762240);
+NG2_IMP(83768758);
 NG2_IMP(83761E58);
 NG2_IMP(83761488);
 NG2_IMP(83761928);
@@ -125,10 +148,62 @@ NG2_IMP(8375F428);
 NG2_IMP(8375F7C0);
 
 // ---- Draws ----------------------------------------------------------------------------------
-//
-// The recompiled draw functions still run first: they flush the dirty state into the device struct
-// and patch vertex shader ucode per declaration. Their command packets land in segment memory that
-// is never submitted.
+
+namespace {
+
+uint64_t Load64(uint32_t guest) { return rex::memory::load_and_swap<uint64_t>(Host(guest)); }
+void Store64(uint32_t guest, uint64_t value) { rex::memory::store_and_swap<uint64_t>(Host(guest), value); }
+uint8_t Load8(uint32_t guest) { return *Host(guest); }
+void Store8(uint32_t guest, uint8_t value) { *Host(guest) = value; }
+
+// The library's draw prologue minus the ring (notes/native/open_questions.md section 3).
+// sub_83768758 is kept: it picks the per-declaration vertex shader patch (sub_83768618), and updates
+// shadows the renderer reads (+10560 through sub_83767088, +10580, +12692). Dirty masks are cleared
+// exactly where the library clears them; nothing else reads them.
+void NativeFlush(PPCContext& ctx, uint8_t* base, uint32_t dev) {
+  const uint64_t state = Load64(dev + 16);
+  Store64(dev + 0, 0);
+  Store64(dev + 8, 0);
+  if (state & 0x1E0000) {
+    ctx.r3.u64 = dev;
+    ctx.r4.u64 = state;
+    __imp__sub_83768758(ctx, base);
+  }
+  Store64(dev + 16, 0);
+  Store64(dev + 24, 0);
+  Store64(dev + 32, 0);
+}
+
+// Immediate vertices: the engine fills what Begin returns, and the renderer copies it at the next
+// D3D entry, so one bump buffer in guest memory is enough. Replaces the ring segment.
+constexpr uint32_t kScratchBytes = 32u << 20;
+uint32_t g_scratch = 0, g_scratch_used = 0;
+uint32_t ScratchAlloc(uint32_t bytes) {
+  if (!g_scratch) g_scratch = REX_KERNEL_STATE()->memory()->SystemHeapAlloc(kScratchBytes, 4096);
+  bytes = (bytes + 15) & ~15u;
+  if (bytes > kScratchBytes) return 0;
+  if (g_scratch_used + bytes > kScratchBytes) g_scratch_used = 0;
+  const uint32_t guest = g_scratch + g_scratch_used;
+  g_scratch_used += bytes;
+  return guest;
+}
+
+// Begin's stride goes into the declaration key for the vertex shader patch, around the flush.
+void FlushImmediate(PPCContext& ctx, uint8_t* base, uint32_t dev, uint32_t stride) {
+  const uint8_t saved = Load8(dev + 12520), wanted = uint8_t(stride >> 2);
+  Store8(dev + 12520, wanted);
+  if (wanted != Load8(dev + 11824) && Load(dev + 12688)) Store64(dev + 16, Load64(dev + 16) | 0x80000);
+  NativeFlush(ctx, base, dev);
+  Store8(dev + 12520, saved);
+}
+
+// The End is inlined: it copies +13428 to the cursor. Nothing moved, so it changes nothing.
+void FinishBegin(uint32_t dev) {
+  Store(dev + 13428, Load(dev + kDevCursor));
+  Store64(dev + 24, Load64(dev + 24) | 1);
+}
+
+}  // namespace
 
 // DrawIndexedVertices(dev, _, _, start index, index count). Triangle strips (folded by the linker).
 extern "C" REX_FUNC(sub_83762240) {
@@ -136,7 +211,7 @@ extern "C" REX_FUNC(sub_83762240) {
   g_stats.draws.fetch_add(1, std::memory_order_relaxed);
   const uint32_t dev = ctx.r3.u32, start = ctx.r6.u32, count = ctx.r7.u32;
   ng2::native::RendererDrainImmediate();
-  __imp__sub_83762240(ctx, base);
+  { DrawTimer timer; NativeFlush(ctx, base, dev); }
   const uint32_t buffer = Load(dev + kDevIndexBuffer);
   const uint32_t common = Load(buffer);
   ng2::native::DrawCall draw;
@@ -160,7 +235,7 @@ extern "C" REX_FUNC(sub_83761E58) {
   draw.first_vertex = ctx.r5.u32;
   draw.count = ctx.r6.u32;
   ng2::native::RendererDrainImmediate();
-  __imp__sub_83761E58(ctx, base);
+  { DrawTimer timer; NativeFlush(ctx, base, draw.dev); }
   ng2::native::RendererDraw(draw);
 }
 
@@ -175,9 +250,12 @@ extern "C" REX_FUNC(sub_83761488) {
   draw.count = ctx.r5.u32;
   draw.immediate = true;
   draw.immediate_dwords = (ctx.r5.u32 * ctx.r6.u32 + 3) / 4;
+  const uint32_t stride = ctx.r6.u32;
   ng2::native::RendererDrainImmediate();
-  __imp__sub_83761488(ctx, base);
-  draw.immediate_guest = ctx.r3.u32;
+  { DrawTimer timer; FlushImmediate(ctx, base, draw.dev, stride); }
+  draw.immediate_guest = ScratchAlloc(draw.immediate_dwords * 4);
+  FinishBegin(draw.dev);
+  ctx.r3.u64 = draw.immediate_guest;
   if (draw.immediate_guest) ng2::native::RendererDraw(draw);
 }
 
@@ -196,11 +274,15 @@ extern "C" REX_FUNC(sub_83761928) {
   draw.index_32 = (ctx.r8.u32 & 4) != 0;
   draw.immediate_dwords = (ctx.r6.u32 * ctx.r9.u32 + 3) / 4;
   const uint32_t index_out = ctx.r10.u32, vertex_out = Load(ctx.r1.u32 + 84);
+  const uint32_t stride = ctx.r9.u32;
   ng2::native::RendererDrainImmediate();
-  __imp__sub_83761928(ctx, base);
-  if (ctx.r3.u32) return;
-  draw.index_guest = Load(index_out);
-  draw.immediate_guest = Load(vertex_out);
+  { DrawTimer timer; FlushImmediate(ctx, base, draw.dev, stride); }
+  draw.index_guest = ScratchAlloc(draw.count * (draw.index_32 ? 4 : 2));
+  draw.immediate_guest = ScratchAlloc(draw.immediate_dwords * 4);
+  FinishBegin(draw.dev);
+  Store(index_out, draw.index_guest);
+  Store(vertex_out, draw.immediate_guest);
+  ctx.r3.u64 = 0;
   if (draw.index_guest && draw.immediate_guest) ng2::native::RendererDraw(draw);
 }
 
@@ -268,6 +350,12 @@ extern "C" REX_FUNC(sub_8376A9F8) {
 }
 
 // ---- Ring and fences ------------------------------------------------------------------------
+
+// Shader constant upload into the ring, called from sub_83768758. Ring only.
+NG2_IMP(83768568);
+extern "C" REX_FUNC(sub_83768568) {
+  if (!NativeOn()) return __imp__sub_83768568(ctx, base);
+}
 
 // Segment kick: writes an INDIRECT_BUFFER to the primary ring and bumps CP_RB_WPTR. Dropped, which
 // is what keeps the command processor empty.
