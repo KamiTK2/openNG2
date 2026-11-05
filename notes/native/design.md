@@ -74,30 +74,29 @@ Each ends in a run through `tools/native_test.ps1`, reported against D3D12.
 - Luminance chain depends on clear-via-transfer side effects (#102): must be made explicit clears.
 - About 2/3 of the game shaders have never been run under test.
 
-## Status for the morning (2026-11-05, findings up to #145)
+## Status for the morning (2026-11-05, findings up to #147)
 
 To run it: `--gpu_backend=vulkan --ng2_native_d3d=true`. D3D12 stays the default and is unaffected with the switch off.
 
 **Done**
 - Game runs with no PM4 reaching the command processor and no EDRAM: gameplay, menus, movies, the New Game cutscene, Mission Mode.
-- Image against D3D12: courtyard 0.45/255, post-movie 2x session 0.73/255, 4x 0.66/255.
+- Image against D3D12: courtyard 0.41-0.50/255, post-movie 2x session 0.65/255, 4x 0.66/255.
 - Performance at 8x (the fair test): native 7.4 ms at 60 fps, 47% GPU; D3D12 16.7 ms at 56 fps, 100% GPU. At equal clocks in a light scene: 1.37 ms against 5.39 ms. At 5x the same 60 fps takes 87 W against 220 W.
 - All shaders work: 634 precompiled, anything else is translated on first use, so a missing shader no longer drops geometry.
 - All 52,505 disk textures load; signed formats, sampler settings, reload and freeing are in.
 - FSR, CAS, FXAA, ultrawide, frame generation, live resolution change, the Recomp Settings pane.
-- River in the New Game cutscene: black patches gone, red post reflection back.
+- River in the New Game cutscene: matches D3D12 by eye on a frozen frame, with the same camera. The cause was swapped Clear flags: 0x10 is depth, 0x20 is stencil (#146).
+- 2x depth clear: no workaround left. The same flag fix is the true rule (#146).
+- 30 fps cap: even, 33.33 ms on average with 0 of 240 frames off by more than 2 ms, same as D3D12 (#147).
 - Validation layers clean on menu, gameplay and cutscene. 3-minute runs clean in gameplay and cutscene.
 
 **Partly done**
 - Story coverage: 44 of 58 stage ids load and render on both renderers with no misses and no dropped draws. They can't be reported by chapter (#145): only stage 9 = Ch. 1 and stage 0xB = Ch. 3 are established. These runs start a stage with the player falling in, so they are not a playthrough.
-- 2x depth clear: still a fit that matches the result, not the guest's mechanism (#144). A once-per-frame limit keeps it from wiping depth mid-scene.
 - PM4 removal: the draw functions are gone; `sub_83768758` and the library's Swap still write small packets into memory nothing reads (0.06 ms per frame), and the idle command processor thread remains. Removing them means reimplementing vertex shader patching.
 - VRAM: 2936 MB against D3D12 2662 MB at 4x, 5900 MB against 4991 MB at 8x.
 
 **Not done or unknown**
 - Fullscreen on native has not been seen in a capture: screenshots are black on any Vulkan fullscreen. Only the 60/120 present rates are confirmed.
 - Mission Mode flame blur: no repeatable comparison exists, so it isn't known whether it matches.
-- River in the post-movie 2x session: viewed on native (run mv-nat), bridge and water render with a red reflection under the post; D3D12 was on a different shot at that moment, so it is not compared.
 - 14 stage ids stall on both renderers (#145): unknown whether they are unused.
-- 30 fps cap frame pacing not measured.
-- Cutscenes are compared by eye: their camera differs between renderers even at the same frame number.
+- Cutscenes are compared by eye: their camera can differ between renderers at the same frame number, and falling petals always differ.
