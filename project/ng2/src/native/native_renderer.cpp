@@ -1172,7 +1172,15 @@ VkImageView TextureView(uint32_t dev, uint32_t slot) {
   uint32_t words[6];
   SwapDwords(words, Virt(dev + kDevFetch + slot * 24), 6);
   const auto found = r.resolved.find(ResolvedKey(words));
-  if (found != r.resolved.end()) return SampleView(found->second, FetchSwizzleKey(words[3]));
+  if (found != r.resolved.end()) {
+    // The guest's resolve swaps red and blue to the texture's memory order and the fetch swizzle
+    // swaps them back. Host images hold the target's components as they are.
+    uint32_t swizzle = FetchSwizzleKey(words[3]);
+    if ((swizzle & 0xFF) == VK_COMPONENT_SWIZZLE_B && ((swizzle >> 16) & 0xFF) == VK_COMPONENT_SWIZZLE_R) {
+      swizzle = (swizzle & 0xFF00FF00) | VK_COMPONENT_SWIZZLE_R | (VK_COMPONENT_SWIZZLE_B << 16);
+    }
+    return SampleView(found->second, swizzle);
+  }
   const VkImageView view = LoadStaticTexture(words);
   if (view != VK_NULL_HANDLE) return view;
   return SampleView(r.white_2d, 0);
@@ -1696,9 +1704,12 @@ void ClearColorSurface(Surface& s, const VkClearColorValue& value) {
   }
 }
 
-void ClearDepthSurface(Surface& s, float z, uint32_t stencil) {
+// mask: 1 stencil, 2 depth.
+void ClearDepthSurface(Surface& s, float z, uint32_t stencil, uint32_t mask) {
   VkClearDepthStencilValue value = {z, stencil};
-  VkImageSubresourceRange range = {VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1};
+  VkImageSubresourceRange range = {0, 0, 1, 0, 1};
+  if (mask & 1) range.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+  if (mask & 2) range.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
   vk.vkCmdClearDepthStencilImage(r.f->main_cb, s.image.image, VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
 }
 
@@ -1771,12 +1782,15 @@ void RendererClear(uint32_t dev, uint32_t rect_count, uint32_t rects, uint32_t f
   value.float32[2] = float(argb & 0xFF) / 255.0f;
   value.float32[3] = float(argb >> 24) / 255.0f;
   FullBarrier(r.f->main_cb);
+  // Flags: bits 0-3 colour targets, 0x10 stencil, 0x20 depth (seen as 0x3F, 0x1F, 0x30).
   for (uint32_t i = 0; i < 4; ++i) {
-    if (!(flags & (0x10u << i))) continue;
+    if (!(flags & (1u << i))) continue;
     if (Surface* s = CurrentSurface(dev, i)) ClearColorSurface(*s, value);
   }
-  if (flags & 3) {
-    if (Surface* s = GetSurface(Load(dev + kDevDepthSurface), true)) ClearDepthSurface(*s, z, stencil);
+  if (flags & 0x30) {
+    if (Surface* s = GetSurface(Load(dev + kDevDepthSurface), true)) {
+      ClearDepthSurface(*s, z, stencil, flags >> 4);
+    }
   }
   FullBarrier(r.f->main_cb);
   if (r.dumping) REXLOG_INFO("NG2 NATIVE CLEAR flags {:X} argb {:08X} z {}", flags, argb, z);
@@ -1862,7 +1876,7 @@ void RendererResolve(uint32_t dev, uint32_t flags, uint32_t source_rect, uint32_
     if (Surface* s = CurrentSurface(dev, which < 4 ? which : 0)) ClearColorSurface(*s, value);
   }
   if (flags & 0x200) {
-    if (Surface* s = GetSurface(Load(dev + kDevDepthSurface), true)) ClearDepthSurface(*s, clear_z, clear_stencil);
+    if (Surface* s = GetSurface(Load(dev + kDevDepthSurface), true)) ClearDepthSurface(*s, clear_z, clear_stencil, 3);
   }
   FullBarrier(cb);
 }
