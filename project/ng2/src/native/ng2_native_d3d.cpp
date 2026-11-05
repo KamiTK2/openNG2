@@ -321,7 +321,7 @@ extern "C" REX_FUNC(sub_837721D0) {
 
 // ClearF(dev, flags, rect, float colour[4], f1 z, r8 stencil): the Clear body. Clear itself is
 // replaced below, so this only sees the two callers that go to it directly, sub_83771E60
-// BeginTiling and sub_83772688, which is how the 2x session clears the scene depth (#129).
+// BeginTiling and sub_83772688. It never ran in the 1x or 2x session tested (#135).
 NG2_IMP(8375E350);
 extern "C" REX_FUNC(sub_8375E350) {
   if (!NativeOn()) return __imp__sub_8375E350(ctx, base);

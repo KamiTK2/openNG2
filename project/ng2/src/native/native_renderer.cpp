@@ -48,6 +48,9 @@
 
 REXCVAR_DEFINE_STRING(ng2_native_shader_pack, "ng2_native_shaders.pack", "NG2",
                       "Native renderer shader pack, relative to the executable");
+REXCVAR_DEFINE_BOOL(ng2_native_log_resolves, false, "NG2", "NG2 DIAG: log resolves that clear");
+REXCVAR_DEFINE_BOOL(ng2_native_msaa_depth_clear, true, "NG2",
+                    "Native renderer: clear the 2x session depth on a full colour clear (#129)");
 REXCVAR_DEFINE_INT32(ng2_native_texture_mb, 2048, "NG2",
                      "Native renderer: game texture memory budget in MB; least recently used are freed");
 REXCVAR_DEFINE_INT32(ng2_native_show_resolve, -1, "NG2",
@@ -2021,7 +2024,8 @@ void RendererClear(uint32_t dev, uint32_t rect_count, uint32_t rects, uint32_t f
     // The 2x session asks for colour only (0x0F where the 1x session asks for 0x3F) and no other
     // clear of this depth surface reaches here, yet the frame needs it cleared (#129). Inferred:
     // without this, depth from one bad frame blocks the world for good.
-    const bool msaa_scene_clear = (flags & 0xF) == 0xF && s->msaa_y > 1;
+    const bool msaa_scene_clear =
+        REXCVAR_GET(ng2_native_msaa_depth_clear) && (flags & 0xF) == 0xF && s->msaa_y > 1;
     const uint32_t mask = (flags >> 4) | (msaa_scene_clear ? 2 : 0);
     if (mask & 3) ClearDepthSurface(*s, z, stencil, mask);
   }
@@ -2051,6 +2055,13 @@ void RendererResolve(uint32_t dev, uint32_t flags, uint32_t source_rect, uint32_
   VkCommandBuffer cb = r.f->main_cb;
   FullBarrier(cb);
   const uint32_t which = flags & 7;
+  if (REXCVAR_GET(ng2_native_log_resolves) && (flags & 0x300)) {
+    static uint32_t logged = 0;
+    if (logged++ < 40) {
+      REXLOG_INFO("NG2 NATIVE resolve clear flags {:X} z {} depth surface {:08X}", flags, clear_z,
+                  Load(dev + kDevDepthSurface));
+    }
+  }
   const bool from_depth = which == 4;
   Surface* source = from_depth ? GetSurface(Load(dev + kDevDepthSurface), true)
                                : CurrentSurface(dev, which);
