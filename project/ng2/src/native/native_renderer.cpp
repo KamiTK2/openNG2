@@ -257,6 +257,7 @@ struct R {
   VkCommandPool cmd_pool = VK_NULL_HANDLE;
   VkQueryPool queries = VK_NULL_HANDLE;
   float timestamp_ms = 0, timestamp_period = 1.0f;
+  uint32_t timestamp_frames = 0;
   Frame frames[kFrames];
   uint32_t frame_index = 0;
   bool recording = false;
@@ -795,7 +796,9 @@ void BeginFrame() {
     if (vk.vkGetQueryPoolResults(r.dev, r.queries, r.frame_index * 2, 2, sizeof(stamps), stamps, 8,
                                  VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
       const float period = r.timestamp_period;
-      r.timestamp_ms = float(stamps[1] - stamps[0]) * period * 1e-6f;
+      const float gpu_ms = float(stamps[1] - stamps[0]) * period * 1e-6f;
+      r.timestamp_ms += gpu_ms;
+      ++r.timestamp_frames;
     }
   }
   ++r.frame_count;
@@ -2337,7 +2340,10 @@ void RendererSwap(uint32_t dev, uint32_t front_texture) {
 void RendererLogStats(uint64_t swaps) {
   std::lock_guard lock(g_mutex);
   if (!r.usable) return;
-  REXLOG_INFO("NG2 VK GPU frame time: {:.2f} ms", r.timestamp_ms);
+  // Mean over the window: on a 30 fps scene every other swap draws nothing, so one sample misleads.
+  REXLOG_INFO("NG2 VK GPU frame time: {:.2f} ms", r.timestamp_ms / float(std::max(r.timestamp_frames, 1u)));
+  r.timestamp_ms = 0;
+  r.timestamp_frames = 0;
   if (swaps % 240) return;
   const float n = float(std::max<uint64_t>(g_s.frames, 1));
   REXLOG_INFO(

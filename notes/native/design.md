@@ -73,3 +73,12 @@ Each ends in a run through `tools/native_test.ps1`, reported against D3D12.
   the translated shader output.
 - Luminance chain depends on clear-via-transfer side effects (#102): must be made explicit clears.
 - About 2/3 of the game shaders have never been run under test.
+
+## Status 2026-11-05 (findings #136-#139)
+
+- Stage coverage: 2 real story saves (stages 9 and 0xB), 16 forced stages through Mission Mode, 0 misses. Other story chapters are not reached with their scripts.
+- Same-frame testing: `ng2_autopilot_freeze_frame` on the cutscene route. Gameplay is not repeatable.
+- Open native bug: the river in the New Game cutscene (black patches, no reflection of the bridge post).
+- Texture signs are ignored on native (`texture_swizzled_signs` stays 0).
+- Clean under validation layers on menu, gameplay and cutscene.
+- Deliberately left: `sub_83768758` and library Swap packets into unread memory (0.06 ms/frame), idle command processor thread.
