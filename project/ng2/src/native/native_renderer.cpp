@@ -100,6 +100,7 @@ constexpr VkDeviceSize kUploadAlign = 256;
 constexpr uint32_t kFrames = 2;
 constexpr uint32_t kDescriptorSetsPerFrame = 8192;
 constexpr VkDeviceSize kChunkSize = 256ull * 1024 * 1024;
+constexpr uint32_t kDevGammaRamp = 14988;     // D3DGAMMARAMP: 256 u16 red, green, blue
 constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT_S8_UINT;
 
 uint8_t* Virt(uint32_t guest) {
@@ -229,6 +230,9 @@ struct R {
   VkPipelineLayout present_layout = VK_NULL_HANDLE;
   VkDescriptorSetLayout present_set_layout = VK_NULL_HANDLE;
   VkSampler present_sampler = VK_NULL_HANDLE;
+  Image gamma_ramp;  // 256x1, the display ramp the guest set (D3DGAMMARAMP)
+  uint16_t gamma_ramp_guest[768] = {};
+  bool gamma_ramp_valid = false;
   std::unordered_map<VkImageView, VkFramebuffer> framebuffers;
 
   // Device-local chunks; textures are kept for the session.
@@ -475,8 +479,10 @@ bool InitPresent() {
   VkDescriptorSetLayoutBinding binding = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
                                           VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
   VkDescriptorSetLayoutCreateInfo set_info = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-  set_info.bindingCount = 1;
-  set_info.pBindings = &binding;
+  VkDescriptorSetLayoutBinding bindings[2] = {binding, binding};
+  bindings[1].binding = 1;
+  set_info.bindingCount = 2;
+  set_info.pBindings = bindings;
   if (vk.vkCreateDescriptorSetLayout(r.dev, &set_info, nullptr, &r.present_set_layout) != VK_SUCCESS) {
     return false;
   }
@@ -669,6 +675,7 @@ bool Init() {
   r.rect_gs = MakeModule(kRectGeom, sizeof(kRectGeom));
   const VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
   if (!MakeImage(r.white_2d, VK_FORMAT_R8G8B8A8_UNORM, 1, 1, 1, usage)) return false;
+  if (!MakeImage(r.gamma_ramp, VK_FORMAT_R16G16B16A16_UNORM, 256, 1, 1, usage)) return false;
   return InitPresent();
 }
 
@@ -1883,6 +1890,30 @@ void RendererResolve(uint32_t dev, uint32_t flags, uint32_t source_rect, uint32_
   FullBarrier(cb);
 }
 
+// The display ramp lives on the device; the display hardware applies it, not the frame.
+void UpdateGammaRamp(uint32_t dev) {
+  uint16_t ramp[768];
+  std::memcpy(ramp, Virt(dev + kDevGammaRamp), sizeof(ramp));
+  if (r.gamma_ramp_valid && !std::memcmp(ramp, r.gamma_ramp_guest, sizeof(ramp))) return;
+  const VkDeviceSize offset = UploadAlloc(256 * 8);
+  if (offset == VK_WHOLE_SIZE) return;
+  std::memcpy(r.gamma_ramp_guest, ramp, sizeof(ramp));
+  auto* out = reinterpret_cast<uint16_t*>(r.f->upload_map + offset);
+  for (uint32_t i = 0; i < 256; ++i) {
+    for (uint32_t c = 0; c < 3; ++c) out[i * 4 + c] = _byteswap_ushort(ramp[c * 256 + i]);
+    out[i * 4 + 3] = 0xFFFF;
+  }
+  REXLOG_INFO("NG2 NATIVE: gamma ramp R {} {} {} {} {} G128 {} B128 {}", out[0], out[16 * 4],
+              out[64 * 4], out[128 * 4], out[255 * 4], out[128 * 4 + 1], out[128 * 4 + 2]);
+  ToGeneral(r.f->upload_cb, r.gamma_ramp);
+  VkBufferImageCopy copy = {};
+  copy.bufferOffset = r.f->upload_base + offset;
+  copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  copy.imageExtent = {256, 1, 1};
+  vk.vkCmdCopyBufferToImage(r.f->upload_cb, r.upload, r.gamma_ramp.image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+  r.gamma_ramp_valid = true;
+}
+
 void RendererSwap(uint32_t dev, uint32_t front_texture) {
   std::lock_guard lock(g_mutex);
   if (!Usable()) return;
@@ -1901,6 +1932,7 @@ void RendererSwap(uint32_t dev, uint32_t front_texture) {
     if (found != r.resolved.end()) front = &found->second;
   }
   Frame& f = *r.f;
+  UpdateGammaRamp(dev);
   FullBarrier(f.main_cb);
   vk.vkEndCommandBuffer(f.upload_cb);
   bool submitted = false;
@@ -1951,13 +1983,18 @@ void RendererSwap(uint32_t dev, uint32_t front_texture) {
           VkDescriptorSet& set = sets[sample];
           if (set == VK_NULL_HANDLE) {
             vk.vkAllocateDescriptorSets(r.dev, &alloc, &set);
-            VkDescriptorImageInfo image = {r.present_sampler, sample, VK_IMAGE_LAYOUT_GENERAL};
-            VkWriteDescriptorSet write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-            write.dstSet = set;
-            write.descriptorCount = 1;
-            write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            write.pImageInfo = &image;
-            vk.vkUpdateDescriptorSets(r.dev, 1, &write, 0, nullptr);
+            VkDescriptorImageInfo image[2] = {{r.present_sampler, sample, VK_IMAGE_LAYOUT_GENERAL},
+                                              {r.present_sampler, SampleView(r.gamma_ramp, 0), VK_IMAGE_LAYOUT_GENERAL}};
+            VkWriteDescriptorSet writes[2] = {};
+            for (uint32_t i = 0; i < 2; ++i) {
+              writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+              writes[i].dstSet = set;
+              writes[i].dstBinding = i;
+              writes[i].descriptorCount = 1;
+              writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+              writes[i].pImageInfo = &image[i];
+            }
+            vk.vkUpdateDescriptorSets(r.dev, 2, writes, 0, nullptr);
           }
           VkViewport viewport = {0.0f, 0.0f, float(width), float(height), 0.0f, 1.0f};
           VkRect2D scissor = {{0, 0}, {width, height}};
