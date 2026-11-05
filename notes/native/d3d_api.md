@@ -51,9 +51,9 @@ Calling convention: Xbox 360 PPC, args in r3-r10 and f1+, the rest on the stack,
 | Address | D3D role | Args / device fields | /frame | External callers | Status |
 |---|---|---|---|---|---|
 | `83760B00` | CreateVertexShader | r3=function blob; optional hook pointer at 0x84C3F0C0; alloc 83835940 | 0 | 20 (822F02E8, 82319C88, 82319CE8, ...) | inferred |
-| `83760C10` | SetVertexShader | r3=dev, r4=shader; +12684; copies register patch list into shadow | 709 | 34 (8231B388, 8233B7E8, 8282B748, ...) | observed |
+| `83760C10` | SetPixelShader (label corrected, #124) | r3=dev, r4=shader; +12684; copies register patch list into shadow | 709 | 34 (8231B388, 8233B7E8, 8282B748, ...) | observed |
 | `83760EC8` | CreatePixelShader | r3=function blob; optional hook pointer at 0x84C3F0BC; parse 83760DD0 | 0 | 18 (822F02E8, 8231AD60, 8232E318, ...) | inferred |
-| `83760FB8` | SetPixelShader | r3=dev, r4=shader; +12688; sets shader dirty bit | 385.5 | 32 (8231B388, 8233B7E8, 8282B748, ...) | observed |
+| `83760FB8` | SetVertexShader (label corrected, #124) | r3=dev, r4=shader; +12688; sets shader dirty bit | 385.5 | 32 (8231B388, 8233B7E8, 8282B748, ...) | observed |
 | `83761210` | SetVertexDeclaration | r3=dev, r4=decl; +11812; dirty bit 0x80000 in +16. Mostly inlined, see Risks | 0 | 3 (83888F28, 8388A4F8, 8388A808) | inferred |
 | `83761318` | CreateVertexDeclaration | r3=element array (12 bytes each, stream 255 ends); 83761228 | 0 | 12 (822F02E8, 8231ADC0, 8233BE40, ...) | inferred |
 
