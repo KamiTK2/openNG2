@@ -67,7 +67,8 @@ REXCVAR_DEFINE_INT32(ng2_native_skip_to, 100000, "NG2", "NG2 DIAG: end of the ra
 REXCVAR_DEFINE_STRING(ng2_native_skip_ps, "", "NG2",
                       "Native renderer debug: skip draws with these pixel shader hashes");
 REXCVAR_DEFINE_INT32(ng2_internal_height, 0, "NG2",
-                     "Render height, 16:9 (output height with an upscaler). -1 the window, 0 use resolution_scale");
+                     "Render height (output height with an upscaler). -1 the window, 0 use resolution_scale");
+REXCVAR_DEFINE_INT32(ng2_internal_width, 0, "NG2", "Render width; 0 follows the aspect ratio");
 REXCVAR_DEFINE_BOOL(ng2_native_motion, false, "NG2", "Write motion vectors for the scene");
 REXCVAR_DEFINE_INT32(ng2_upscaler, 0, "NG2", "Temporal upscaler: 0 off, 1 DLSS, 2 FSR, 3 plain scaling (test)");
 REXCVAR_DEFINE_INT32(ng2_upscale_jitter_sign, 1, "NG2", "NG2 DIAG: sign of the jitter given to the upscaler");
@@ -193,6 +194,7 @@ struct Fn {
 constexpr int kMaxScale = 10;
 std::atomic<int> g_desired_scale{1};
 std::atomic<int> g_output_width{0}, g_output_height{0};
+std::atomic<double> g_output_aspect{16.0 / 9.0};
 std::atomic<int> g_height_limit{INT_MAX};  // Lowered when a chosen resolution doesn't fit.
 std::atomic<bool> g_dlss_available{false}, g_fsr_available{false};
 
@@ -294,7 +296,7 @@ struct R {
   // Sized by resolution, not by whole multiples: everything below is in use.
   bool sized = false;
   uint32_t input_width = 0, input_height = 0, output_width = 0, output_height = 0;
-  float scene_x = 1.0f, scene_y = 1.0f, final_scale = 1.0f;
+  float scene_x = 1.0f, scene_y = 1.0f, final_x = 1.0f, final_y = 1.0f;
   float jitter_pixels[2] = {}, jitter_ndc[2] = {}, jitter_ndc_last[2] = {};
   uint32_t jitter_index = 0;
   Surface* scene_color = nullptr;
@@ -307,7 +309,8 @@ struct R {
   Ng2UpscaleDestroyFn bridge_destroy = nullptr;
   std::wstring bridge_data_path;
   int upscaler_kind = 0, upscaler_quality = 0;  // What the live upscaler was made for.
-  uint32_t upscaler_input_height = 0, upscaler_output_height = 0;
+  uint32_t upscaler_input_width = 0, upscaler_input_height = 0;
+  uint32_t upscaler_output_width = 0, upscaler_output_height = 0;
   bool upscaler_ready = false, upscaler_reset = true;
   uint32_t motion_draws_frame = 0, motion_matched_frame = 0;
   std::chrono::steady_clock::time_point last_upscale_time;
@@ -944,18 +947,24 @@ void ApplyResolutionScale() {
     const float ratio =
         temporal ? kRatios[std::clamp(REXCVAR_GET(ng2_upscale_quality), 0, 4)] : 1.0f;
     const int window_w = g_output_width.load(), window_h = g_output_height.load();
-    // The final surface is 16:9 whatever the window is.
-    const int fitted = window_h > 0 ? std::min(window_h, window_w * 9 / 16) : 1440;
-    const int largest = int(uint64_t(r.max_image_dimension) * 9 / 16);
+    // The game draws 16:9 and the presenter stretches it to the aspect ratio, so a wide output
+    // means more pixels across the same guest surface.
+    const double aspect = std::max(g_output_aspect.load(), 16.0 / 9.0);
+    const int fitted = window_h > 0 ? std::min(window_h, int(window_w / aspect)) : 1440;
+    const int largest = int(double(r.max_image_dimension) / aspect);
     output_height = uint32_t(std::clamp(std::min(chosen_height > 0 ? chosen_height : fitted,
                                                  g_height_limit.load()),
                                         360, largest));
-    output_width = uint32_t(std::lround(float(output_height) * 16.0f / 9.0f));
+    const int chosen_width = REXCVAR_GET(ng2_internal_width);
+    output_width = chosen_height > 0 && chosen_width > 0 && int(output_height) == chosen_height
+                       ? uint32_t(chosen_width)
+                       : uint32_t(std::lround(double(output_height) * aspect));
     input_width = uint32_t(std::lround(float(output_width) * ratio));
     input_height = uint32_t(std::lround(float(output_height) * ratio));
   }
   if (want == r.scale && temporal == r.temporal && sized == r.sized &&
-      output_height == r.output_height && input_height == r.input_height) {
+      output_height == r.output_height && output_width == r.output_width &&
+      input_height == r.input_height && input_width == r.input_width) {
     return;
   }
   for (Frame& frame : r.frames) vk.vkWaitForFences(r.dev, 1, &frame.fence, VK_TRUE, UINT64_MAX);
@@ -970,7 +979,8 @@ void ApplyResolutionScale() {
   // The game's scene is 1120x584 at every setting seen so far (#150); its pixels are not square.
   r.scene_x = float(input_width) / 1120.0f;
   r.scene_y = float(input_height) / 584.0f;
-  r.final_scale = float(output_height) / 720.0f;
+  r.final_x = float(output_width) / 1280.0f;
+  r.final_y = float(output_height) / 720.0f;
   r.scene_color = r.scene_depth = nullptr;
   r.composite = nullptr;
   for (auto& [key, surface] : r.surfaces) DestroyScaledImage(surface.image);
@@ -1249,7 +1259,8 @@ void ScaleFor(uint32_t guest_width, uint32_t guest_height, float& x, float& y) {
   if (!r.sized) {
     x = y = float(r.scale);
   } else if (guest_width == 1280 && guest_height == 720) {
-    x = y = r.final_scale;
+    x = r.final_x;
+    y = r.final_y;
   } else if (guest_width * 5 > guest_height * 9) {
     x = r.scene_x;
     y = r.scene_y;
@@ -2631,11 +2642,14 @@ bool EvaluateUpscaler(VkCommandBuffer cb, Image& source) {
   const int quality = std::clamp(REXCVAR_GET(ng2_upscale_quality), 0, 4);
   Ng2UpscaleDevice device = BridgeDevice();
   if (kind != r.upscaler_kind || quality != r.upscaler_quality ||
-      r.input_height != r.upscaler_input_height || r.output_height != r.upscaler_output_height) {
+      source.height != r.upscaler_input_height || source.width != r.upscaler_input_width ||
+      r.output_height != r.upscaler_output_height || r.output_width != r.upscaler_output_width) {
     if (r.upscaler_kind) r.bridge_destroy(r.upscaler_kind);
     r.upscaler_kind = kind;
     r.upscaler_quality = quality;
-    r.upscaler_input_height = r.input_height;
+    r.upscaler_input_width = source.width;
+    r.upscaler_input_height = source.height;
+    r.upscaler_output_width = r.output_width;
     r.upscaler_output_height = r.output_height;
     r.upscaler_ready = r.bridge_create(kind, &device, cb, source.width, source.height, r.output_width,
                                        r.output_height, quality);
@@ -3073,9 +3087,10 @@ bool UpscalerAvailable(int kind) {
   return kind == kNg2UpscaleDlss ? g_dlss_available.load() : kind == kNg2UpscaleFsr && g_fsr_available.load();
 }
 
-void SetOutputSize(int width, int height) {
+void SetOutputSize(int width, int height, double aspect) {
   g_output_width = width;
   g_output_height = height;
+  g_output_aspect = aspect;
 }
 
 bool HostSupportsNative() {

@@ -272,3 +272,10 @@ g2_trace_karmaon.txt`, `ng2_trace_karmaoff.txt`; generated code of the named fun
 - observed: FSR 1.0 now has room to work: Laplacian energy at 1080p on the 1440p window, bilinear 63.0, FSR 1.0 224.3. That measure counts RCAS sharpening as well as upscaling, and the frames are not guaranteed identical.
 - observed: the row steps live in the sandbox (2880x1620 then 3200x1800) and saves. Old settings map to 720 x their multiple.
 - unknown: the row at ultrawide. Labels and sizes assume the final 16:9 surface. The fallback when a size does not fit has not run on the RTX 4090. Output far above the window goes through the presenter's filter, whose quality has not been judged.
+
+## #152: Internal Resolution follows the aspect ratio, up to 4K (corrects #151)
+
+- observed: the row lists common sizes for the aspect ratio in use, with Auto resolved against the window: 16:9 up to 3840x2160, 21:9 up to 5120x2160, 32:9 up to 7680x2160, other ratios 720, 1080, 1440 and 2160 lines. The stepped list in #151 is gone, and so is its 8K. Old multiples map to at most 4K.
+- observed: the game still draws 16:9 and the presenter stretches it (#37), so a wide output is more pixels across the guest surface: the final surface scale differs per axis.
+- observed, runs: a-219 2520x1080 window on Auto, camera 2.3333, DLSS Quality 2293x960 -> 3440x1440, picture correct by eye; a-snap, 1920x1080 under 21:9 moved to 2560x1080; a-329 32:9 mode, FSR Quality 3413x960 -> 5120x1440; a-169 DLSS Performance 1920x1080 -> 3840x2160.
+- unknown: a real ultrawide monitor. Those runs were windows on a 16:9 display. The 21:9 mode gives 2.3333, so 3440x1440 is a slight stretch on a 2.389 display unless Auto is used. The row list on an ultrawide has been exercised by the size moving, not seen in a capture.

@@ -97,8 +97,10 @@ struct RecompSettings {
   // temporal, on the native renderer only: cvars ng2_upscaler and ng2_upscale_quality (live).
   int upscaler = 0;
   int upscale_quality = 3;  // 0 Ultra Performance .. 3 Quality, 4 DLAA / Native AA
-  // Native renderer, cvar ng2_internal_height (live): render height at 16:9, or the upscaler's
-  // output with FSR / DLSS. -1 the window, 0 not set yet: resolution_scale decides.
+  // Native renderer, cvars ng2_internal_width / height (live): render size, or the upscaler's
+  // output with FSR / DLSS, from the list for the aspect ratio in use. Height -1 matches the
+  // window, 0 is not set yet: resolution_scale decides.
+  int internal_width = 0;
   int internal_height = 0;
   int sharpness = 8;  // 0..10 for FSR / CAS (present_fsr_sharpness_reduction / cas sharpness)
   // 30 = present every other frame (game still runs at 60), 60, 120 = frame generation.
@@ -202,6 +204,7 @@ class RecompOptionsPane : public rex::ui::ImGuiDialog {
   std::function<bool()> ingame_row_selected_;
   bool overlay_open_ = false;
   RecompSettings settings_;
+  double current_aspect_ = 16.0 / 9.0;  // Aspect ratio in use, Auto resolved against the window.
   RecompSettings startup_;  // values the running session started with (restart checks)
   PadInput pad_;
   int64_t pane_since_ms_ = 0;

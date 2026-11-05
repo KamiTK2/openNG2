@@ -97,6 +97,33 @@ double AspectForMode(int mode, float width, float height) {
       return height > 0.0f ? std::max(16.0 / 9.0, double(width) / double(height)) : 16.0 / 9.0;
   }
 }
+// Internal Resolution choices for an aspect ratio: the sizes people actually use, up to 4K.
+struct RenderSize {
+  int width, height;
+};
+std::vector<RenderSize> RenderSizesFor(double aspect) {
+  std::vector<RenderSize> sizes = {{-1, -1}};
+  if (aspect < 1.9) {
+    sizes.insert(sizes.end(), {{1280, 720}, {1600, 900}, {1920, 1080}, {2560, 1440}, {3200, 1800}, {3840, 2160}});
+  } else if (aspect >= 2.2 && aspect < 2.5) {
+    sizes.insert(sizes.end(), {{2560, 1080}, {3440, 1440}, {3840, 1600}, {5120, 2160}});
+  } else if (aspect >= 3.4 && aspect < 3.7) {
+    sizes.insert(sizes.end(), {{3840, 1080}, {5120, 1440}, {7680, 2160}});
+  } else {
+    for (int height : {720, 1080, 1440, 2160}) {
+      sizes.push_back({int(std::lround(height * aspect / 2.0)) * 2, height});
+    }
+  }
+  return sizes;
+}
+// The listed size nearest in height: where a size lands when the aspect ratio changes.
+RenderSize NearestRenderSize(const std::vector<RenderSize>& sizes, int height) {
+  RenderSize best = sizes[1];
+  for (size_t i = 1; i < sizes.size(); ++i) {
+    if (std::abs(sizes[i].height - height) < std::abs(best.height - height)) best = sizes[i];
+  }
+  return best;
+}
 const char* AaCvarValue(int aa) { return aa == 2 ? "fxaa_extreme" : aa == 1 ? "fxaa" : "none"; }
 int AaFromCvar(const std::string& v) { return v == "fxaa_extreme" ? 2 : v == "fxaa" ? 1 : 0; }
 const char* UpscalerCvarValue(int u) { return u == 2 ? "cas" : u == 1 ? "fsr" : "bilinear"; }
@@ -726,7 +753,9 @@ bool RecompSettings::Load(const std::filesystem::path& path) {
     } else if (k == "ng2_upscale_quality") {
       upscale_quality = ParseInt(v, upscale_quality, 0, 4);
     } else if (k == "ng2_internal_height") {
-      internal_height = ParseInt(v, internal_height, -1, 8640);
+      internal_height = ParseInt(v, internal_height, -1, 2160);
+    } else if (k == "ng2_internal_width") {
+      internal_width = ParseInt(v, internal_width, 0, 16384);
     }
     else if (k == "ng2_sharpness") sharpness = ParseInt(v, sharpness, 0, 10);
     else if (k == "ng2_aspect_mode") aspect_mode = ParseInt(v, aspect_mode, 0, 3);
@@ -795,6 +824,7 @@ bool RecompSettings::Save(const std::filesystem::path& path) const {
       << "present_effect = \"" << UpscalerCvarValue(upscaler) << "\"\n"
       << "ng2_upscaler = " << TemporalCvarValue(upscaler) << "\n"
       << "ng2_upscale_quality = " << upscale_quality << "\n"
+      << "ng2_internal_width = " << internal_width << "\n"
       << "ng2_internal_height = " << internal_height << "\n"
       << "ng2_sharpness = " << sharpness << "\n"
       << "present_fsr_sharpness_reduction = " << FsrSharpnessReduction(sharpness) << "\n"
@@ -1257,8 +1287,12 @@ RecompOptionsPane::RecompOptionsPane(rex::ui::ImGuiDrawer* drawer, rex::ui::Wind
     settings_.upscale_quality =
         std::clamp(std::atoi(rex::cvar::GetFlagByName("ng2_upscale_quality").c_str()), 0, 4);
     settings_.internal_height = std::atoi(rex::cvar::GetFlagByName("ng2_internal_height").c_str());
-    // Older settings hold a multiple of 720p: the same picture, now named as a resolution.
-    if (!settings_.internal_height) settings_.internal_height = settings_.resolution_scale * 720;
+    settings_.internal_width = std::atoi(rex::cvar::GetFlagByName("ng2_internal_width").c_str());
+    // Older settings hold a multiple of 720p: the nearest listed size, at most 4K.
+    if (!settings_.internal_height) {
+      settings_.internal_height = std::min(settings_.resolution_scale * 720, 2160);
+      settings_.internal_width = 0;
+    }
   }
   {
     const std::string r = rex::cvar::GetFlagByName("present_fsr_sharpness_reduction");
@@ -1319,6 +1353,7 @@ void RecompOptionsPane::ApplyAndSave() {
   rex::cvar::SetFlagByName("ng2_upscaler", std::to_string(TemporalCvarValue(settings_.upscaler)));
   rex::cvar::SetFlagByName("ng2_upscale_quality", std::to_string(settings_.upscale_quality));
   if (NativeRendererRunning()) {
+    rex::cvar::SetFlagByName("ng2_internal_width", std::to_string(settings_.internal_width));
     rex::cvar::SetFlagByName("ng2_internal_height", std::to_string(settings_.internal_height));
   }
   rex::cvar::SetFlagByName("present_fsr_sharpness_reduction",
@@ -1642,7 +1677,23 @@ void RecompOptionsPane::UpdateQuitToDesktop(const ImGuiIO& io) {
 void RecompOptionsPane::OnDraw(ImGuiIO& io) {
   pad_.Poll();
   DrawShaderProgress(io);
-  native::SetOutputSize(int(io.DisplaySize.x), int(io.DisplaySize.y));
+  current_aspect_ = AspectForMode(settings_.aspect_mode, io.DisplaySize.x, io.DisplaySize.y);
+  native::SetOutputSize(int(io.DisplaySize.x), int(io.DisplaySize.y), current_aspect_);
+  // A size from another aspect ratio's list moves to the nearest one in this list.
+  if (NativeRendererRunning() && settings_.internal_height > 0) {
+    const std::vector<RenderSize> sizes = RenderSizesFor(current_aspect_);
+    const bool listed = std::any_of(sizes.begin(), sizes.end(), [this](const RenderSize& size) {
+      return size.width == settings_.internal_width && size.height == settings_.internal_height;
+    });
+    if (!listed) {
+      const RenderSize nearest = NearestRenderSize(sizes, settings_.internal_height);
+      settings_.internal_width = nearest.width;
+      settings_.internal_height = nearest.height;
+      rex::cvar::SetFlagByName("ng2_internal_width", std::to_string(nearest.width));
+      rex::cvar::SetFlagByName("ng2_internal_height", std::to_string(nearest.height));
+      settings_.Save(settings_path_);
+    }
+  }
   UpdatePromptDevice(io, window_);
   DrawPromptGlyphs(io);
   UpdateQuitToDesktop(io);
@@ -1821,17 +1872,17 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
       {
         // Presets set the image rows below together (not the Framerate Cap); "Custom" when
         // they match none of them.
-        struct Preset { const char* name; int res, aa, upscaler, sharpness; };
+        struct Preset { const char* name; int res, aa, upscaler, sharpness, height; };
         static const Preset kPresets[] = {
-            {"Low", 1, 0, 1, 8},
-            {"Medium", 2, 1, 1, 8},
-            {"High", 3, 1, 1, 8},
-            {"Ultra", 4, 2, 1, 8},
+            {"Low", 1, 0, 1, 8, 720},
+            {"Medium", 2, 1, 1, 8, 1080},
+            {"High", 3, 1, 1, 8, 1440},
+            {"Ultra", 4, 2, 1, 8, 2160},
         };
         int match = -1;
         for (int i = 0; i < 4; ++i) {
           const Preset& p = kPresets[i];
-          const bool same_size = NativeRendererRunning() ? s.internal_height == p.res * 720
+          const bool same_size = NativeRendererRunning() ? s.internal_height == p.height
                                                          : s.resolution_scale == p.res;
           if (same_size && s.anti_aliasing == p.aa && s.upscaler == p.upscaler &&
               s.sharpness == p.sharpness) {
@@ -1848,7 +1899,8 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
                           if (v == match) return false;
                           const Preset& p = kPresets[v];
                           s.resolution_scale = p.res;
-                          s.internal_height = p.res * 720;
+                          s.internal_height = p.height;
+                          s.internal_width = 0;  // The aspect ratio's list picks it.
                           s.anti_aliasing = p.aa;
                           s.upscaler = p.upscaler;
                           s.sharpness = p.sharpness;
@@ -1857,23 +1909,20 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
       }
       const bool temporal = s.upscaler >= kUpscalerFsrTemporal;
       if (NativeRendererRunning()) {
-        // 16:9 sizes, past any display: above the screen is supersampling. ng2_internal_height in
-        // the settings file takes any other height, shown as it is until the row is moved.
-        static constexpr int kHeights[] = {-1,   360,  540,  720,  900,  1080, 1200, 1440, 1620, 1800,
-                                           2160, 2520, 2880, 3240, 3600, 4320, 5040, 5760, 7200, 8640};
-        constexpr int kCount = int(sizeof(kHeights) / sizeof(kHeights[0]));
+        const std::vector<RenderSize> sizes = RenderSizesFor(current_aspect_);
         int index = 0;
-        for (int i = 0; i < kCount; ++i) {
-          if (kHeights[i] <= s.internal_height) index = i;
+        for (size_t i = 0; i < sizes.size(); ++i) {
+          if (sizes[i].height == s.internal_height && sizes[i].width == s.internal_width) index = int(i);
         }
         if (s.internal_height < 0) {
-          std::snprintf(buf, sizeof(buf), "Window");
+          std::snprintf(buf, sizeof(buf), "Match Window");
         } else {
-          std::snprintf(buf, sizeof(buf), "%d x %d", int(std::lround(s.internal_height * 16.0 / 9.0)),
-                        s.internal_height);
+          std::snprintf(buf, sizeof(buf), "%d x %d", s.internal_width, s.internal_height);
         }
-        step_row("Internal Resolution", buf, index, 0, kCount - 1, 1,
-                 [&s](int v) { s.internal_height = kHeights[v]; });
+        step_row("Internal Resolution", buf, index, 0, int(sizes.size()) - 1, 1, [&s, sizes](int v) {
+          s.internal_width = sizes[v].width > 0 ? sizes[v].width : 0;
+          s.internal_height = sizes[v].height;
+        });
       } else {
         std::snprintf(buf, sizeof(buf), "%dx", s.resolution_scale);
         step_row("Internal Resolution", buf, s.resolution_scale, 1, MaxResolutionScale(), 1,
@@ -2324,7 +2373,8 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
   if (focused_ && row_ >= 0 && row_ < int(rows.size()) &&
       std::strcmp(rows[row_].label, "Preset") == 0) {
     text_at(X(L.label_x), fy, kGrey,
-            "Low suits weaker PCs. Ultra renders at 4x and needs a strong GPU.", false, note_px);
+            NativeRendererRunning() ? "Low suits weaker PCs. Ultra renders at 4K and needs a strong GPU."
+                                    : "Low suits weaker PCs. Ultra renders at 4x and needs a strong GPU.", false, note_px);
     fy += note_px * 1.5f;
   }
   if (focused_ && row_ >= 0 && row_ < int(rows.size()) &&
