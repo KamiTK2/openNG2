@@ -146,7 +146,7 @@ struct Stats {
   F(vkCreateGraphicsPipelines) F(vkCreateCommandPool) F(vkAllocateCommandBuffers)              \
   F(vkBeginCommandBuffer) F(vkEndCommandBuffer) F(vkResetCommandBuffer) F(vkCreateFence)       \
   F(vkWaitForFences) F(vkResetFences) F(vkCmdPipelineBarrier) F(vkCmdBindPipeline)             \
-  F(vkCmdBindDescriptorSets) F(vkCmdBindIndexBuffer) F(vkCmdDraw) F(vkCmdDrawIndexed)          \
+  F(vkCmdPushConstants) F(vkCmdBindDescriptorSets) F(vkCmdBindIndexBuffer) F(vkCmdDraw) F(vkCmdDrawIndexed)          \
   F(vkCmdSetViewport) F(vkCmdSetScissor) F(vkCmdSetBlendConstants)                             \
   F(vkCmdSetStencilReference) F(vkCmdSetStencilCompareMask) F(vkCmdSetStencilWriteMask)        \
   F(vkCmdSetDepthBias) F(vkCmdBeginRendering) F(vkCmdEndRendering) F(vkCmdCopyImage)           \
@@ -160,6 +160,8 @@ struct Fn {
   NG2_VK_FUNCS(NG2_F)
 #undef NG2_F
 } vk;
+
+std::atomic<int> g_desired_scale{1};
 
 struct Image {
   VkImage image = VK_NULL_HANDLE;
@@ -300,6 +302,7 @@ struct R {
   VkDeviceSize last_bool_loop_offset = VK_WHOLE_SIZE;
   uint32_t resolve_index = 0;
   Image* show_override = nullptr;
+  std::unordered_map<VkImageView, VkDescriptorSet> present_sets;
   bool dumping = false;
 } r;
 
@@ -527,6 +530,9 @@ bool InitPresent() {
   VkPipelineLayoutCreateInfo layout = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
   layout.setLayoutCount = 1;
   layout.pSetLayouts = &r.present_set_layout;
+  VkPushConstantRange present_constants = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 24};
+  layout.pushConstantRangeCount = 1;
+  layout.pPushConstantRanges = &present_constants;
   if (vk.vkCreatePipelineLayout(r.dev, &layout, nullptr, &r.present_layout) != VK_SUCCESS) return false;
 
   VkSamplerCreateInfo sampler = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
@@ -586,6 +592,10 @@ bool Init() {
   r.presenter = graphics->presenter();
   r.vma = rex::ui::vulkan::CreateVmaAllocator(r.device, false);
   r.scale = uint32_t(std::clamp(std::atoi(rex::cvar::GetFlagByName("resolution_scale").c_str()), 1, 8));
+  g_desired_scale = int(r.scale);
+  rex::cvar::RegisterChangeCallback("resolution_scale", [](std::string_view, std::string_view value) {
+    g_desired_scale = std::atoi(std::string(value).c_str());
+  });
   REXLOG_INFO("NG2 NATIVE: internal resolution {}x", r.scale);
   r.dev = r.device->device();
   const auto& ifn = r.device->vulkan_instance()->functions();
@@ -733,8 +743,32 @@ bool Usable() {
 
 void FreeRetiredImages();
 
+void DestroyScaledImage(Image& image) {
+  for (auto& [swizzle, view] : image.sample_views) vk.vkDestroyImageView(r.dev, view, nullptr);
+  if (image.view) vk.vkDestroyImageView(r.dev, image.view, nullptr);
+  vmaDestroyImage(r.vma, image.image, image.allocation);
+  r.image_bytes -= image.bytes;
+}
+
+// resolution_scale changed (Recomp Settings applies it live): everything sized by the scale is
+// recreated on demand. Happens between frames; the next frame's history is simply gone.
+void ApplyResolutionScale() {
+  const uint32_t want = uint32_t(std::clamp(g_desired_scale.load(), 1, 8));
+  if (want == r.scale) return;
+  for (Frame& frame : r.frames) vk.vkWaitForFences(r.dev, 1, &frame.fence, VK_TRUE, UINT64_MAX);
+  REXLOG_INFO("NG2 NATIVE: internal resolution {}x -> {}x", r.scale, want);
+  for (auto& [key, surface] : r.surfaces) DestroyScaledImage(surface.image);
+  for (auto& [key, image] : r.resolved) DestroyScaledImage(image);
+  r.surfaces.clear();
+  r.resolved.clear();
+  r.resolved_latest.clear();
+  r.present_sets.clear();
+  r.scale = want;
+}
+
 void BeginFrame() {
   if (r.recording) return;
+  ApplyResolutionScale();
   r.f = &r.frames[r.frame_index];
   Frame& f = *r.f;
   vk.vkWaitForFences(r.dev, 1, &f.fence, VK_TRUE, UINT64_MAX);
@@ -910,11 +944,13 @@ Surface* GetSurface(uint32_t guest, bool depth) {
   const VkImageUsageFlags usage =
       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
       (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
-  if (!MakeImage(s.image, format, width * r.scale * s.msaa_x, height * r.scale * s.msaa_y, 1, usage)) {
+  if (!MakeImage(s.image, format, width * r.scale * s.msaa_x, height * r.scale * s.msaa_y, 1, usage, 1, 0,
+                 VK_IMAGE_TYPE_2D, true)) {
     REXLOG_ERROR("NG2 NATIVE: surface {:08X} {}x{} failed", guest, width, height);
     r.surfaces.erase(key);
     return nullptr;
   }
+  r.image_bytes += s.image.bytes;
   EndPass();
   ToGeneral(r.f->main_cb, s.image);
   // A new target starts out cleared: nothing on the guest can rely on its old contents.
@@ -1915,7 +1951,8 @@ Image* GetResolvedImage(uint32_t texture) {
   Image image;
   const VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                                   VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-  if (!MakeImage(image, vk_format, width, height, levels, usage)) return nullptr;
+  if (!MakeImage(image, vk_format, width, height, levels, usage, 1, 0, VK_IMAGE_TYPE_2D, true)) return nullptr;
+  r.image_bytes += image.bytes;
   ToGeneral(r.f->main_cb, image);
   REXLOG_INFO("NG2 NATIVE resolve target {:08X} {}x{} format {} levels {}", base, width, height,
               format, levels);
@@ -2182,9 +2219,8 @@ void RendererSwap(uint32_t dev, uint32_t front_texture) {
           alloc.descriptorPool = r.static_pool;
           alloc.descriptorSetCount = 1;
           alloc.pSetLayouts = &r.present_set_layout;
-          static std::unordered_map<VkImageView, VkDescriptorSet> sets;
           VkImageView sample = SampleView(*front, 0);
-          VkDescriptorSet& set = sets[sample];
+          VkDescriptorSet& set = r.present_sets[sample];
           if (set == VK_NULL_HANDLE) {
             vk.vkAllocateDescriptorSets(r.dev, &alloc, &set);
             VkDescriptorImageInfo image[2] = {{r.present_sampler, sample, VK_IMAGE_LAYOUT_GENERAL},
@@ -2206,6 +2242,20 @@ void RendererSwap(uint32_t dev, uint32_t front_texture) {
           vk.vkCmdSetScissor(cb, 0, 1, &scissor);
           vk.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, r.present_pipeline);
           vk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, r.present_layout, 0, 1, &set, 0, nullptr);
+          // swap_post_effect, read per frame so the Recomp Settings row is live
+          const std::string aa = rex::cvar::GetFlagByName("swap_post_effect");
+          const bool extreme = aa == "fxaa_extreme";
+          struct {
+            float texel[2];
+            float edge_threshold, edge_threshold_min, span_max;
+            int32_t fxaa;
+          } constants = {{1.0f / float(width), 1.0f / float(height)},
+                         extreme ? 0.063f : 0.166f,
+                         extreme ? 0.0312f : 0.0833f,
+                         extreme ? 12.0f : 8.0f,
+                         (extreme || aa == "fxaa") ? 1 : 0};
+          vk.vkCmdPushConstants(cb, r.present_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(constants),
+                                &constants);
           vk.vkCmdDraw(cb, 3, 1, 0, 0);
         }
         vk.vkCmdEndRenderPass(cb);

@@ -30,6 +30,12 @@ REXCVAR_DEFINE_INT32(ng2_autopilot_list_down, 0, "NG2",
 REXCVAR_DEFINE_BOOL(ng2_autopilot_turbo, true, "NG2",
                     "NG2 DIAG: guest vblank unthrottled until the autopilot reaches its goal");
 
+REXCVAR_DEFINE_INT32(ng2_autopilot_scale_change, 0, "NG2",
+                     "NG2 DIAG: 4 s after the goal, set resolution_scale live to this (0 = off)");
+
+REXCVAR_DEFINE_BOOL(ng2_autopilot_open_pane, false, "NG2",
+                    "NG2 DIAG: after the options goal, open the Recomp Settings pane");
+
 bool Ng2InGameplay();          // ng2_hooks.cpp
 int Ng2MainMenuCursor();       // ng2_hooks.cpp
 bool Ng2LoadingScreenUp();     // ng2_hooks.cpp
@@ -57,6 +63,7 @@ struct Autopilot {
   bool confirm_left = false;
   int list_down_done = 0;
   int64_t left_menu_ms = 0;
+  int64_t done_ms = 0;
 } g_ap;
 
 void Note(const char* state) {
@@ -77,6 +84,7 @@ void Pulse(int64_t now, uint16_t buttons) {
 
 void Finish(const char* goal) {
   g_ap.done = true;
+  g_ap.done_ms = NowMs();
   REXLOG_INFO("NG2 AUTOPILOT t={} GOAL {} presses={}", NowMs() - g_ap.start_ms, goal,
               g_ap.presses);
 }
@@ -85,8 +93,28 @@ void Finish(const char* goal) {
 
 void Ng2AutopilotPad(uint32_t user_index, rex::input::X_INPUT_STATE* st) {
   const std::string route = REXCVAR_GET(ng2_autopilot);
-  if (route.empty() || user_index != 0 || g_ap.done) return;
+  if (route.empty() || user_index != 0) return;
   const int64_t now = NowMs();
+  if (g_ap.done) {
+    static bool scale_changed = false;
+    if (!scale_changed && REXCVAR_GET(ng2_autopilot_scale_change) > 0 && g_ap.done_ms &&
+        now - g_ap.done_ms >= 4000) {
+      scale_changed = true;
+      rex::cvar::SetFlagByName("resolution_scale",
+                               std::to_string(REXCVAR_GET(ng2_autopilot_scale_change)));
+    }
+    // Options route: open the Recomp Settings pane (an ImGui overlay) for a screenshot.
+    static int pane_step = 0;
+    if (route == "options" && REXCVAR_GET(ng2_autopilot_open_pane) && pane_step < 6 &&
+        !g_ap.pressing && now >= g_ap.next_press_ms && now - g_ap.done_ms >= 800) {
+      Pulse(now, pane_step < 5 ? kDpadDown : kA);
+      g_ap.next_press_ms = now + 250;
+      ++pane_step;
+    }
+    if (g_ap.pressing && now >= g_ap.press_end_ms) g_ap.pressing = 0;
+    if (g_ap.pressing) st->gamepad.buttons = uint16_t(uint16_t(st->gamepad.buttons) | g_ap.pressing);
+    return;
+  }
   if (!g_ap.start_ms) g_ap.start_ms = now;
   // This route confirms a save overwrite, so it refuses anything but the test sandbox.
   if (route == "cutscene" && !std::strstr(GetCommandLineA(), "openNG2-test")) {

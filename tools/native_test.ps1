@@ -18,6 +18,7 @@ param(
   [int]$MeasureSec = 15,
   [int]$TimeoutSec = 60,
   [string[]]$Cvars = @(),
+  [string[]]$Settings = @(),   # recomp_settings.toml keys, 'k=v', over the pinned test values
   [switch]$Movies,   # let the boot movie play (it is skipped by the autopilot's Start) instead of Skip Intro
   [int]$PulseMs = 0,
   [int]$Shots = 1,
@@ -26,6 +27,7 @@ param(
 $ErrorActionPreference = 'Stop'
 # powershell -File passes 'a=1,b=2' as one string
 $Cvars = @($Cvars | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
+$Settings = @($Settings | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 $root = Split-Path $PSScriptRoot -Parent
 $bin = Join-Path $root "project\ng2\out\build\$Preset"
 $native = Join-Path $root 'notes\logs\native'
@@ -86,6 +88,7 @@ $overrides = [ordered]@{
 }
 if ($Movies) { $overrides['ng2_skip_intro'] = 'false' }
 if ($Route -eq 'cutscene') { $overrides['ng2_skip_any_cutscene'] = 'false' }
+foreach ($kv in $Settings) { $k, $v = $kv -split '=', 2; $overrides[$k.Trim()] = $v.Trim() }
 $settingsFile = Join-Path $sandbox 'recomp_settings.toml'
 $lines = Get-Content $settingsFile | Where-Object { $overrides.Keys -notcontains (($_ -split '=')[0].Trim()) }
 $lines += $overrides.GetEnumerator() | ForEach-Object { "$($_.Key) = $($_.Value)" }
@@ -117,7 +120,12 @@ function Shot($tag) {
   if ($w -le 0 -or $hh -le 0) { return }
   $bmp = New-Object System.Drawing.Bitmap $w, $hh
   $g = [System.Drawing.Graphics]::FromImage($bmp)
-  $hdc = $g.GetHdc(); [void][NT]::PrintWindow($h, $hdc, 2); $g.ReleaseHdc($hdc)
+  if ($Settings -match '^fullscreen=true') {
+    # PrintWindow reads nothing back from a fullscreen swapchain
+    $g.CopyFromScreen($r.L, $r.T, 0, 0, (New-Object System.Drawing.Size $w, $hh))
+  } else {
+    $hdc = $g.GetHdc(); [void][NT]::PrintWindow($h, $hdc, 2); $g.ReleaseHdc($hdc)
+  }
   $bmp.Save((Join-Path $out "$tag.png"), [System.Drawing.Imaging.ImageFormat]::Png)
   $g.Dispose(); $bmp.Dispose()
 }
@@ -148,7 +156,7 @@ try {
     $measureEnd = $clock.Elapsed.TotalSeconds + $MeasureSec
     # GPU clocks and power (#131): capped frame times mean nothing without them
     if (Test-Path $smiFile) { Remove-Item $smiFile -Force }
-    $smi = Start-Process nvidia-smi -PassThru -WindowStyle Hidden -ArgumentList '--query-gpu=clocks.gr,utilization.gpu,power.draw', '--format=csv,noheader,nounits', '-lms', '500', '-f', "`"$smiFile`""
+    $smi = Start-Process nvidia-smi -PassThru -WindowStyle Hidden -ArgumentList '--query-gpu=clocks.gr,utilization.gpu,power.draw', '--format=csv,noheader,nounits', '-lms', '500' -RedirectStandardOutput $smiFile
     for ($i = 1; $i -le $Shots; ++$i) {
       Start-Sleep -Milliseconds ([int]($MeasureSec * 1000 / ($Shots + 1)))
       if (-not $p.HasExited) { Shot "shot$i" }
