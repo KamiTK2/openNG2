@@ -232,8 +232,13 @@ bool RewriteSystemConstantLayout(std::vector<uint32_t>& spirv) {
 
 rg::SpirvShaderTranslator& Translator() {
   // Host render target mode: fragment outputs, no interlock, no EDRAM access. Features(true) is
-  // the desktop baseline, SPIR-V 1.5 with float controls.
-  static rg::SpirvShaderTranslator::Features features(true);
+  // the desktop baseline, SPIR-V 1.5 with float controls. Denorm flushing is off: drivers don't
+  // all offer it (the RTX 4090's doesn't), and declaring it is then invalid SPIR-V for the device.
+  static rg::SpirvShaderTranslator::Features features = [] {
+    rg::SpirvShaderTranslator::Features f(true);
+    f.denorm_flush_to_zero_float32 = false;
+    return f;
+  }();
   static rg::SpirvShaderTranslator translator(features, true, true, false);
   return translator;
 }

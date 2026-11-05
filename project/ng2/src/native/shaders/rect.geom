@@ -4,8 +4,8 @@ layout(triangles) in;
 layout(triangle_strip, max_vertices = 4) out;
 layout(location = 0) in vec4 vi[][16];
 layout(location = 0) out vec4 vo[16];
-in gl_PerVertex { vec4 gl_Position; float gl_PointSize; } gl_in[];
-out gl_PerVertex { vec4 gl_Position; float gl_PointSize; };
+in gl_PerVertex { vec4 gl_Position; } gl_in[];
+out gl_PerVertex { vec4 gl_Position; };
 void Emit(int v) {
   gl_Position = gl_in[v].gl_Position;
   for (int i = 0; i < 16; ++i) vo[i] = vi[v][i];

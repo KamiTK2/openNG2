@@ -1,8 +1,8 @@
 #version 450
 // Final output: display gamma ramp, then optional FXAA (same constants as the SDK's swap FXAA).
 // Rebuild: glslangValidator -V --vn kPresentFrag -o present_frag.h present.frag
-layout(set = 0, binding = 0) uniform sampler2D image;
-layout(set = 0, binding = 1) uniform sampler2D ramp;
+layout(set = 0, binding = 0) uniform sampler2DArray image;
+layout(set = 0, binding = 1) uniform sampler2DArray ramp;
 layout(push_constant) uniform Constants {
   vec2 texel;
   float edge_threshold;
@@ -15,9 +15,9 @@ layout(location = 0) out vec4 color;
 const vec3 kLumaWeights = vec3(0.299, 0.587, 0.114);
 const float kDirReduceMul = 0.125;
 const float kDirReduceMin = 1.0 / 128.0;
-float Ramp(float v, int c) { return texture(ramp, vec2((v * 255.0 + 0.5) / 256.0, 0.5))[c]; }
+float Ramp(float v, int c) { return texture(ramp, vec3((v * 255.0 + 0.5) / 256.0, 0.5, 0.0))[c]; }
 vec3 Fetch(vec2 p) {
-  vec3 c = textureLod(image, p, 0.0).rgb;
+  vec3 c = textureLod(image, vec3(p, 0.0), 0.0).rgb;
   return vec3(Ramp(c.r, 0), Ramp(c.g, 1), Ramp(c.b, 2));
 }
 float Luma(vec2 p) { return dot(Fetch(p), kLumaWeights); }
