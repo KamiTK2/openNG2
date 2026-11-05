@@ -17,6 +17,9 @@ set(NG2_SOURCES
     src/ng2_autopilot.cpp
     src/ng2_hooks.cpp
     src/native/ng2_native_d3d.cpp
+    src/native/native_renderer.cpp
+    src/native/native_shaders.cpp
+    src/native/native_textures.cpp
     src/ps_prompts.cpp
     src/recomp_settings.cpp
     src/shader_precompile.cpp

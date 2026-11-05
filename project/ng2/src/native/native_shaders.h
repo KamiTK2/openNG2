@@ -9,8 +9,8 @@
 //                     constant to its heap dword offset << 2. Endian swap happens in the shader
 //                     from bits 0:1 of fetch word 1.
 //   set 1  binding 0  uniform: NativeSystemConstants
-//          binding 1  uniform: vertex float constants, vec4[], from dev+1920
-//          binding 2  uniform: pixel float constants, vec4[], from dev+6016
+//          binding 1  uniform: vertex float constants, vec4[], from dev+1920, packed by float_bitmap
+//          binding 2  uniform: pixel float constants, vec4[], from dev+6016, packed by float_bitmap
 //          binding 3  uniform: bool + loop constants (256 bits, then 32 dwords in uvec4s)
 //          binding 4  uniform: fetch constants, 32 x 6 dwords, from dev+1152
 //   set 2  vertex textures, set 3 pixel textures: per shader, see NativeShader::textures/samplers.
@@ -77,6 +77,9 @@ struct NativeShader {
   uint32_t flags = 0;
   uint32_t color_targets = 0;  // bit per colour output written
   uint32_t float_constant_count = 0;
+  // Constants are tightly packed: the shader's vec4 n is the n-th set bit here (all ones when the
+  // shader addresses them dynamically). See PackFloatConstants in the renderer.
+  uint64_t float_bitmap[4] = {};
   std::vector<uint32_t> vertex_fetch_slots;  // fetch constant indices read, 0-95
   std::vector<NativeTextureBinding> textures;
   std::vector<NativeSamplerBinding> samplers;

@@ -16,7 +16,7 @@ namespace ng2::native {
 namespace {
 
 constexpr uint32_t kPackMagic = 0x4E32474E;  // 'NG2N'
-constexpr uint32_t kPackVersion = 1;
+constexpr uint32_t kPackVersion = 2;
 
 void PutU32(std::vector<uint8_t>& out, uint32_t v) {
   const auto* p = reinterpret_cast<const uint8_t*>(&v);
@@ -95,6 +95,7 @@ bool ShaderPack::Save(const std::filesystem::path& path) const {
     PutU32(out, s.flags);
     PutU32(out, s.color_targets);
     PutU32(out, s.float_constant_count);
+    for (uint64_t bits : s.float_bitmap) PutU64(out, bits);
     PutArray(out, s.vertex_fetch_slots);
     PutArray(out, s.textures);
     PutArray(out, s.samplers);
@@ -126,6 +127,7 @@ bool ShaderPack::Load(const std::filesystem::path& path, std::string* error) {
     s.flags = r.U32();
     s.color_targets = r.U32();
     s.float_constant_count = r.U32();
+    for (uint64_t& bits : s.float_bitmap) bits = r.U64();
     r.Array(s.vertex_fetch_slots);
     r.Array(s.textures);
     r.Array(s.samplers);
@@ -280,6 +282,7 @@ bool TranslateShader(ShaderStage stage, const uint32_t* ucode_guest_order, uint3
   out.flags = 0;
   out.color_targets = shader.writes_color_targets();
   out.float_constant_count = shader.constant_register_map().float_count;
+  for (int i = 0; i < 4; ++i) out.float_bitmap[i] = shader.constant_register_map().float_bitmap[i];
   if (shader.kills_pixels()) out.flags |= kShaderFlagKillsPixels;
   if (shader.writes_depth()) out.flags |= kShaderFlagWritesDepth;
   if (shader.uses_register_dynamic_addressing()) out.flags |= kShaderFlagRelativeRegisters;
