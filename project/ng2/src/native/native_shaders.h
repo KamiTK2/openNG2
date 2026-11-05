@@ -108,6 +108,17 @@ class ShaderPack {
 // ucode is guest byte order. Returns false and fills error if translation failed.
 bool TranslateShader(ShaderStage stage, const uint32_t* ucode_guest_order, uint32_t ucode_dwords,
                      uint64_t ucode_hash, NativeShader& out, std::string* error = nullptr);
+
+// One shader container found in the game image.
+struct ImageShader {
+  ShaderStage stage;
+  uint32_t ucode_address;
+  uint32_t ucode_dwords;
+  uint64_t ucode_hash;
+  bool wmv;
+};
+// Finds every unique shader in a guest image (big endian, as loaded at `base`).
+std::vector<ImageShader> ScanImageShaders(const uint8_t* image, size_t size, uint32_t base);
 #endif
 
 }  // namespace ng2::native

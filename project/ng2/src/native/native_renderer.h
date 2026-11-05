@@ -34,4 +34,10 @@ void RendererSwap(uint32_t dev, uint32_t front_texture);
 void RendererDrainImmediate();
 void RendererLogStats(uint64_t swaps);
 
+// True when this PC has a Vulkan 1.3 device. Safe before the GPU plugin is loaded.
+bool HostSupportsNative();
+// Builds the shader pack from the loaded game image if it's missing or out of date. The pack is
+// game-derived, so releases can't ship it. Runs once before the game starts.
+void EnsureShaderPack();
+
 }  // namespace ng2::native

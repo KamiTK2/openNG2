@@ -238,3 +238,14 @@ g2_trace_karmaon.txt`, `ng2_trace_karmaoff.txt`; generated code of the named fun
 - observed, native 10x: r10 16.51 ms, 60 fps, 99% GPU, 225 W, 8170 MB; r10b 12.26 ms, 59.8 fps, 74% GPU, 224 W, 8678 MB; r10fsr with FSR 60.2 fps, 8147 MB; post-movie 4x MSAA session r10mv 22.01 ms, 58.7 fps, 99% GPU, 225 W, 10188 MB, picture correct by eye. The same scene and scale differ by 4 ms between runs. No surface failures in any run.
 - observed: D3D12 unchanged at 5x (r5d 60.1 fps, 9.85 ms).
 - unknown: the 'does not fit' fallback (`ReduceScale` in native_renderer.cpp) has not run: the RTX 4090 never hit it. The Recomp Settings row at 6x-10x has not been seen in a capture: the pane did not open in r10pane.
+
+## #149: native Vulkan is the default, Renderer row, shader pack built on first launch
+
+- observed: launcher installs could not have run the native renderer as of #148. `tools/rexglue-sdk` does not exist in an install, so `ng2`'s translator sources were missing, and neither the launcher nor the release built `ng2_native_shaders.pack`, whose absence made native setup fail. Evidence: `launcher/src/pipeline.cpp` Build(), `tools/make_release.py`, `Init()` in native_renderer.cpp.
+- observed: the payload now carries `sdk/translator` (6.2 MB). A full configure, codegen, compile and link in the install layout (build/project/ng2 + build/sdk, without the repo) exited 0, 589 steps. That exe started on native with no pack and stayed up for 30 s: "shader pack built, 621 of 621 shaders, 0.7 s, saved true". It was not run through openNG2.exe itself.
+- observed: dev build with the pack deleted, run sw-gen: 621 of 621 in 0.6 s, 3 patched vertex shaders translated at bind at about 1 ms each, 60.2 fps. The pack from native-shader-tool held 634 because it also takes shaders from the SDK cache.
+- observed: runs with no command line backend: `gpu_backend = "d3d12"` in recomp_settings.toml gives "NG2 NATIVE: off"; "vulkan" and a missing key give "on". Files from older versions have no key, so existing players move to Vulkan.
+- observed, 4x gameplay, short windows: sw-vk 60.2 fps, 5.4 ms, 79 W; sw-d3d 60.1 fps, 11.05 ms, 216 W.
+- observed: the Renderer row in a capture (pane3.png, run by key input in the sandbox): D3D12 selected, restart note and hint shown, `gpu_backend = "d3d12"` saved.
+- observed: both the dev and install-layout logs hold the same 12 error lines, 11 duplicate cvar registrations (the translator compiled into ng2 as well as the plugin) and one ResolvePath(\\Device). Not new.
+- unknown: the fallback to D3D12 on a PC without Vulkan 1.3 has not run; the RTX 4090 always passes `HostSupportsNative`. A device that passes that check and still fails native setup is not handled.

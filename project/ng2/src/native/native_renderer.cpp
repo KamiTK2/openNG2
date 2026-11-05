@@ -9,6 +9,8 @@
 
 #include <windows.h>
 
+#include <rex/system/user_module.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -685,8 +687,8 @@ bool Init() {
                          REXCVAR_GET(ng2_native_shader_pack);
   std::string error;
   if (!r.pack.Load(pack_path, &error)) {
-    REXLOG_ERROR("NG2 NATIVE: shader pack {}: {}", pack_path.string(), error);
-    return false;
+    // Not fatal: shaders are translated at bind time instead.
+    REXLOG_WARN("NG2 NATIVE: shader pack {}: {}", pack_path.string(), error);
   }
   r.runtime_pack_path = pack_path.parent_path() / "ng2_native_shaders_runtime.pack";
   if (std::filesystem::exists(r.runtime_pack_path)) {
@@ -2513,6 +2515,79 @@ void RendererSwap(uint32_t dev, uint32_t front_texture) {
   if (!submitted) submit();
   r.recording = false;
   r.frame_index = (r.frame_index + 1) % kFrames;
+}
+
+bool HostSupportsNative() {
+  HMODULE loader = LoadLibraryW(L"vulkan-1.dll");
+  if (!loader) return false;
+  bool supported = false;
+  const auto get =
+      reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(loader, "vkGetInstanceProcAddr"));
+  const auto create = get ? reinterpret_cast<PFN_vkCreateInstance>(get(nullptr, "vkCreateInstance"))
+                          : nullptr;
+  VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+  app.apiVersion = VK_API_VERSION_1_3;
+  VkInstanceCreateInfo info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+  info.pApplicationInfo = &app;
+  VkInstance instance = VK_NULL_HANDLE;
+  if (create && create(&info, nullptr, &instance) == VK_SUCCESS) {
+    const auto enumerate = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(
+        get(instance, "vkEnumeratePhysicalDevices"));
+    const auto properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+        get(instance, "vkGetPhysicalDeviceProperties"));
+    uint32_t count = 0;
+    enumerate(instance, &count, nullptr);
+    std::vector<VkPhysicalDevice> devices(count);
+    enumerate(instance, &count, devices.data());
+    for (VkPhysicalDevice device : devices) {
+      VkPhysicalDeviceProperties p;
+      properties(device, &p);
+      if (p.apiVersion >= VK_API_VERSION_1_3) supported = true;
+    }
+    reinterpret_cast<PFN_vkDestroyInstance>(get(instance, "vkDestroyInstance"))(instance, nullptr);
+  }
+  FreeLibrary(loader);
+  return supported;
+}
+
+void EnsureShaderPack() {
+  if (rex::cvar::GetFlagByName("ng2_native_d3d") != "true" ||
+      rex::cvar::GetFlagByName("gpu_backend") != "vulkan") {
+    return;
+  }
+  wchar_t module_path[MAX_PATH];
+  GetModuleFileNameW(nullptr, module_path, MAX_PATH);
+  const auto pack_path = std::filesystem::path(module_path).parent_path() /
+                         REXCVAR_GET(ng2_native_shader_pack);
+  ShaderPack pack;
+  if (pack.Load(pack_path)) return;
+  auto module = REX_KERNEL_STATE()->GetExecutableModule();
+  if (!module) return;
+  const auto* xex = module->xex_module();
+  const uint32_t base = xex->base_address(), size = xex->image_size();
+  const uint8_t* image = Virt(base);
+  const auto start = std::chrono::steady_clock::now();
+  const std::vector<ImageShader> shaders = ScanImageShaders(image, size, base);
+  size_t added = 0;
+  for (size_t i = 0; i < shaders.size(); ++i) {
+    const ImageShader& s = shaders[i];
+    NativeShader shader;
+    std::string error;
+    if (TranslateShader(s.stage,
+                        reinterpret_cast<const uint32_t*>(image + (s.ucode_address - base)),
+                        s.ucode_dwords, s.ucode_hash, shader, &error)) {
+      shader.guest_address = s.ucode_address;
+      if (s.wmv) shader.flags |= kShaderFlagWmv;
+      pack.Add(std::move(shader));
+      ++added;
+    } else {
+      REXLOG_WARN("NG2 NATIVE: shader {:016X}: {}", s.ucode_hash, error);
+    }
+  }
+  const bool saved = pack.Save(pack_path);
+  REXLOG_INFO("NG2 NATIVE: shader pack built, {} of {} shaders, {:.1f} s, saved {}", added,
+              shaders.size(),
+              std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), saved);
 }
 
 void RendererLogStats(uint64_t swaps) {

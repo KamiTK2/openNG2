@@ -55,6 +55,9 @@ target_include_directories(ng2 SYSTEM PRIVATE "${REXGLUE_SHARE_DIR}/../../includ
 # hold in full. The plugin doesn't export the translator, so its sources are compiled in here, as
 # in tools/native-shader-tool.
 set(NG2_SDK ${CMAKE_CURRENT_SOURCE_DIR}/../../tools/rexglue-sdk)
+if(NOT EXISTS ${NG2_SDK}/src/graphics)
+    set(NG2_SDK ${CMAKE_CURRENT_SOURCE_DIR}/../../sdk/translator)  # launcher install (make_release.py)
+endif()
 set(NG2_G ${NG2_SDK}/src/graphics)
 target_sources(ng2 PRIVATE
     ${NG2_G}/flags.cpp

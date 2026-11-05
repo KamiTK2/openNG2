@@ -15,6 +15,7 @@
 #include <rex/system/xam/content_manager.h>
 
 #include "crash_handler.h"
+#include "native/native_renderer.h"
 #ifdef NG2_TRACE_ALL
 #include "ng2_trace_all.h"
 #endif
@@ -80,6 +81,7 @@ class Ng2App : public rex::ReXApp {
   // SDK builds them all before the game starts (findings #58).
   void OnPreLaunchModule() override {
     InstallDlc();
+    ng2::native::EnsureShaderPack();
     if (auto* ks = REX_KERNEL_STATE()) {
       ng2::PrepareShaderCache(rex::filesystem::GetExecutableFolder() / "shaders", cache_root(),
                               ks->title_id());

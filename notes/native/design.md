@@ -74,9 +74,13 @@ Each ends in a run through `tools/native_test.ps1`, reported against D3D12.
 - Luminance chain depends on clear-via-transfer side effects (#102): must be made explicit clears.
 - About 2/3 of the game shaders have never been run under test.
 
+## Default renderer (2026-11-05, #149)
+
+Native Vulkan is the default: `ng2.toml` sets `gpu_backend = "vulkan"` and `ng2_native_d3d = true`. Recomp Settings > Graphics > Renderer writes `gpu_backend` to the player's settings and applies at the next start; a file without the key gets Vulkan. A PC with no Vulkan 1.3 device starts on D3D12. The shader pack is game-derived, so releases can't ship it: `EnsureShaderPack` builds it from the loaded image before the game starts, and shaders it can't hold are translated at bind time. After a translator change, bump `kPackVersion` so players' packs rebuild.
+
 ## Status for the morning (2026-11-05, findings up to #147)
 
-To run it: `--gpu_backend=vulkan --ng2_native_d3d=true`. D3D12 stays the default and is unaffected with the switch off.
+To run it (now the default): `--gpu_backend=vulkan --ng2_native_d3d=true`. D3D12 is unaffected with `--gpu_backend=d3d12`.
 
 **Done**
 - Game runs with no PM4 reaching the command processor and no EDRAM: gameplay, menus, movies, the New Game cutscene, Mission Mode.

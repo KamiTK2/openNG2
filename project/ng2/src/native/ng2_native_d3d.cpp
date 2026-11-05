@@ -69,8 +69,7 @@ bool NativeOn() {
     if (!REXCVAR_GET(ng2_native_d3d)) return false;
     const std::string backend = rex::cvar::GetFlagByName("gpu_backend");
     if (backend != "vulkan") {
-      REXLOG_ERROR("NG2 NATIVE: ng2_native_d3d needs gpu_backend=vulkan (got {}), staying off",
-                   backend);
+      REXLOG_INFO("NG2 NATIVE: off, gpu_backend is {}", backend);
       return false;
     }
     REXLOG_INFO("NG2 NATIVE: on, no PM4 reaches the command processor");

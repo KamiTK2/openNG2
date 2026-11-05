@@ -1,13 +1,17 @@
 #include "native_shaders.h"
 
+#include <algorithm>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <unordered_set>
 
 #ifdef NG2_NATIVE_WITH_TRANSLATOR
+#define XXH_INLINE_ALL
+#include <xxhash.h>
 namespace rex::graphics {
 extern bool g_ng2_native_output_clamp;  // spirv_translator_rb.cpp
 }
@@ -20,6 +24,7 @@ namespace ng2::native {
 namespace {
 
 constexpr uint32_t kPackMagic = 0x4E32474E;  // 'NG2N'
+// Bump when translated output changes: a player's generated pack is rebuilt on a mismatch.
 constexpr uint32_t kPackVersion = 2;
 
 void PutU32(std::vector<uint8_t>& out, uint32_t v) {
@@ -330,6 +335,35 @@ bool TranslateShader(ShaderStage stage, const uint32_t* ucode_guest_order, uint3
   }
   return true;
 }
+std::vector<ImageShader> ScanImageShaders(const uint8_t* image, size_t size, uint32_t base) {
+  constexpr uint32_t kRegionStart = 0x8200AC98;
+  const auto be32 = [](const uint8_t* p) {
+    return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3];
+  };
+  std::vector<ImageShader> found;
+  std::unordered_set<uint64_t> seen;
+  for (uint32_t addr = kRegionStart;; addr += 4) {
+    const size_t off = addr - base;
+    if (off + 24 > size) break;
+    const uint32_t magic = be32(&image[off]);
+    if (magic != 0x102A1100 && magic != 0x102A1101) continue;
+    const uint32_t a = be32(&image[off + 4]), b = be32(&image[off + 8]);
+    if (!b || b % 4 || off + a + b > size) continue;
+    // Non-zero field 5 means a 0x40-byte block precedes the ucode (checked against the cache hash).
+    const uint32_t lead = be32(&image[off + 20]) ? 0x40 : 0;
+    if (b <= lead) continue;
+    const uint32_t bytes = b - lead;
+    const uint64_t hash = XXH3_64bits(&image[off + a + lead], bytes);
+    if (!seen.insert(hash).second) continue;
+    static const char kNeedle[] = "wmv";
+    const uint8_t* header = &image[off];
+    found.push_back({magic == 0x102A1101 ? ShaderStage::kVertex : ShaderStage::kPixel,
+                     addr + a + lead, bytes / 4, hash,
+                     std::search(header, header + a, kNeedle, kNeedle + 3) != header + a});
+  }
+  return found;
+}
+
 #endif  // NG2_NATIVE_WITH_TRANSLATOR
 
 }  // namespace ng2::native

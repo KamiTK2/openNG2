@@ -17,4 +17,7 @@ native_resolves = true
 # - Vulkan: NG2's 2x / 4x MSAA scene surfaces are stored as the 1x surface the game reads them
 #   back as (supersampling), which removes the MSAA copies (#117).
 ng2_msaa_supersample = true
-# To try the Vulkan renderer: gpu_backend = "vulkan"
+# The native renderer (notes/native/design.md) is the default. Recomp Settings > Graphics > Renderer
+# writes gpu_backend to the player's settings; "d3d12" runs the emulated path instead.
+gpu_backend = "vulkan"
+ng2_native_d3d = true
