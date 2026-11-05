@@ -59,8 +59,8 @@ Each ends in a run through `tools/native_test.ps1`, reported against D3D12.
 - **M3** done (#122, #125): textures load from fetch constants; menus and HUD correct.
 - **M4** done (#125): render targets and resolves, the pass graph renders, gameplay frame on screen.
 - **M5** working in the tested scene (#125): patched vfetch, bone palettes, skinned characters.
-- **M6** correctness across menus, cutscenes, chapters. Movies via a host WMV decoder.
-- **M7** performance against D3D12, then port features (FSR, frame generation, ultrawide).
+- **M6** in progress (#126-#130): gamma ramp, MSAA as one pixel per sample, menus, movies, New Game cutscene, Mission Mode. Movies work through the guest decoder and texture reloads. Later chapters not covered.
+- **M7** internal resolution done (#127); then port features (FSR, frame generation, ultrawide).
 
 ## Known risks
 
