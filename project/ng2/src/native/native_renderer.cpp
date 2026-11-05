@@ -25,6 +25,8 @@
 #define XXH_INLINE_ALL
 #include <xxhash.h>
 
+#include <fmt/format.h>
+
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/memory/utils.h>
@@ -1228,6 +1230,13 @@ VkDescriptorSet MakeTextureSet(uint32_t dev, const NativeShader& shader, uint32_
   for (uint32_t i = 0; i < images && count < 64; ++i, ++count) {
     infos[count] = {};
     infos[count].imageView = TextureView(dev, shader.textures[i].fetch_constant);
+    if (r.dumping) {
+      uint32_t w[6];
+      SwapDwords(w, Virt(dev + kDevFetch + shader.textures[i].fetch_constant * 24), 6);
+      REXLOG_INFO("NG2 NATIVE   tex slot {} dim {} words {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} resolved {}",
+                  shader.textures[i].fetch_constant, shader.textures[i].dimension, w[0], w[1], w[2],
+                  w[3], w[4], w[5], r.resolved.count(ResolvedKey(w)));
+    }
     infos[count].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     writes[count] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     writes[count].dstSet = set;
@@ -1254,8 +1263,38 @@ VkDescriptorSet MakeTextureSet(uint32_t dev, const NativeShader& shader, uint32_
 
 // ---- Draw -----------------------------------------------------------------------------------
 
+// Literal constants of a shader object (`def`). The library loads these straight from the shader's
+// memory to the GPU (sub_83768568), so they never reach the device struct's shadow.
+struct LiteralConstants {
+  uint32_t physical[256] = {};  // Guest physical address of the vec4; 0 = use the device value.
+};
+
+const LiteralConstants& GetLiterals(uint32_t object, uint32_t info, uint32_t base) {
+  static std::unordered_map<uint64_t, LiteralConstants> cache;
+  const uint64_t key = (uint64_t(object) << 32) | info;
+  const auto found = cache.find(key);
+  if (found != cache.end()) return found->second;
+  LiteralConstants& out = cache[key];
+  const uint32_t table = Load(info + 20);
+  if (!table) return out;
+  uint32_t entry = table + info + 20;
+  const uint32_t end = Load(table + info + 16) + entry;
+  while (entry < end) {
+    const uint32_t start = rex::memory::load_and_swap<uint16_t>(Virt(entry));
+    const uint32_t dwords = rex::memory::load_and_swap<uint16_t>(Virt(entry + 2));
+    if (!dwords) break;
+    const uint32_t source = ToPhysical(Load(entry + 4) + base);
+    entry += 8;
+    for (uint32_t i = 0; i < dwords / 4; ++i) {
+      out.physical[(start + i) & 255] = source + i * 16;
+    }
+  }
+  return out;
+}
+
 // Vec4s the shader reads, in order; the shader indexes this packed list.
-VkDeviceSize PackFloatConstants(uint32_t guest, const uint64_t bitmap[4], uint32_t count) {
+VkDeviceSize PackFloatConstants(uint32_t guest, const uint64_t bitmap[4], uint32_t count,
+                                const LiteralConstants& literals) {
   const VkDeviceSize offset = UploadAlloc(std::max<uint32_t>(count, 1) * 16);
   if (offset == VK_WHOLE_SIZE) return offset;
   auto* out = reinterpret_cast<uint32_t*>(r.f->upload_map + offset);
@@ -1266,7 +1305,8 @@ VkDeviceSize PackFloatConstants(uint32_t guest, const uint64_t bitmap[4], uint32
     while (bits) {
       const uint32_t index = i * 64 + uint32_t(_tzcnt_u64(bits));
       bits &= bits - 1;
-      SwapDwords(out + written * 4, in + index * 4, 4);
+      const uint32_t literal = literals.physical[index];
+      SwapDwords(out + written * 4, literal ? Phys(literal) : reinterpret_cast<const uint8_t*>(in + index * 4), 4);
       ++written;
     }
   }
@@ -1287,6 +1327,13 @@ void RendererDrainImmediate() {
   std::lock_guard lock(g_mutex);
   for (const PendingImmediate& p : r.pending) {
     std::memcpy(r.heap_map + p.heap_offset, Virt(p.guest), p.bytes);
+    if (r.dumping) {
+      uint32_t v[12] = {};
+      SwapDwords(v, Virt(p.guest), std::min<uint32_t>(p.bytes / 4, 12));
+      float* f = reinterpret_cast<float*>(v);
+      REXLOG_INFO("NG2 NATIVE   imm {} bytes: {} {} {} {} {} {} {} {} {} {} {} {}", p.bytes, f[0], f[1],
+                  f[2], f[3], f[4], f[5], f[6], f[7], f[8], f[9], f[10], f[11]);
+    }
   }
   r.pending.clear();
 }
@@ -1507,9 +1554,12 @@ void RendererDraw(const DrawCall& d) {
     }
   }
   const VkDeviceSize system_offset = UploadAlloc(sizeof(system));
-  const VkDeviceSize vs_offset = PackFloatConstants(dev + kDevVsFloat, vs->float_bitmap, vs->float_constant_count);
+  const VkDeviceSize vs_offset =
+      PackFloatConstants(dev + kDevVsFloat, vs->float_bitmap, vs->float_constant_count,
+                         GetLiterals(vs_object, vs_object + 872, Load(vs_object + 32)));
   const VkDeviceSize ps_offset =
-      ps ? PackFloatConstants(dev + kDevPsFloat, ps->float_bitmap, ps->float_constant_count)
+      ps ? PackFloatConstants(dev + kDevPsFloat, ps->float_bitmap, ps->float_constant_count,
+                              GetLiterals(ps_object, ps_object + 40, Load(ps_object + 24)))
          : vs_offset;
   const VkDeviceSize fetch_offset = UploadAlloc(sizeof(fetch));
   uint8_t bool_loop[160];
@@ -1601,6 +1651,21 @@ void RendererDraw(const DrawCall& d) {
   }
   ++g_s.drawn;
   if (r.dumping) {
+    std::string slots;
+    for (uint32_t slot : vs->vertex_fetch_slots) slots += fmt::format("{}({:08X} {:08X}) ", slot, fetch[slot * 2], fetch[slot * 2 + 1]);
+    REXLOG_INFO("NG2 NATIVE   vs flags {:X} floats {} slots {} ps floats {} sys flags {:X} ndc {} {} {} {}",
+                vs->flags, vs->float_constant_count, slots, ps ? ps->float_constant_count : 0, flags,
+                system.ndc_scale[0], system.ndc_offset[0], system.ndc_scale[1], system.ndc_offset[1]);
+    if (vs->float_constant_count) {
+      auto* c = reinterpret_cast<float*>(r.f->upload_map + vs_offset);
+      REXLOG_INFO("NG2 NATIVE   vs c: {} {} {} {} / {} {} {} {}", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]);
+    }
+    if (ps && ps->float_constant_count) {
+      auto* c = reinterpret_cast<float*>(r.f->upload_map + ps_offset);
+      std::string text;
+      for (uint32_t i = 0; i < ps->float_constant_count; ++i) text += fmt::format("{} ", c[i * 4]);
+      REXLOG_INFO("NG2 NATIVE   ps c.x: {} bitmap {:X} {:X}", text, ps->float_bitmap[0], ps->float_bitmap[1]);
+    }
     REXLOG_INFO(
         "NG2 NATIVE DRAW prim {} n {} idx {} vs {:016X} ps {:016X} {}x{} vport {:.1f} {:.1f} {:.1f} "
         "{:.1f} vte {:04X} depthctl {:08X} sc {} {} {} {} cull {} imm {} blend {:08X} mask {:04X}",
