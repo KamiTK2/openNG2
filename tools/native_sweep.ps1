@@ -3,6 +3,8 @@
 # Writes notes\logs\native\<name>_sweep.csv: stage, both statuses, MAE, miss counters, errors.
 param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][string[]]$Stages, [int]$Scale = 1,
       [int]$Sec = 5, [switch]$NativeOnly)
+# Stages load through the first Mission Mode entry, which spawns the player at the stage default.
+$route = 'ng2_autopilot_menu_item=2,ng2_autopilot_script=wwawwawwa'
 $root = Split-Path $PSScriptRoot -Parent
 Set-Location $root
 $csv = "notes\logs\native\${Name}_sweep.csv"
@@ -11,7 +13,7 @@ foreach ($s in ($Stages | ForEach-Object { $_ -split ',' } | Where-Object { $_ }
   $id = [Convert]::ToInt32($s, 16)
   $n = '{0}-n{1:x3}' -f $Name, $id
   $d = '{0}-d{1:x3}' -f $Name, $id
-  $r1 = & powershell -NoProfile -File tools\native_test.ps1 -Name $n -Route gameplay -Backend vulkan -Scale $Scale -MeasureSec $Sec -TimeoutSec 25 -Cvars "ng2_native_d3d=true,ng2_autopilot_stage=$id" | Select-Object -First 1
+  $r1 = & powershell -NoProfile -File tools\native_test.ps1 -Name $n -Route gameplay -Backend vulkan -Scale $Scale -MeasureSec $Sec -TimeoutSec 25 -Cvars "ng2_native_d3d=true,$route,ng2_autopilot_stage=$id" | Select-Object -First 1
   $st1 = if ($r1 -like 'PASS*') { 'PASS' } else { 'FAIL' }
   $fps = if ($r1 -match 'fps=([\d.]+)') { $Matches[1] } else { '' }
   $gpu = if ($r1 -match 'gpu=([\d.]+)') { $Matches[1] } else { '' }
@@ -21,7 +23,7 @@ foreach ($s in ($Stages | ForEach-Object { $_ -split ',' } | Where-Object { $_ }
   $err = @(Select-String -Path $log -Pattern '\[error\]' -Encoding UTF8).Count
   $st2 = ''; $mae = ''
   if (-not $NativeOnly) {
-    $r2 = & powershell -NoProfile -File tools\native_test.ps1 -Name $d -Route gameplay -Backend d3d12 -Scale $Scale -MeasureSec $Sec -TimeoutSec 30 -Cvars "ng2_autopilot_stage=$id" | Select-Object -First 1
+    $r2 = & powershell -NoProfile -File tools\native_test.ps1 -Name $d -Route gameplay -Backend d3d12 -Scale $Scale -MeasureSec $Sec -TimeoutSec 30 -Cvars "$route,ng2_autopilot_stage=$id" | Select-Object -First 1
     $st2 = if ($r2 -like 'PASS*') { 'PASS' } else { 'FAIL' }
     if ((Test-Path "notes\logs\native\$n\shot1.png") -and (Test-Path "notes\logs\native\$d\shot1.png")) {
       $o = & powershell -NoProfile -File tools\native_diff.ps1 -A "notes\logs\native\$d\shot1.png" -B "notes\logs\native\$n\shot1.png" | Out-String

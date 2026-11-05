@@ -42,6 +42,8 @@ REXCVAR_DEFINE_BOOL(ng2_autopilot_open_pane, false, "NG2",
 
 REXCVAR_DEFINE_INT32(ng2_autopilot_stage, -1, "NG2",
                      "NG2 DIAG: load this stage id in place of the requested one (-1 = off)");
+REXCVAR_DEFINE_INT32(ng2_autopilot_freeze_frame, 0, "NG2",
+                     "NG2 DIAG: freeze the guest on this swap after the goal (0 = off)");
 REXCVAR_DEFINE_BOOL(ng2_autopilot_story_mode, false, "NG2",
                     "NG2 DIAG: forced stage from Mission Mode runs in story mode");
 REXCVAR_DEFINE_INT32(ng2_autopilot_entry, 0xFFFF, "NG2", "NG2 DIAG: entry for ng2_autopilot_stage");
@@ -138,12 +140,6 @@ void Ng2AutopilotPad(uint32_t user_index, rex::input::X_INPUT_STATE* st) {
       scale_changed = true;
       rex::cvar::SetFlagByName("resolution_scale",
                                std::to_string(REXCVAR_GET(ng2_autopilot_scale_change)));
-    }
-    // A forced stage can leave its chapter card up after the goal (the HUD flag comes first).
-    if (REXCVAR_GET(ng2_autopilot_stage) >= 0 && now - g_ap.done_ms < 6000 && !g_ap.pressing &&
-        now >= g_ap.next_press_ms) {
-      Pulse(now, kA);
-      g_ap.next_press_ms = now + 500;
     }
     // Options route: open the Recomp Settings pane (an ImGui overlay) for a screenshot.
     static int pane_step = 0;
@@ -277,6 +273,17 @@ void Ng2AutopilotOnPresent() {
   } else if (REXCVAR_GET(ng2_autopilot_turbo) && !normal_vsync_restored) {
     normal_vsync_restored = true;
     rex::cvar::SetFlagByName("vsync", "true");
+  }
+  // Same-frame comparison: stop the guest on the Nth swap of the scene, counted in swaps from the
+  // first swap showing it, so that frame stays on screen on every backend. Needs N above the goal
+  // hold and turbo off. The script's timeout ends the run.
+  const int freeze = REXCVAR_GET(ng2_autopilot_freeze_frame);
+  static int scene_swaps = 0;
+  const bool scene = REXCVAR_GET(ng2_autopilot) == "cutscene" ? Ng2CutsceneUp() : Ng2InGameplay();
+  if (freeze > 0 && scene_swaps == freeze - 2) rex::cvar::SetFlagByName("ng2_native_dump_frame", "-1");
+  if (freeze > 0 && (scene_swaps > 0 || scene) && ++scene_swaps == freeze) {
+    REXLOG_INFO("NG2 AUTOPILOT frozen at frame {}", freeze);
+    for (;;) Sleep(1000);
   }
   if (!g_ap.done) return;
   static int64_t window_ms = 0;

@@ -55,6 +55,8 @@ REXCVAR_DEFINE_INT32(ng2_native_texture_mb, 2048, "NG2",
                      "Native renderer: game texture memory budget in MB; least recently used are freed");
 REXCVAR_DEFINE_INT32(ng2_native_show_resolve, -1, "NG2",
                      "Native renderer debug: present the Nth resolve of the frame instead");
+REXCVAR_DEFINE_STRING(ng2_native_skip_ps, "", "NG2",
+                      "Native renderer debug: skip draws with these pixel shader hashes");
 REXCVAR_DEFINE_INT32(ng2_native_dump_frame, 0, "NG2",
                      "Native renderer debug: log the passes of this frame");
 
@@ -101,6 +103,7 @@ constexpr uint32_t kSysAlphaFuncShift = 16;
 
 // Per-frame ring areas. Vertex streams and immediate vertices are copied here each frame.
 constexpr VkDeviceSize kHeapSize = 128ull * 1024 * 1024;
+constexpr uint64_t kStreamSlack = 64 * 1024;
 // Constants and index data the GPU reads directly: video memory, so small.
 constexpr VkDeviceSize kUploadSize = 48ull * 1024 * 1024;
 // Texture bytes, only ever a copy source: system memory.
@@ -198,6 +201,7 @@ struct Surface {
   uint32_t msaa_x = 1, msaa_y = 1;
   bool has_pending_clear = false;
   VkClearColorValue pending_clear = {};
+  uint64_t depth_fit_frame = UINT64_MAX;  // Last frame the 2x scene depth clear ran.
 };
 
 struct PipelineKey {
@@ -1556,10 +1560,12 @@ uint32_t CopyToHeap(uint32_t address, uint32_t bytes) {
   const uint64_t key = (uint64_t(address) << 32) | bytes;
   auto [it, added] = r.heap_copied.try_emplace(key, UINT32_MAX);
   if (!added) return it->second;
-  const uint32_t offset = HeapAlloc(bytes);
+  // Fetches can run past the declared size, as they could on the console: keep what follows.
+  const uint32_t copy = bytes + uint32_t(std::min<uint64_t>(kStreamSlack, 0x20000000ull - (address + bytes)));
+  const uint32_t offset = HeapAlloc(copy);
   if (offset == UINT32_MAX) return offset;
-  std::memcpy(r.heap_map + offset, Phys(address), bytes);
-  g_s.heap_bytes += bytes;
+  std::memcpy(r.heap_map + offset, Phys(address), copy);
+  g_s.heap_bytes += copy;
   it->second = offset;
   return offset;
 }
@@ -1747,6 +1753,11 @@ void RendererDraw(const DrawCall& d) {
       vs_images + vs_samplers ? MakeTextureSet(dev, *vs, vs_images, vs_samplers) : VK_NULL_HANDLE;
   const VkDescriptorSet ps_set =
       ps_images + ps_samplers ? MakeTextureSet(dev, *ps, ps_images, ps_samplers) : VK_NULL_HANDLE;
+
+  if (ps && !REXCVAR_GET(ng2_native_skip_ps).empty() &&
+      REXCVAR_GET(ng2_native_skip_ps).find(fmt::format("{:016X}", ps->ucode_hash)) != std::string::npos) {
+    return;
+  }
 
   // Vertex data.
   uint32_t fetch[32 * 6];
@@ -2065,8 +2076,10 @@ void RendererClear(uint32_t dev, uint32_t rect_count, uint32_t rects, uint32_t f
     // The 2x session asks for colour only (0x0F where the 1x session asks for 0x3F) and no other
     // clear of this depth surface reaches here, yet the frame needs it cleared (#129). Inferred:
     // without this, depth from one bad frame blocks the world for good.
-    const bool msaa_scene_clear =
-        REXCVAR_GET(ng2_native_msaa_depth_clear) && (flags & 0xF) == 0xF && s->msaa_y > 1;
+    // Once per frame per surface, so a later colour-only clear in the same scene keeps its depth.
+    const bool msaa_scene_clear = REXCVAR_GET(ng2_native_msaa_depth_clear) && (flags & 0xF) == 0xF &&
+                                  s->msaa_y > 1 && s->depth_fit_frame != r.frame_count;
+    if (msaa_scene_clear) s->depth_fit_frame = r.frame_count;
     const uint32_t mask = (flags >> 4) | (msaa_scene_clear ? 2 : 0);
     if (mask & 3) ClearDepthSurface(*s, z, stencil, mask);
   }
@@ -2214,7 +2227,9 @@ void RendererSwap(uint32_t dev, uint32_t front_texture) {
   BeginFrame();
   EndPass();
   ++g_s.frames;
-  r.dumping = uint64_t(REXCVAR_GET(ng2_native_dump_frame)) == g_s.frames;
+  r.dumping = uint64_t(REXCVAR_GET(ng2_native_dump_frame)) == g_s.frames ||
+              REXCVAR_GET(ng2_native_dump_frame) == -1;
+  if (REXCVAR_GET(ng2_native_dump_frame) == -1) rex::cvar::SetFlagByName("ng2_native_dump_frame", "0");
   (void)dev;
 
   Image* front = r.show_override;
