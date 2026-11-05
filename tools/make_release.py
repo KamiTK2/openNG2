@@ -168,7 +168,7 @@ def main():
     proj_out = os.path.join(OUT, "payload", "project", "ng2")
     for name in ("CMakeLists.txt", "ng2.toml", "ng2_manifest.toml"):
         copy(os.path.join(PROJECT, name), os.path.join(proj_out, name))
-    for sub in ("src", "config", "shaders"):
+    for sub in ("src", "config", "shaders", "upscalers"):
         for base, _, files in os.walk(os.path.join(PROJECT, sub)):
             for name in files:
                 if name in EXCLUDE_SRC:

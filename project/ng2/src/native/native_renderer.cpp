@@ -46,6 +46,7 @@
 #include <rex/ui/vulkan/mem_alloc.h>
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/provider.h>
+#include "upscale_bridge.h"
 
 #include "native_shaders.h"
 #include "native_textures.h"
@@ -67,6 +68,7 @@ REXCVAR_DEFINE_STRING(ng2_native_skip_ps, "", "NG2",
                       "Native renderer debug: skip draws with these pixel shader hashes");
 REXCVAR_DEFINE_BOOL(ng2_native_motion, false, "NG2", "Write motion vectors for the scene");
 REXCVAR_DEFINE_INT32(ng2_upscaler, 0, "NG2", "Temporal upscaler: 0 off, 1 DLSS, 2 FSR, 3 plain scaling (test)");
+REXCVAR_DEFINE_INT32(ng2_upscale_jitter_sign, 1, "NG2", "NG2 DIAG: sign of the jitter given to the upscaler");
 REXCVAR_DEFINE_INT32(ng2_upscale_quality, 3, "NG2",
                      "0 Ultra Performance, 1 Performance, 2 Balanced, 3 Quality, 4 DLAA / Native AA");
 REXCVAR_DEFINE_INT32(ng2_native_show_motion, 0, "NG2",
@@ -290,7 +292,18 @@ struct R {
   uint32_t jitter_index = 0;
   Surface* scene_color = nullptr;
   Surface* scene_depth = nullptr;
-  Image upscaled;
+  Image upscaled, depth_copy;
+  // ng2_upscalers.dll, loaded when an upscaler is first chosen.
+  bool bridge_tried = false;
+  Ng2UpscaleCreateFn bridge_create = nullptr;
+  Ng2UpscaleEvaluateFn bridge_evaluate = nullptr;
+  Ng2UpscaleDestroyFn bridge_destroy = nullptr;
+  std::wstring bridge_data_path;
+  int upscaler_kind = 0, upscaler_quality = 0;  // What the live upscaler was made for.
+  uint32_t upscaler_input_height = 0, upscaler_output_height = 0;
+  bool upscaler_ready = false, upscaler_reset = true;
+  uint32_t motion_draws_frame = 0, motion_matched_frame = 0;
+  std::chrono::steady_clock::time_point last_upscale_time;
   Image* composite = nullptr;  // The resolved texture the upscaled image stands in for.
   VkDevice dev = VK_NULL_HANDLE;
   VkPhysicalDeviceMemoryProperties memory = {};
@@ -2264,6 +2277,7 @@ void RendererDraw(const DrawCall& d) {
     } else {
       const uint64_t base_key = XXH3_64bits(draw_parts, draw_part_count * 8);
       const uint64_t draw_key = base_key + r.draw_occurrences[base_key]++;
+      ++r.motion_draws_frame;
       HistoryEntry entry = {r.history_half * kHistoryPositions + r.history_used, low, high};
       r.history_used += positions;
       r.history_now[draw_key] = entry;
@@ -2272,6 +2286,7 @@ void RendererDraw(const DrawCall& d) {
       if (last != r.history_last.end() && last->second.min_vertex == low &&
           last->second.max_vertex == high) {
         system.history_bases[1] = last->second.first - low;
+        ++r.motion_matched_frame;
       }
     }
   }
@@ -2507,6 +2522,142 @@ Image* GetResolvedImage(uint32_t texture) {
   return &stored;
 }
 
+VkImageView PlainView(Image& image) {
+  constexpr uint64_t kKey = UINT64_MAX;
+  const auto found = image.sample_views.find(kKey);
+  if (found != image.sample_views.end()) return found->second;
+  VkImageViewCreateInfo view = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  view.image = image.image;
+  view.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  view.format = image.format;
+  view.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  VkImageView out = VK_NULL_HANDLE;
+  vk.vkCreateImageView(r.dev, &view, nullptr, &out);
+  image.sample_views[kKey] = out;
+  return out;
+}
+
+Ng2UpscaleDevice BridgeDevice() {
+  const auto* instance = r.device->vulkan_instance();
+  Ng2UpscaleDevice d = {};
+  d.instance = instance->instance();
+  d.physical_device = r.device->physical_device();
+  d.device = r.dev;
+  d.get_instance_proc_addr = instance->functions().vkGetInstanceProcAddr;
+  d.get_device_proc_addr = instance->functions().vkGetDeviceProcAddr;
+  d.data_path = r.bridge_data_path.c_str();
+  return d;
+}
+
+void LoadBridge() {
+  if (r.bridge_tried) return;
+  r.bridge_tried = true;
+  const std::filesystem::path logs = std::filesystem::temp_directory_path() / "openNG2";
+  std::error_code ec;
+  std::filesystem::create_directories(logs, ec);
+  r.bridge_data_path = logs.wstring();
+  HMODULE module = LoadLibraryW(L"ng2_upscalers.dll");
+  if (!module) {
+    REXLOG_WARN("NG2 NATIVE: ng2_upscalers.dll not found, scaling plainly");
+    return;
+  }
+  r.bridge_create = reinterpret_cast<Ng2UpscaleCreateFn>(GetProcAddress(module, "Ng2UpscaleCreate"));
+  r.bridge_evaluate = reinterpret_cast<Ng2UpscaleEvaluateFn>(GetProcAddress(module, "Ng2UpscaleEvaluate"));
+  r.bridge_destroy = reinterpret_cast<Ng2UpscaleDestroyFn>(GetProcAddress(module, "Ng2UpscaleDestroy"));
+}
+
+void TransitionImages(VkCommandBuffer cb, Image* const* images, uint32_t count, VkImageLayout from, VkImageLayout to) {
+  VkImageMemoryBarrier barriers[3];
+  for (uint32_t i = 0; i < count; ++i) {
+    barriers[i] = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barriers[i].srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    barriers[i].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    barriers[i].oldLayout = from;
+    barriers[i].newLayout = to;
+    barriers[i].srcQueueFamilyIndex = barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[i].image = images[i]->image;
+    barriers[i].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  }
+  vk.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0,
+                          nullptr, 0, nullptr, count, barriers);
+}
+
+// True when the vendor upscaler filled r.upscaled.
+bool EvaluateUpscaler(VkCommandBuffer cb, Image& source) {
+  const int kind = REXCVAR_GET(ng2_upscaler);
+  if ((kind != kNg2UpscaleDlss && kind != kNg2UpscaleFsr) || !r.scene_depth ||
+      r.velocity.width != source.width || r.velocity.height != source.height) {
+    return false;
+  }
+  LoadBridge();
+  if (!r.bridge_create || !r.bridge_evaluate) return false;
+  const int quality = std::clamp(REXCVAR_GET(ng2_upscale_quality), 0, 4);
+  Ng2UpscaleDevice device = BridgeDevice();
+  if (kind != r.upscaler_kind || quality != r.upscaler_quality ||
+      r.input_height != r.upscaler_input_height || r.output_height != r.upscaler_output_height) {
+    if (r.upscaler_kind) r.bridge_destroy(r.upscaler_kind);
+    r.upscaler_kind = kind;
+    r.upscaler_quality = quality;
+    r.upscaler_input_height = r.input_height;
+    r.upscaler_output_height = r.output_height;
+    r.upscaler_ready = r.bridge_create(kind, &device, cb, source.width, source.height, r.output_width,
+                                       r.output_height, quality);
+    REXLOG_INFO("NG2 NATIVE: upscaler {} {}x{} -> {}x{} quality {}: {}", kind, source.width, source.height,
+                r.output_width, r.output_height, quality, r.upscaler_ready ? "ready" : "failed");
+    r.upscaler_reset = true;
+  }
+  if (!r.upscaler_ready) return false;
+
+  // Both vendors read a plain colour image: the game's depth has stencil beside it.
+  if (r.depth_copy.width != source.width || r.depth_copy.height != source.height) {
+    if (r.depth_copy.image != VK_NULL_HANDLE) RetireTexture(r.depth_copy);
+    r.depth_copy = {};
+    if (!MakeImage(r.depth_copy, VK_FORMAT_R32_SFLOAT, source.width, source.height, 1,
+                   VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+      return false;
+    }
+    ToGeneral(cb, r.depth_copy);
+    FullBarrier(cb);
+  }
+  VkImageCopy copy = {};
+  copy.srcSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+  copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  copy.extent = {source.width, source.height, 1};
+  vk.vkCmdCopyImage(cb, r.scene_depth->image.image, VK_IMAGE_LAYOUT_GENERAL, r.depth_copy.image,
+                    VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+  FullBarrier(cb);
+
+  Image* inputs[3] = {&source, &r.depth_copy, &r.velocity};
+  TransitionImages(cb, inputs, 3, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  const auto describe = [](Image& image) {
+    return Ng2UpscaleImage{image.image, PlainView(image), image.format, image.width, image.height};
+  };
+  const auto now = std::chrono::steady_clock::now();
+  Ng2UpscaleFrame frame = {};
+  frame.command_buffer = cb;
+  frame.color = describe(source);
+  frame.depth = describe(r.depth_copy);
+  frame.motion = describe(r.velocity);
+  frame.output = describe(r.upscaled);
+  frame.jitter_x = r.jitter_pixels[0] * float(REXCVAR_GET(ng2_upscale_jitter_sign));
+  frame.jitter_y = r.jitter_pixels[1] * float(REXCVAR_GET(ng2_upscale_jitter_sign));
+  frame.frame_ms = std::chrono::duration<float, std::milli>(now - r.last_upscale_time).count();
+  frame.sharpness = 0.0f;
+  frame.reset = r.upscaler_reset;
+  r.last_upscale_time = now;
+  const bool ok = r.bridge_evaluate(kind, &frame);
+  TransitionImages(cb, inputs, 3, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+  FullBarrier(cb);
+  // The vendors bind their own pipelines and descriptors; every native draw rebinds its own.
+  if (!ok) {
+    static bool logged = false;
+    if (!logged) REXLOG_ERROR("NG2 NATIVE: upscaler evaluate failed");
+    logged = true;
+  }
+  r.upscaler_reset = !ok;
+  return ok;
+}
+
 void Upscale(VkCommandBuffer cb, Image& source) {
   if (r.upscaled.width != r.output_width || r.upscaled.height != r.output_height ||
       r.upscaled.format != source.format) {
@@ -2520,6 +2671,8 @@ void Upscale(VkCommandBuffer cb, Image& source) {
     ToGeneral(cb, r.upscaled);
     FullBarrier(cb);
   }
+  r.composite = &source;
+  if (EvaluateUpscaler(cb, source)) return;
   VkImageBlit blit = {};
   blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
   blit.srcOffsets[1] = {int32_t(source.width), int32_t(source.height), 1};
@@ -2527,7 +2680,6 @@ void Upscale(VkCommandBuffer cb, Image& source) {
   blit.dstOffsets[1] = {int32_t(r.output_width), int32_t(r.output_height), 1};
   vk.vkCmdBlitImage(cb, source.image, VK_IMAGE_LAYOUT_GENERAL, r.upscaled.image,
                     VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_LINEAR);
-  r.composite = &source;
 }
 
 bool SameTexelBlock(VkFormat a, VkFormat b) {
@@ -2749,6 +2901,9 @@ void RendererSwap(uint32_t dev, uint32_t front_texture) {
   EndPass();
   FlushMotion();
   if (REXCVAR_GET(ng2_native_show_motion) && r.velocity.image != VK_NULL_HANDLE) r.show_override = &r.velocity;
+  // A camera cut or a new scene leaves little of the last frame to match.
+  if (r.motion_draws_frame && r.motion_matched_frame * 2 < r.motion_draws_frame) r.upscaler_reset = true;
+  r.motion_draws_frame = r.motion_matched_frame = 0;
   r.history_last.swap(r.history_now);
   r.history_now.clear();
   r.draw_occurrences.clear();
