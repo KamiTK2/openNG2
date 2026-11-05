@@ -14,6 +14,7 @@ find_package(rexglue 0.10.0 REQUIRED CONFIG)
 set(G ${SDK}/src/graphics)
 add_executable(native_shader_tool
     main.cpp
+    vk_check.cpp
     ${NG2_ROOT}/project/ng2/src/native/native_shaders.cpp
     ${G}/flags.cpp
     ${G}/format/ucode.cpp
@@ -38,4 +39,5 @@ target_include_directories(native_shader_tool BEFORE PRIVATE
     ${SDK}/thirdparty/spirv-headers/include
     ${SDK}/thirdparty/renderdoc
     ${SDK}/thirdparty/vulkan-headers/include)
-target_link_libraries(native_shader_tool PRIVATE rex::runtime rex::SPIRV rex::glslang)
+target_link_libraries(native_shader_tool PRIVATE rex::runtime rex::SPIRV rex::glslang
+    $ENV{VULKAN_SDK}/Lib/vulkan-1.lib)
