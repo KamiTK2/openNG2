@@ -838,18 +838,20 @@ Surface* GetSurface(uint32_t guest, bool depth) {
   const uint32_t size = Load(guest + 36);
   // The game makes new surface objects for the same memory, so the object is not the identity:
   // format, base and size are.
-  const uint64_t key = (uint64_t(info) << 32) ^ (uint64_t(size) << 1) ^ uint64_t(depth);
-  const auto found = r.surfaces.find(key);
-  if (found != r.surfaces.end()) return &found->second;
   const uint32_t width = ((size >> 18) & 0x3FFF) + 1;
   const uint32_t height = ((size >> 3) & 0x7FFF) + 1;
+  // Formats 3 and 12 are the same bits viewed two ways, so the key is the host format.
+  const VkFormat format = depth ? kDepthFormat : ColorFormat((info >> 16) & 0xF);
+  const uint64_t key = (uint64_t(info & 0xFFF) << 48) ^ (uint64_t(format) << 32) ^
+                       (uint64_t(width) << 16) ^ (uint64_t(height) << 1) ^ uint64_t(depth);
+  const auto found = r.surfaces.find(key);
+  if (found != r.surfaces.end()) return &found->second;
   const uint32_t msaa = (surface_info >> 16) & 3;
   if (msaa) ++g_s.msaa_surfaces;
   Surface& s = r.surfaces[key];
   s.guest = guest;
   s.depth = depth;
   s.base = info & 0xFFF;
-  const VkFormat format = depth ? kDepthFormat : ColorFormat((info >> 16) & 0xF);
   const VkImageUsageFlags usage =
       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
       (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);

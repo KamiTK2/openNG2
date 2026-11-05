@@ -38,8 +38,8 @@ Vulkan, presented through the SDK presenter (ImGui and Recomp Settings keep work
 
 | Group | Functions | Native behaviour |
 |---|---|---|
-| Draw | `83762240` DrawIndexedVertices, `83761E58` DrawVertices, `83761488` BeginVertices, `83761928` BeginIndexedVertices | Read state from the device, record a Vulkan draw |
-| Immediate vertices | Begin returns scratch guest memory; 72 inline Ends have no hook | Queue the draw, flush at the next D3D entry point |
+| Draw | `83762240` DrawIndexedVertices, `83761E58` DrawVertices, `83761488` BeginVertices, `83761928` BeginIndexedVertices | The library function runs first (it flushes dirty state into the device and patches vertex shaders; its packets are never read), then a Vulkan draw is recorded from the device. `83761928` is not drawn yet |
+| Immediate vertices | 72 inline Ends have no hook | The draw is recorded at Begin; the bytes are copied to the heap at the next D3D entry point |
 | Targets | `8375E290` Clear, `83762CA8` Resolve | Vulkan clear, image copy |
 | Present | `8376A9F8` Swap | The library's Swap still runs for its frame bookkeeping; afterwards present, then wait for the flip (the only frame pacing left, #123) |
 | Ring | `8375F428` segment kick, `8375FCE0` InsertCallback, `837613A0` SetShaderGPRAllocation | Kick dropped (the one place that reaches the primary ring), callbacks run at once on the calling thread, drains disappear. `8375FB08` KickOff stays: it recycles segment memory |
@@ -55,10 +55,10 @@ Each ends in a run through `tools/native_test.ps1`, reported against D3D12.
 
 - **M0** cvar and scaffolding: with it off, nothing changes (same log, same frame time).
 - **M1** done (#123): boots to gameplay with an empty ring, 60 fps, no fence hangs.
-- **M2** shaders: ucode from the XEX to SPIR-V, first flat-coloured HUD geometry on screen.
-- **M3** textures: untile and load from fetch constants; menus and HUD correct.
-- **M4** render targets and resolves: pass graph (#121) renders, gameplay frame on screen.
-- **M5** vertex path: patched vfetch, bone palettes, skinned characters.
+- **M2** done (#124, #125): shaders from the XEX to SPIR-V, running on real data.
+- **M3** done (#122, #125): textures load from fetch constants; menus and HUD correct.
+- **M4** done (#125): render targets and resolves, the pass graph renders, gameplay frame on screen.
+- **M5** working in the tested scene (#125): patched vfetch, bone palettes, skinned characters.
 - **M6** correctness across menus, cutscenes, chapters. Movies via a host WMV decoder.
 - **M7** performance against D3D12, then port features (FSR, frame generation, ultrawide).
 
