@@ -329,6 +329,7 @@ extern "C" REX_FUNC(sub_8375E538) {
 REXCVAR_DEFINE_BOOL(ng2_fast_loading, true, "NG2",
                     "Run loading screens unthrottled (guest vblank off while loading)");
 void Ng2AutopilotOnPresent();  // ng2_autopilot.cpp
+bool Ng2MainMenuUp();
 void Ng2OnPresent() {
   ng2::RecompCountGameFrame();
   Ng2AutopilotOnPresent();
@@ -352,9 +353,13 @@ void Ng2OnPresent() {
     // screen, and ran unthrottled for up to 15 s (GitHub #6: Genshin vs Joe at double speed,
     // odd audio). Loading screens draw 155-270 calls per frame, scenes 550+ (prof-route-4).
     const bool scene_3d = rex::graphics::LastFrameDrawCount() >= 400;
+    // The load at boot has no fade to wait for, and it ends on the title and menus: those must
+    // run at normal speed however few draws they make.
+    static bool boot_load = true;
     if (latched && !g_loading_screen.load() &&
-        (g_chapter_screen.load() || Ng2InGameplay() || scene_3d || now - icon_seen_ms > 15000 ||
-         !REXCVAR_GET(ng2_fast_loading))) {
+        (g_chapter_screen.load() || Ng2InGameplay() || scene_3d || Ng2MainMenuUp() ||
+         now - icon_seen_ms > (boot_load ? 1000 : 15000) || !REXCVAR_GET(ng2_fast_loading))) {
+      boot_load = false;
       if (scene_3d) REXLOG_INFO("NG2 fast loading: 3D scene ({} draws), off", rex::graphics::LastFrameDrawCount());
       latched = false;
     }

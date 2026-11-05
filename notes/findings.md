@@ -279,3 +279,9 @@ g2_trace_karmaon.txt`, `ng2_trace_karmaoff.txt`; generated code of the named fun
 - observed: the game still draws 16:9 and the presenter stretches it (#37), so a wide output is more pixels across the guest surface: the final surface scale differs per axis.
 - observed, runs: a-219 2520x1080 window on Auto, camera 2.3333, DLSS Quality 2293x960 -> 3440x1440, picture correct by eye; a-snap, 1920x1080 under 21:9 moved to 2560x1080; a-329 32:9 mode, FSR Quality 3413x960 -> 5120x1440; a-169 DLSS Performance 1920x1080 -> 3840x2160.
 - unknown: a real ultrawide monitor. Those runs were windows on a 16:9 display. The 21:9 mode gives 2.3333, so 3440x1440 is a slight stretch on a 2.389 display unless Auto is used. The row list on an ultrawide has been exercised by the size moving, not seen in a capture.
+
+## #153: Fast Loading stuck on with the native renderer
+
+- observed, user session 19:25:41: "NG2 fast loading: on" at boot and no "off" before the window closed at 19:26:02; game fps 512 to 684 for those 21 s, seen by the user as fast forward.
+- observed: the latch's 3D scene exit reads rex::graphics::LastFrameDrawCount(), set only by the command processor (command_processor.cpp:2031), so on native that exit never fired. Same bug as GitHub #6: a cutscene right after a load would run unthrottled on native too.
+- fix: the native renderer publishes its own draw count. Separately, the boot load now ends on the main menu or 1 s after the icon goes, since its 15 s fade wait left the title and menus unthrottled.

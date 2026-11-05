@@ -47,6 +47,7 @@
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/provider.h>
 #include "upscale_bridge.h"
+#include <rex/graphics/frame_stats.h>
 
 #include "native_shaders.h"
 #include "native_textures.h"
@@ -313,6 +314,7 @@ struct R {
   uint32_t upscaler_output_width = 0, upscaler_output_height = 0;
   bool upscaler_ready = false, upscaler_reset = true;
   uint32_t motion_draws_frame = 0, motion_matched_frame = 0;
+  uint32_t frame_draws = 0;  // Fast Loading ends at a 3D scene: the SDK's count needs the CP.
   std::chrono::steady_clock::time_point last_upscale_time;
   Image* composite = nullptr;  // The resolved texture the upscaled image stands in for.
   VkDevice dev = VK_NULL_HANDLE;
@@ -2461,6 +2463,7 @@ void RendererDraw(const DrawCall& d) {
     if (m.pipeline != VK_NULL_HANDLE) r.motion_draws.push_back(m);
   }
   ++g_s.drawn;
+  ++r.frame_draws;
   if (r.dumping) {
     std::string slots;
     for (uint32_t slot : vs->vertex_fetch_slots) slots += fmt::format("{}({:08X} {:08X}) ", slot, fetch[slot * 2], fetch[slot * 2 + 1]);
@@ -2952,6 +2955,8 @@ void RendererSwap(uint32_t dev, uint32_t front_texture) {
   EndPass();
   FlushMotion();
   if (REXCVAR_GET(ng2_native_show_motion) && r.velocity.image != VK_NULL_HANDLE) r.show_override = &r.velocity;
+  rex::graphics::SetLastFrameDrawCount(r.frame_draws);
+  r.frame_draws = 0;
   // A camera cut or a new scene leaves little of the last frame to match.
   if (r.motion_draws_frame && r.motion_matched_frame * 2 < r.motion_draws_frame) r.upscaler_reset = true;
   r.motion_draws_frame = r.motion_matched_frame = 0;
