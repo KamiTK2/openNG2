@@ -41,19 +41,20 @@ Vulkan, presented through the SDK presenter (ImGui and Recomp Settings keep work
 | Draw | `83762240` DrawIndexedVertices, `83761E58` DrawVertices, `83761488` BeginVertices, `83761928` BeginIndexedVertices | Read state from the device, record a Vulkan draw |
 | Immediate vertices | Begin returns scratch guest memory; 72 inline Ends have no hook | Queue the draw, flush at the next D3D entry point |
 | Targets | `8375E290` Clear, `83762CA8` Resolve | Vulkan clear, image copy |
-| Present | `8376A9F8` Swap, `83770C48`, `83771808` | End the frame, hand the image to the presenter |
-| Ring | `8375FB08` KickOff, `8375FCE0`, `837613A0` SetShaderGPRAllocation | No ring output; drains disappear |
-| Fences | `8375FC08` BlockOnFence, `8375FF08` BlockUntilIdle | Complete from host fences, keep `dev+10908` and `*(dev+10896)` coherent |
+| Present | `8376A9F8` Swap | The library's Swap still runs for its frame bookkeeping; afterwards present, then wait for the flip (the only frame pacing left, #123) |
+| Ring | `8375F428` segment kick, `8375FCE0` InsertCallback, `837613A0` SetShaderGPRAllocation | Kick dropped (the one place that reaches the primary ring), callbacks run at once on the calling thread, drains disappear. `8375FB08` KickOff stays: it recycles segment memory |
+| Fences | `8375F7C0` emit fence, `8375FF08` BlockUntilIdle | The fence and read position are stored in the write-back block when emitted, so `dev+10908` and `*(dev+10896)` stay coherent and BlockOnFence `8375FC08` needs no change. Real host fences join in when M2 submits work |
 
 Everything else in the library stays and acts as a state store. Setter dirty masks are ignored.
+The library's internal helpers can still write into command segment memory; those segments are
+never submitted or read.
 
 ## Milestones
 
 Each ends in a run through `tools/native_test.ps1`, reported against D3D12.
 
 - **M0** cvar and scaffolding: with it off, nothing changes (same log, same frame time).
-- **M1** boots with an empty ring: clears and swaps are native, the game loop runs, no fence hangs.
-  Proves the no-PM4 design on the real game.
+- **M1** done (#123): boots to gameplay with an empty ring, 60 fps, no fence hangs.
 - **M2** shaders: ucode from the XEX to SPIR-V, first flat-coloured HUD geometry on screen.
 - **M3** textures: untile and load from fetch constants; menus and HUD correct.
 - **M4** render targets and resolves: pass graph (#121) renders, gameplay frame on screen.

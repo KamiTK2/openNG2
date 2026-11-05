@@ -23,6 +23,8 @@ param(
   [string]$Preset = 'win-amd64-relwithdebinfo'
 )
 $ErrorActionPreference = 'Stop'
+# powershell -File passes 'a=1,b=2' as one string
+$Cvars = @($Cvars | ForEach-Object { $_ -split ',' } | Where-Object { $_ })
 $root = Split-Path $PSScriptRoot -Parent
 $bin = Join-Path $root "project\ng2\out\build\$Preset"
 $native = Join-Path $root 'notes\logs\native'

@@ -16,6 +16,7 @@ set(NG2_SOURCES
     src/crash_handler.cpp
     src/ng2_autopilot.cpp
     src/ng2_hooks.cpp
+    src/native/ng2_native_d3d.cpp
     src/ps_prompts.cpp
     src/recomp_settings.cpp
     src/shader_precompile.cpp
@@ -43,6 +44,9 @@ endif()
 set_source_files_properties(src/update_check.cpp src/recomp_settings.cpp PROPERTIES
     COMPILE_DEFINITIONS "OPENNG2_VERSION=\"${OPENNG2_VERSION}\"")
 target_link_libraries(ng2 PRIVATE winhttp windowscodecs ole32)
+
+# The native renderer uses the SDK Vulkan headers, which include RenderDoc's from their own folder.
+target_include_directories(ng2 SYSTEM PRIVATE "${REXGLUE_SHARE_DIR}/../../include/renderdoc")
 
 # NG2 DIAG: whole-program guest function counter (tools/gen_trace_all.py). Off by default.
 option(NG2_TRACE_ALL "Count guest function entries (diagnostic)" OFF)
