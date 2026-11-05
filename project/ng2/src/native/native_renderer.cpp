@@ -206,6 +206,9 @@ struct PendingImmediate {
 struct R {
   const VulkanDevice* device = nullptr;
   rex::ui::Presenter* presenter = nullptr;
+  // Internal resolution: every render target and resolved texture is this many times its guest
+  // size. Shaders use normalised coordinates, so they don't need to know. Read once at startup.
+  uint32_t scale = 1;
   VkDevice dev = VK_NULL_HANDLE;
   VkPhysicalDeviceMemoryProperties memory = {};
   bool usable = false;
@@ -546,6 +549,8 @@ bool Init() {
   auto* provider = static_cast<rex::ui::vulkan::VulkanProvider*>(graphics->provider());
   r.device = provider->vulkan_device();
   r.presenter = graphics->presenter();
+  r.scale = uint32_t(std::clamp(std::atoi(rex::cvar::GetFlagByName("resolution_scale").c_str()), 1, 8));
+  REXLOG_INFO("NG2 NATIVE: internal resolution {}x", r.scale);
   r.dev = r.device->device();
   const auto& ifn = r.device->vulkan_instance()->functions();
   ifn.vkGetPhysicalDeviceMemoryProperties(r.device->physical_device(), &r.memory);
@@ -862,7 +867,7 @@ Surface* GetSurface(uint32_t guest, bool depth) {
   const VkImageUsageFlags usage =
       VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
       (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
-  if (!MakeImage(s.image, format, width, height, 1, usage)) {
+  if (!MakeImage(s.image, format, width * r.scale, height * r.scale, 1, usage)) {
     REXLOG_ERROR("NG2 NATIVE: surface {:08X} {}x{} failed", guest, width, height);
     r.surfaces.erase(key);
     return nullptr;
@@ -1535,7 +1540,8 @@ void RendererDraw(const DrawCall& d) {
   }
   (void)pass_w;
   (void)pass_h;
-  const float w = float(width), h = float(height);
+  // Guest pixels: the viewport transform and scissor registers are in them.
+  const float w = float(width / r.scale), h = float(height / r.scale);
   const float sx = (vte & 1) ? RegFloat(dev, kVportXScale) : 1.0f;
   const float ox = (vte & 2) ? RegFloat(dev, kVportXScale + 1) : 0.0f;
   const float sy = (vte & 4) ? RegFloat(dev, kVportXScale + 2) : 1.0f;
@@ -1637,11 +1643,12 @@ void RendererDraw(const DrawCall& d) {
   if (ps_set != VK_NULL_HANDLE) {
     vk.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 3, 1, &ps_set, 0, nullptr);
   }
-  VkViewport viewport = {0.0f, 0.0f, w, h, 0.0f, 1.0f};
+  VkViewport viewport = {0.0f, 0.0f, float(width), float(height), 0.0f, 1.0f};
   vk.vkCmdSetViewport(cb, 0, 1, &viewport);
   const uint32_t tl = Reg(dev, kScissorTl), br = Reg(dev, kScissorBr);
-  int32_t x0 = tl & 0x7FFF, y0 = (tl >> 16) & 0x7FFF;
-  int32_t x1 = br & 0x7FFF, y1 = (br >> 16) & 0x7FFF;
+  const int32_t scale = int32_t(r.scale);
+  int32_t x0 = (tl & 0x7FFF) * scale, y0 = ((tl >> 16) & 0x7FFF) * scale;
+  int32_t x1 = (br & 0x7FFF) * scale, y1 = ((br >> 16) & 0x7FFF) * scale;
   x1 = std::min(x1, int32_t(width));
   y1 = std::min(y1, int32_t(height));
   VkRect2D scissor = {{x0, y0}, {uint32_t(std::max(x1 - x0, 0)), uint32_t(std::max(y1 - y0, 0))}};
@@ -1728,7 +1735,8 @@ Image* GetResolvedImage(uint32_t texture) {
   const uint32_t base = ToPhysical(words[1] & 0xFFFFF000);
   const uint32_t format = words[1] & 0x3F;
   const uint64_t key = ResolvedKey(words);
-  const uint32_t width = (words[2] & 0x1FFF) + 1, height = ((words[2] >> 13) & 0x1FFF) + 1;
+  const uint32_t width = ((words[2] & 0x1FFF) + 1) * r.scale;
+  const uint32_t height = (((words[2] >> 13) & 0x1FFF) + 1) * r.scale;
   const uint32_t levels = std::max<uint32_t>(((words[4] >> 6) & 0xF) + 1, 1);
   const VkFormat vk_format = ResolvedTextureFormat(format);
   auto found = r.resolved.find(key);
@@ -1825,15 +1833,15 @@ void RendererResolve(uint32_t dev, uint32_t flags, uint32_t source_rect, uint32_
   if (source && dest) {
     int32_t x0 = 0, y0 = 0, x1 = int32_t(source->image.width), y1 = int32_t(source->image.height);
     if (source_rect) {
-      x0 = int32_t(Load(source_rect));
-      y0 = int32_t(Load(source_rect + 4));
-      x1 = int32_t(Load(source_rect + 8));
-      y1 = int32_t(Load(source_rect + 12));
+      x0 = int32_t(Load(source_rect)) * int32_t(r.scale);
+      y0 = int32_t(Load(source_rect + 4)) * int32_t(r.scale);
+      x1 = int32_t(Load(source_rect + 8)) * int32_t(r.scale);
+      y1 = int32_t(Load(source_rect + 12)) * int32_t(r.scale);
     }
     int32_t dx = 0, dy = 0;
     if (dest_point) {
-      dx = int32_t(Load(dest_point));
-      dy = int32_t(Load(dest_point + 4));
+      dx = int32_t(Load(dest_point)) * int32_t(r.scale);
+      dy = int32_t(Load(dest_point + 4)) * int32_t(r.scale);
     }
     const int32_t dest_w = int32_t(std::max(dest->width >> level, 1u));
     const int32_t dest_h = int32_t(std::max(dest->height >> level, 1u));
