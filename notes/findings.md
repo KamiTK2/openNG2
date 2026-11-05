@@ -265,3 +265,10 @@ g2_trace_karmaon.txt`, `ng2_trace_karmaoff.txt`; generated code of the named fun
 - inferred: the near, far and field of view given to FSR are placeholders, not read from the game.
 
 - observed: the sky colour banding in the New Game cutscene is not from DLSS: the same contours are in m-cut0 with no upscaler. Whether D3D12 has it is unknown.
+
+## #151: Internal Resolution as real resolutions on the native renderer
+
+- observed: `ng2_internal_height` sets a 16:9 render height; with FSR or DLSS it is the output height and Upscaling Quality sets the input. Runs at a 2560x1440 window, capped at 60: 1920x1080 60.2 fps 54 W; 3840x2160 60.2 fps 71 W; 7680x4320 60.1 fps 144 W, 4716 MB; 3840x2160 with DLSS Quality rendered 2560x1440, 60.2 fps, 82 W; Window with FSR Quality rendered 1707x960, 59 fps, 60 W.
+- observed: FSR 1.0 now has room to work: Laplacian energy at 1080p on the 1440p window, bilinear 63.0, FSR 1.0 224.3. That measure counts RCAS sharpening as well as upscaling, and the frames are not guaranteed identical.
+- observed: the row steps live in the sandbox (2880x1620 then 3200x1800) and saves. Old settings map to 720 x their multiple.
+- unknown: the row at ultrawide. Labels and sizes assume the final 16:9 surface. The fallback when a size does not fit has not run on the RTX 4090. Output far above the window goes through the presenter's filter, whose quality has not been judged.

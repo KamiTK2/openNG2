@@ -120,6 +120,7 @@ $overrides = [ordered]@{
 }
 if ($Movies) { $overrides['ng2_skip_intro'] = 'false' }
 if ($Route -eq 'cutscene') { $overrides['ng2_skip_any_cutscene'] = 'false' }
+$overrides['ng2_internal_height'] = '0'  # -Scale decides, not the player's resolution
 foreach ($kv in $Settings) { $k, $v = $kv -split '=', 2; $overrides[$k.Trim()] = $v.Trim() }
 $settingsFile = Join-Path $sandbox 'recomp_settings.toml'
 $lines = Get-Content $settingsFile | Where-Object { $overrides.Keys -notcontains (($_ -split '=')[0].Trim()) }

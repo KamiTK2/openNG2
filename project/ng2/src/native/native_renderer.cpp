@@ -66,6 +66,8 @@ REXCVAR_DEFINE_INT32(ng2_native_skip_from, 0, "NG2", "NG2 DIAG: first draw of ng
 REXCVAR_DEFINE_INT32(ng2_native_skip_to, 100000, "NG2", "NG2 DIAG: end of the range");
 REXCVAR_DEFINE_STRING(ng2_native_skip_ps, "", "NG2",
                       "Native renderer debug: skip draws with these pixel shader hashes");
+REXCVAR_DEFINE_INT32(ng2_internal_height, 0, "NG2",
+                     "Render height, 16:9 (output height with an upscaler). -1 the window, 0 use resolution_scale");
 REXCVAR_DEFINE_BOOL(ng2_native_motion, false, "NG2", "Write motion vectors for the scene");
 REXCVAR_DEFINE_INT32(ng2_upscaler, 0, "NG2", "Temporal upscaler: 0 off, 1 DLSS, 2 FSR, 3 plain scaling (test)");
 REXCVAR_DEFINE_INT32(ng2_upscale_jitter_sign, 1, "NG2", "NG2 DIAG: sign of the jitter given to the upscaler");
@@ -191,6 +193,7 @@ struct Fn {
 constexpr int kMaxScale = 10;
 std::atomic<int> g_desired_scale{1};
 std::atomic<int> g_output_width{0}, g_output_height{0};
+std::atomic<int> g_height_limit{INT_MAX};  // Lowered when a chosen resolution doesn't fit.
 std::atomic<bool> g_dlss_available{false}, g_fsr_available{false};
 
 struct Image {
@@ -288,6 +291,8 @@ struct R {
   // Temporal upscaling. The scene chain renders at input size, the 1280x720 surface the frame ends
   // on at output size, and the upscaler fills the texture between them.
   bool temporal = false;
+  // Sized by resolution, not by whole multiples: everything below is in use.
+  bool sized = false;
   uint32_t input_width = 0, input_height = 0, output_width = 0, output_height = 0;
   float scene_x = 1.0f, scene_y = 1.0f, final_scale = 1.0f;
   float jitter_pixels[2] = {}, jitter_ndc[2] = {}, jitter_ndc_last[2] = {};
@@ -498,10 +503,18 @@ VkFormat SignedViewFormat(VkFormat format) {
 // A surface that the device can't make at this scale (too large, or out of memory) lowers the
 // scale for the session: the next frame recreates everything smaller instead of dropping draws.
 bool FitsDevice(uint32_t unscaled_width, uint32_t unscaled_height) {
+  if (r.sized) return true;  // ApplyResolutionScale already keeps sizes in range.
   return std::max(unscaled_width, unscaled_height) * r.scale <= r.max_image_dimension;
 }
 
 void ReduceScale(uint32_t unscaled_width, uint32_t unscaled_height) {
+  if (r.sized) {
+    const int lower = std::max(360, int(r.output_height) / 2);
+    if (lower >= g_height_limit.load()) return;
+    g_height_limit = lower;
+    REXLOG_WARN("NG2 NATIVE: height {} does not fit this device, using {}", r.output_height, lower);
+    return;
+  }
   const uint32_t fit = r.max_image_dimension / std::max({unscaled_width, unscaled_height, 1u});
   const int lower = int(std::clamp(std::min(fit, r.scale - 1), 1u, r.scale));
   if (r.scale <= 1 || lower >= g_desired_scale.load()) return;
@@ -923,25 +936,33 @@ void ApplyResolutionScale() {
   const int kind = REXCVAR_GET(ng2_upscaler);
   const bool temporal = kind == 3 || (kind == kNg2UpscaleDlss && g_dlss_available) ||
                         (kind == kNg2UpscaleFsr && g_fsr_available);
+  const int chosen_height = REXCVAR_GET(ng2_internal_height);
+  const bool sized = temporal || chosen_height != 0;
   uint32_t output_height = 0, output_width = 0, input_width = 0, input_height = 0;
-  if (temporal) {
+  if (sized) {
     static constexpr float kRatios[5] = {1.0f / 3.0f, 0.5f, 0.58f, 2.0f / 3.0f, 1.0f};
-    const float ratio = kRatios[std::clamp(REXCVAR_GET(ng2_upscale_quality), 0, 4)];
+    const float ratio =
+        temporal ? kRatios[std::clamp(REXCVAR_GET(ng2_upscale_quality), 0, 4)] : 1.0f;
     const int window_w = g_output_width.load(), window_h = g_output_height.load();
     // The final surface is 16:9 whatever the window is.
-    output_height = uint32_t(window_h > 0 ? std::min(window_h, window_w * 9 / 16) : 1440);
-    output_width = output_height * 16 / 9;
+    const int fitted = window_h > 0 ? std::min(window_h, window_w * 9 / 16) : 1440;
+    const int largest = int(uint64_t(r.max_image_dimension) * 9 / 16);
+    output_height = uint32_t(std::clamp(std::min(chosen_height > 0 ? chosen_height : fitted,
+                                                 g_height_limit.load()),
+                                        360, largest));
+    output_width = uint32_t(std::lround(float(output_height) * 16.0f / 9.0f));
     input_width = uint32_t(std::lround(float(output_width) * ratio));
     input_height = uint32_t(std::lround(float(output_height) * ratio));
   }
-  if (want == r.scale && temporal == r.temporal && output_height == r.output_height &&
-      input_height == r.input_height) {
+  if (want == r.scale && temporal == r.temporal && sized == r.sized &&
+      output_height == r.output_height && input_height == r.input_height) {
     return;
   }
   for (Frame& frame : r.frames) vk.vkWaitForFences(r.dev, 1, &frame.fence, VK_TRUE, UINT64_MAX);
   REXLOG_INFO("NG2 NATIVE: internal resolution {}x -> {}x, upscaling {} {}x{} -> {}x{}", r.scale, want,
               temporal, input_width, input_height, output_width, output_height);
   r.temporal = temporal;
+  r.sized = sized;
   r.output_width = output_width;
   r.output_height = output_height;
   r.input_width = input_width;
@@ -1225,7 +1246,7 @@ VkFormat ColorFormat(uint32_t format) {
 }
 
 void ScaleFor(uint32_t guest_width, uint32_t guest_height, float& x, float& y) {
-  if (!r.temporal) {
+  if (!r.sized) {
     x = y = float(r.scale);
   } else if (guest_width == 1280 && guest_height == 720) {
     x = y = r.final_scale;
