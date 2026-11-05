@@ -11,8 +11,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <map>
 #include <set>
@@ -144,7 +146,7 @@ void SwapDwords(void* dst, const void* src, size_t dwords) {
 }
 
 struct Stats {
-  uint64_t drawn = 0, no_vs = 0, no_ps = 0, no_pipeline = 0, no_target = 0, prim_unsupported = 0;
+  uint64_t bind_translations = 0, drawn = 0, no_vs = 0, no_ps = 0, no_pipeline = 0, no_target = 0, prim_unsupported = 0;
   uint64_t passes = 0, heap_bytes = 0, upload_bytes = 0, textures = 0, texture_misses = 0;
   uint64_t resolves = 0, resolves_skipped = 0, clears = 0, msaa_surfaces = 0, frames = 0;
   uint64_t upload_full = 0, heap_full = 0, bad_mode = 0, indexed_seen = 0, texture_reloads = 0, texture_evictions = 0;
@@ -288,6 +290,10 @@ struct R {
   uint64_t frame_count = 0, texture_bytes = 0;
 
   ShaderPack pack;
+  // Shaders translated at bind time, kept on disk beside the pack. A deque: draws hold pointers.
+  std::deque<NativeShader> runtime_shaders;
+  std::unordered_map<uint64_t, const NativeShader*> runtime_by_hash;
+  std::filesystem::path runtime_pack_path;
   std::unordered_map<uint64_t, VkShaderModule> modules;
   std::unordered_map<uint64_t, const NativeShader*> shader_by_key;
   std::unordered_set<uint64_t> missed;
@@ -667,7 +673,19 @@ bool Init() {
     REXLOG_ERROR("NG2 NATIVE: shader pack {}: {}", pack_path.string(), error);
     return false;
   }
-  REXLOG_INFO("NG2 NATIVE: {} shaders in the pack", r.pack.size());
+  r.runtime_pack_path = pack_path.parent_path() / "ng2_native_shaders_runtime.pack";
+  if (std::filesystem::exists(r.runtime_pack_path)) {
+    ShaderPack runtime;
+    if (runtime.Load(r.runtime_pack_path, &error)) {
+      for (const NativeShader& shader : runtime.shaders()) {
+        r.runtime_by_hash[shader.ucode_hash] = &r.runtime_shaders.emplace_back(shader);
+      }
+    } else {
+      REXLOG_WARN("NG2 NATIVE: ignoring runtime shader pack: {}", error);
+    }
+  }
+  REXLOG_INFO("NG2 NATIVE: {} shaders in the pack, {} translated at bind time earlier", r.pack.size(),
+              r.runtime_shaders.size());
 
   if (!MakeMappedBuffer(kStagingSize * kFrames, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, r.staging,
                         r.staging_map, false) ||
@@ -1048,16 +1066,44 @@ Surface* GetSurface(uint32_t guest, bool depth) {
 
 // ---- Shaders --------------------------------------------------------------------------------
 
-const NativeShader* FindShader(uint32_t ucode_guest_virtual_base, uint32_t bytes, uint32_t decl) {
+// Patched vertex shaders can differ per declaration, so the pack can't list them all: a miss is
+// translated here once and saved. Only a translator failure drops the draw.
+const NativeShader* TranslateAtBind(ShaderStage stage, uint32_t ucode_guest_physical, uint32_t bytes,
+                                    uint64_t hash) {
+  const auto found = r.runtime_by_hash.find(hash);
+  if (found != r.runtime_by_hash.end()) return found->second;
+  NativeShader shader;
+  std::string error;
+  const auto start = std::chrono::steady_clock::now();
+  if (!TranslateShader(stage, reinterpret_cast<const uint32_t*>(Phys(ucode_guest_physical)),
+                       bytes / 4, hash, shader, &error)) {
+    REXLOG_ERROR("NG2 NATIVE: shader {:016X} failed to translate: {}", hash, error);
+    r.runtime_by_hash[hash] = nullptr;
+    return nullptr;
+  }
+  shader.guest_address = ucode_guest_physical;
+  const NativeShader* stored = &r.runtime_shaders.emplace_back(std::move(shader));
+  r.runtime_by_hash[hash] = stored;
+  ShaderPack runtime;
+  for (const NativeShader& s : r.runtime_shaders) runtime.Add(s);
+  const bool saved = runtime.Save(r.runtime_pack_path);
+  ++g_s.bind_translations;
+  REXLOG_INFO("NG2 NATIVE: translated {} shader {:016X} at bind, {} bytes, {:.1f} ms, saved {}",
+              stage == ShaderStage::kVertex ? "vertex" : "pixel", hash, bytes,
+              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+                  .count(),
+              saved);
+  return stored;
+}
+
+const NativeShader* FindShader(ShaderStage stage, uint32_t ucode_guest_virtual_base, uint32_t bytes,
+                               uint32_t decl) {
   const uint64_t key = (uint64_t(ucode_guest_virtual_base) << 32) ^ (uint64_t(decl) << 2) ^ bytes;
   const auto found = r.shader_by_key.find(key);
   if (found != r.shader_by_key.end()) return found->second;
   const uint64_t hash = XXH3_64bits(Phys(ucode_guest_virtual_base), bytes);
   const NativeShader* shader = r.pack.Find(hash);
-  if (!shader && r.missed.insert(hash).second) {
-    REXLOG_WARN("NG2 NATIVE: shader miss hash {:016X} ucode {:08X} {} bytes decl {:08X}", hash,
-                ucode_guest_virtual_base, bytes, decl);
-  }
+  if (!shader) shader = TranslateAtBind(stage, ucode_guest_virtual_base, bytes, hash);
   r.shader_by_key[key] = shader;
   return shader;
 }
@@ -1714,7 +1760,7 @@ void RendererDraw(const DrawCall& d) {
   const uint32_t variant = (!ps_object && (Load(vs_object + 872) & 0x20)) ? 1 : 0;
   const uint32_t vs_header = vs_object + Load(vs_object + (variant + 112) * 8);
   const uint32_t vs_ucode = Load(vs_header + 872) + Load(vs_object + 32);
-  const NativeShader* vs = FindShader(ToPhysical(vs_ucode), Load(vs_header + 876), decl);
+  const NativeShader* vs = FindShader(ShaderStage::kVertex, ToPhysical(vs_ucode), Load(vs_header + 876), decl);
   if (!vs) {
     ++g_s.no_vs;
     return;
@@ -1723,7 +1769,7 @@ void RendererDraw(const DrawCall& d) {
   if (ps_object) {
     const uint32_t ps_header = ps_object + Load(ps_object + 64);
     const uint32_t ps_ucode = Load(ps_header + 40) + Load(ps_object + 24);
-    ps = FindShader(ToPhysical(ps_ucode), Load(ps_header + 44), 0);
+    ps = FindShader(ShaderStage::kPixel, ToPhysical(ps_ucode), Load(ps_header + 44), 0);
     if (!ps) {
       ++g_s.no_ps;
       return;
