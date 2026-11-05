@@ -263,3 +263,5 @@ g2_trace_karmaon.txt`, `ng2_trace_karmaoff.txt`; generated code of the named fun
 - unknown: everything past one courtyard. Moving enemies, particles, other chapters and fast cuts haven't been compared. Temporal modes have not been compared against D3D12 at a high scale, and not by a person.
 - known gap, observed: the sky writes no motion (up-mv2), so it counts as still while the camera turns. Draws with no match on their first visible frame are also still for one frame.
 - inferred: the near, far and field of view given to FSR are placeholders, not read from the game.
+
+- observed: the sky colour banding in the New Game cutscene is not from DLSS: the same contours are in m-cut0 with no upscaler. Whether D3D12 has it is unknown.
