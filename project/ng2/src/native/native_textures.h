@@ -23,6 +23,8 @@ namespace ng2::native {
 // Numeric values of VkFormat, so this header doesn't need the Vulkan headers.
 constexpr uint32_t kVkFormatUndefined = 0;
 constexpr uint32_t kVkFormatR8Unorm = 9;
+constexpr uint32_t kVkFormatR16G16B16A16Sfloat = 97;
+constexpr uint32_t kVkFormatR32Sfloat = 100;
 constexpr uint32_t kVkFormatR8G8B8A8Unorm = 37;
 constexpr uint32_t kVkFormatA2B10G10R10UnormPack32 = 64;
 constexpr uint32_t kVkFormatBc1RgbaUnormBlock = 133;

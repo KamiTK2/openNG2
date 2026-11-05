@@ -99,9 +99,12 @@ constexpr uint32_t kSysXYDividedByW = 1u << 8, kSysZDividedByW = 1u << 9,
                    kSysPrimitiveLine = 1u << 12, kSysDepthFloat24 = 1u << 15;
 constexpr uint32_t kSysAlphaFuncShift = 16;
 
-constexpr VkDeviceSize kMirrorSize = 512ull * 1024 * 1024;
-constexpr VkDeviceSize kImmediateSize = 64ull * 1024 * 1024;
-constexpr VkDeviceSize kUploadSize = 256ull * 1024 * 1024;
+// Per-frame ring areas. Vertex streams and immediate vertices are copied here each frame.
+constexpr VkDeviceSize kHeapSize = 128ull * 1024 * 1024;
+// Constants and index data the GPU reads directly: video memory, so small.
+constexpr VkDeviceSize kUploadSize = 48ull * 1024 * 1024;
+// Texture bytes, only ever a copy source: system memory.
+constexpr VkDeviceSize kStagingSize = 256ull * 1024 * 1024;
 constexpr VkDeviceSize kUploadAlign = 256;
 constexpr uint32_t kFrames = 2;
 constexpr uint32_t kDescriptorSetsPerFrame = 8192;
@@ -137,7 +140,7 @@ struct Stats {
   uint64_t drawn = 0, no_vs = 0, no_ps = 0, no_pipeline = 0, no_target = 0, prim_unsupported = 0;
   uint64_t passes = 0, heap_bytes = 0, upload_bytes = 0, textures = 0, texture_misses = 0;
   uint64_t resolves = 0, resolves_skipped = 0, clears = 0, msaa_surfaces = 0, frames = 0;
-  uint64_t upload_full = 0, bad_mode = 0, indexed_seen = 0, texture_reloads = 0, texture_evictions = 0;
+  uint64_t upload_full = 0, heap_full = 0, bad_mode = 0, indexed_seen = 0, texture_reloads = 0, texture_evictions = 0;
 } g_s;
 
 #define NG2_VK_FUNCS(F)                                                                       \
@@ -213,9 +216,10 @@ struct Frame {
   VkFence fence = VK_NULL_HANDLE;
   VkDescriptorPool pool = VK_NULL_HANDLE;
   VkDescriptorSet constants = VK_NULL_HANDLE;
-  VkDeviceSize upload_offset = 0, immediate_offset = 0;
+  VkDeviceSize upload_offset = 0, staging_offset = 0, heap_offset = 0;
   uint8_t* upload_map = nullptr;
-  VkDeviceSize upload_base = 0;
+  uint8_t* staging_map = nullptr;
+  VkDeviceSize upload_base = 0, staging_base = 0, heap_base = 0;
   bool timestamps_valid = false;
 };
 
@@ -239,9 +243,10 @@ struct R {
   VkPhysicalDeviceMemoryProperties memory = {};
   bool usable = false;
 
-  VkBuffer heap = VK_NULL_HANDLE, upload = VK_NULL_HANDLE;
+  VkBuffer heap = VK_NULL_HANDLE, upload = VK_NULL_HANDLE, staging = VK_NULL_HANDLE;
   uint8_t* heap_map = nullptr;
   uint8_t* upload_map = nullptr;
+  uint8_t* staging_map = nullptr;
   VkDescriptorSetLayout heap_layout = VK_NULL_HANDLE, constants_layout = VK_NULL_HANDLE;
   VkDescriptorPool static_pool = VK_NULL_HANDLE;
   VkDescriptorSet heap_set = VK_NULL_HANDLE;
@@ -297,7 +302,7 @@ struct R {
   Surface* pass_depth = nullptr;
   uint32_t pass_width = 0, pass_height = 0;
 
-  std::unordered_set<uint64_t> heap_copied;  // (address, size) copied this frame.
+  std::unordered_map<uint64_t, uint32_t> heap_copied;  // (address, size) -> heap offset, this frame.
   std::vector<PendingImmediate> pending;
 
   // Constants reused when nothing changed.
@@ -321,7 +326,8 @@ uint32_t FindMemoryType(uint32_t bits, VkMemoryPropertyFlags want) {
 }
 
 // Host visible memory, in video memory when the BAR is large enough to hold it.
-bool MakeMappedBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer& buffer, uint8_t*& map) {
+bool MakeMappedBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer& buffer, uint8_t*& map,
+                      bool video = true) {
   VkBufferCreateInfo info = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
   info.size = size;
   info.usage = usage;
@@ -334,7 +340,7 @@ bool MakeMappedBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer& buf
   const VkMemoryPropertyFlags kHost =
       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
   uint32_t type = FindMemoryType(req.memoryTypeBits, kHost | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-  if (type != UINT32_MAX &&
+  if (video && type != UINT32_MAX &&
       r.memory.memoryHeaps[r.memory.memoryTypes[type].heapIndex].size > size * 2) {
     alloc.memoryTypeIndex = type;
     if (vk.vkAllocateMemory(r.dev, &alloc, nullptr, &memory) == VK_SUCCESS) {
@@ -627,8 +633,9 @@ bool Init() {
   }
   REXLOG_INFO("NG2 NATIVE: {} shaders in the pack", r.pack.size());
 
-  if (!MakeMappedBuffer(kMirrorSize + kImmediateSize * kFrames, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                        r.heap, r.heap_map) ||
+  if (!MakeMappedBuffer(kStagingSize * kFrames, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, r.staging,
+                        r.staging_map, false) ||
+      !MakeMappedBuffer(kHeapSize * kFrames, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, r.heap, r.heap_map) ||
       !MakeMappedBuffer(kUploadSize * kFrames,
                         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
                             VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
@@ -705,6 +712,9 @@ bool Init() {
     vk.vkCreateDescriptorPool(r.dev, &frame_pool, nullptr, &f.pool);
     f.upload_base = kUploadSize * i;
     f.upload_map = r.upload_map + f.upload_base;
+    f.staging_base = kStagingSize * i;
+    f.staging_map = r.staging_map + f.staging_base;
+    f.heap_base = kHeapSize * i;
 
     VkDescriptorSetAllocateInfo set_alloc = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     set_alloc.descriptorPool = r.static_pool;
@@ -788,7 +798,8 @@ void BeginFrame() {
   FreeRetiredImages();
   vk.vkResetDescriptorPool(r.dev, f.pool, 0);
   f.upload_offset = 0;
-  f.immediate_offset = 0;
+  f.staging_offset = 0;
+  f.heap_offset = 0;
   r.heap_copied.clear();
   r.last_bool_loop_offset = VK_WHOLE_SIZE;
   r.resolve_index = 0;
@@ -821,6 +832,31 @@ VkDeviceSize UploadAlloc(VkDeviceSize bytes, VkDeviceSize slack = 8192) {
   f.upload_offset = offset + bytes;
   g_s.upload_bytes += bytes;
   return offset;
+}
+
+VkDeviceSize StagingAlloc(VkDeviceSize bytes) {
+  Frame& f = *r.f;
+  const VkDeviceSize offset = (f.staging_offset + kUploadAlign - 1) & ~(kUploadAlign - 1);
+  if (offset + bytes > kStagingSize) {
+    ++g_s.upload_full;
+    return VK_WHOLE_SIZE;
+  }
+  f.staging_offset = offset + bytes;
+  g_s.upload_bytes += bytes;
+  return offset;
+}
+
+// Room in this frame's heap area, as an offset into the heap buffer; UINT32_MAX when full.
+uint32_t HeapAlloc(uint32_t bytes) {
+  Frame& f = *r.f;
+  const VkDeviceSize aligned = (bytes + 15ull) & ~15ull;
+  if (f.heap_offset + aligned > kHeapSize) {
+    ++g_s.heap_full;
+    return UINT32_MAX;
+  }
+  const VkDeviceSize offset = f.heap_base + f.heap_offset;
+  f.heap_offset += aligned;
+  return uint32_t(offset);
 }
 
 void EndPass() {
@@ -1319,7 +1355,7 @@ VkImageView LoadStaticTexture(const uint32_t words[6]) {
     ++g_s.texture_misses;
     return VK_NULL_HANDLE;
   }
-  const VkDeviceSize offset = UploadAlloc(loaded.data.size());
+  const VkDeviceSize offset = StagingAlloc(loaded.data.size());
   if (offset == VK_WHOLE_SIZE) return VK_NULL_HANDLE;
   Image image;
   const uint32_t first = loaded.mips.front().level;
@@ -1330,17 +1366,17 @@ VkImageView LoadStaticTexture(const uint32_t words[6]) {
     ++g_s.texture_misses;
     return VK_NULL_HANDLE;
   }
-  std::memcpy(r.f->upload_map + offset, loaded.data.data(), loaded.data.size());
+  std::memcpy(r.f->staging_map + offset, loaded.data.data(), loaded.data.size());
   ToGeneral(r.f->upload_cb, image);
   std::vector<VkBufferImageCopy> copies;
   for (const LoadedMip& mip : loaded.mips) {
     VkBufferImageCopy copy = {};
-    copy.bufferOffset = r.f->upload_base + offset + mip.offset;
+    copy.bufferOffset = r.f->staging_base + offset + mip.offset;
     copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip.level - first, 0, 1};
     copy.imageExtent = {mip.width, mip.height, 1};
     copies.push_back(copy);
   }
-  vk.vkCmdCopyBufferToImage(r.f->upload_cb, r.upload, image.image, VK_IMAGE_LAYOUT_GENERAL,
+  vk.vkCmdCopyBufferToImage(r.f->upload_cb, r.staging, image.image, VK_IMAGE_LAYOUT_GENERAL,
                             uint32_t(copies.size()), copies.data());
   ++g_s.textures;
   image.content_hash = HashTextureContent(desc);
@@ -1514,12 +1550,18 @@ VkDeviceSize PackFloatConstants(uint32_t guest, const uint64_t bitmap[4], uint32
   return offset;
 }
 
-void CopyToHeap(uint32_t address, uint32_t bytes) {
-  if (!bytes || address + uint64_t(bytes) > kMirrorSize) return;
+// A vertex stream's place in this frame's heap area, copied on first use; UINT32_MAX if none.
+uint32_t CopyToHeap(uint32_t address, uint32_t bytes) {
+  if (!bytes || address + uint64_t(bytes) > 0x20000000) return UINT32_MAX;
   const uint64_t key = (uint64_t(address) << 32) | bytes;
-  if (!r.heap_copied.insert(key).second) return;
-  std::memcpy(r.heap_map + address, Phys(address), bytes);
+  auto [it, added] = r.heap_copied.try_emplace(key, UINT32_MAX);
+  if (!added) return it->second;
+  const uint32_t offset = HeapAlloc(bytes);
+  if (offset == UINT32_MAX) return offset;
+  std::memcpy(r.heap_map + offset, Phys(address), bytes);
   g_s.heap_bytes += bytes;
+  it->second = offset;
+  return offset;
 }
 
 }  // namespace
@@ -1710,18 +1752,17 @@ void RendererDraw(const DrawCall& d) {
   uint32_t fetch[32 * 6];
   SwapDwords(fetch, Virt(dev + kDevFetch), 32 * 6);
   for (uint32_t slot : vs->vertex_fetch_slots) {
-    const uint32_t* words = fetch + slot * 2;
+    uint32_t* words = fetch + slot * 2;
     if ((words[0] & 3) != 3) continue;
-    CopyToHeap(words[0] & 0xFFFFFFFC, ((words[1] >> 2) & 0xFFFFFF) * 4);
+    const uint32_t heap_offset = CopyToHeap(words[0] & 0xFFFFFFFC, ((words[1] >> 2) & 0xFFFFFF) * 4);
+    if (heap_offset != UINT32_MAX) words[0] = heap_offset | (words[0] & 3);
   }
   if (d.immediate) {
     const uint32_t bytes = d.immediate_dwords * 4;
-    Frame& f = *r.f;
-    if (f.immediate_offset + bytes > kImmediateSize) return;
-    const VkDeviceSize heap_offset = kMirrorSize + kImmediateSize * r.frame_index + f.immediate_offset;
-    f.immediate_offset += (bytes + 15) & ~15u;
+    const uint32_t heap_offset = HeapAlloc(bytes);
+    if (heap_offset == UINT32_MAX) return;
     r.pending.push_back({d.immediate_guest, heap_offset, bytes});
-    fetch[95 * 2] = uint32_t(heap_offset) | 3;
+    fetch[95 * 2] = heap_offset | 3;
     fetch[95 * 2 + 1] = (d.immediate_dwords << 2) | 2;
   }
 
@@ -2287,12 +2328,12 @@ void RendererLogStats(uint64_t swaps) {
   REXLOG_INFO(
       "NG2 NATIVE frames={} drawn/f={:.1f} passes/f={:.1f} no_vs={} no_ps={} no_pipe={} no_target={} "
       "bad_prim={} heap_mb/f={:.1f} upload_mb/f={:.1f} textures={} tex_miss={} resolves/f={:.1f} "
-      "skipped={} msaa={} upload_full={} pipelines={} surfaces={} resolved={} image_mb={} bad_mode={} "
+      "skipped={} msaa={} upload_full={} heap_full={} pipelines={} surfaces={} resolved={} image_mb={} bad_mode={} "
       "indexed={} tex_mb={} reloads={} evicted={}",
       g_s.frames, float(g_s.drawn) / n, float(g_s.passes) / n, g_s.no_vs, g_s.no_ps, g_s.no_pipeline,
       g_s.no_target, g_s.prim_unsupported, float(g_s.heap_bytes) / n / 1048576.0f,
       float(g_s.upload_bytes) / n / 1048576.0f, g_s.textures, g_s.texture_misses,
-      float(g_s.resolves) / n, g_s.resolves_skipped, g_s.msaa_surfaces, g_s.upload_full,
+      float(g_s.resolves) / n, g_s.resolves_skipped, g_s.msaa_surfaces, g_s.upload_full, g_s.heap_full,
       r.pipelines.size(), r.surfaces.size(), r.resolved.size(), r.image_bytes >> 20, g_s.bad_mode,
       g_s.indexed_seen, r.texture_bytes >> 20, g_s.texture_reloads, g_s.texture_evictions);
 }

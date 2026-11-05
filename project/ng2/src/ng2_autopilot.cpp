@@ -17,6 +17,8 @@
 #include <rex/cvar.h>
 #include <rex/input/input.h>
 #include <rex/logging.h>
+#include <rex/ppc/context.h>
+#include <rex/ppc/func.h>
 
 REXCVAR_DEFINE_STRING(ng2_autopilot, "", "NG2",
                       "NG2 DIAG: drive the game unattended to menu / options / gameplay");
@@ -38,11 +40,18 @@ REXCVAR_DEFINE_STRING(ng2_autopilot_script, "", "NG2",
 REXCVAR_DEFINE_BOOL(ng2_autopilot_open_pane, false, "NG2",
                     "NG2 DIAG: after the options goal, open the Recomp Settings pane");
 
+REXCVAR_DEFINE_INT32(ng2_autopilot_stage, -1, "NG2",
+                     "NG2 DIAG: load this stage id in place of the requested one (-1 = off)");
+REXCVAR_DEFINE_BOOL(ng2_autopilot_story_mode, false, "NG2",
+                    "NG2 DIAG: forced stage from Mission Mode runs in story mode");
+REXCVAR_DEFINE_INT32(ng2_autopilot_entry, 0xFFFF, "NG2", "NG2 DIAG: entry for ng2_autopilot_stage");
+
 bool Ng2InGameplay();          // ng2_hooks.cpp
 int Ng2MainMenuCursor();       // ng2_hooks.cpp
 bool Ng2LoadingScreenUp();     // ng2_hooks.cpp
 bool Ng2ChapterScreenUp();     // ng2_hooks.cpp
 bool Ng2CutsceneUp();          // ng2_hooks.cpp
+uint16_t Ng2GuestU16(uint32_t address);  // ng2_hooks.cpp
 
 namespace {
 
@@ -70,6 +79,7 @@ struct Autopilot {
   bool menu_seen = false;
 } g_ap;
 
+
 void Note(const char* state) {
   if (g_ap.last_state == state) return;
   g_ap.last_state = state;
@@ -95,6 +105,28 @@ void Finish(const char* goal) {
 
 }  // namespace
 
+extern "C" REX_FUNC(__imp__sub_82444FB0);
+
+// Stage load: sub_82444FB0 starts a loaded stage from the u16 at 0x842B033E. Rewriting the first
+// story load sends the game's own load path (assets, chapter data) to another stage.
+extern "C" REX_FUNC(sub_82444FB0) {
+  static bool rewritten = false;
+  uint8_t* const id = base + 0x842B033E;
+  const uint32_t from = (uint32_t(id[0]) << 8) | id[1];
+  const int stage = REXCVAR_GET(ng2_autopilot_stage);
+  REXLOG_INFO("NG2 AUTOPILOT stage start {:#x} entry {:#x}", from, (uint32_t(id[-2]) << 8) | id[-1]);
+  if (stage >= 0 && !rewritten && from < 0x200) {
+    rewritten = true;
+    id[0] = uint8_t(stage >> 8);
+    id[1] = uint8_t(stage);
+    const int entry = REXCVAR_GET(ng2_autopilot_entry);
+    id[-2] = uint8_t(entry >> 8);
+    id[-1] = uint8_t(entry);
+    if (REXCVAR_GET(ng2_autopilot_story_mode)) std::memset(base + 0x84C3F064, 0, 4);
+  }
+  __imp__sub_82444FB0(ctx, base);
+}
+
 void Ng2AutopilotPad(uint32_t user_index, rex::input::X_INPUT_STATE* st) {
   const std::string route = REXCVAR_GET(ng2_autopilot);
   if (route.empty() || user_index != 0) return;
@@ -106,6 +138,12 @@ void Ng2AutopilotPad(uint32_t user_index, rex::input::X_INPUT_STATE* st) {
       scale_changed = true;
       rex::cvar::SetFlagByName("resolution_scale",
                                std::to_string(REXCVAR_GET(ng2_autopilot_scale_change)));
+    }
+    // A forced stage can leave its chapter card up after the goal (the HUD flag comes first).
+    if (REXCVAR_GET(ng2_autopilot_stage) >= 0 && now - g_ap.done_ms < 6000 && !g_ap.pressing &&
+        now >= g_ap.next_press_ms) {
+      Pulse(now, kA);
+      g_ap.next_press_ms = now + 500;
     }
     // Options route: open the Recomp Settings pane (an ImGui overlay) for a screenshot.
     static int pane_step = 0;
@@ -135,6 +173,16 @@ void Ng2AutopilotPad(uint32_t user_index, rex::input::X_INPUT_STATE* st) {
                        : route == "options" ? g_ap.left_menu == 2
                        : cutscene_route     ? g_ap.left_menu && Ng2CutsceneUp()
                                             : gameplay;
+  // A stage forced through the Mission Mode path shows its chapter card before the scene, and the
+  // gameplay flag from the HUD can still be set under it.
+  if (REXCVAR_GET(ng2_autopilot_stage) >= 0 && (Ng2ChapterScreenUp() || loading)) {
+    g_ap.goal_since_ms = 0;
+    if (Ng2ChapterScreenUp()) Pulse(now, kA | kStart);
+    Note("stage_card");
+    if (g_ap.pressing && now >= g_ap.press_end_ms) g_ap.pressing = 0;
+    if (g_ap.pressing) st->gamepad.buttons = uint16_t(uint16_t(st->gamepad.buttons) | g_ap.pressing);
+    return;
+  }
   if (goal_up) {
     if (!g_ap.goal_since_ms) g_ap.goal_since_ms = now;
     if (now - g_ap.goal_since_ms >= kGoalHoldMs) {
@@ -205,6 +253,14 @@ void Ng2AutopilotPad(uint32_t user_index, rex::input::X_INPUT_STATE* st) {
 
 void Ng2AutopilotOnPresent() {
   if (REXCVAR_GET(ng2_autopilot).empty()) return;
+  {
+    static uint32_t stage_seen = 0x10000;
+    const uint32_t stage = uint32_t(Ng2GuestU16(0x84C3F08C));
+    if (stage != stage_seen) {
+      stage_seen = stage;
+      REXLOG_INFO("NG2 AUTOPILOT stage {:#x} at t={}", stage, NowMs() - g_ap.start_ms);
+    }
+  }
   {
     static int cutscene = -1;
     const int up = Ng2CutsceneUp() ? 1 : 0;

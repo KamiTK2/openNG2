@@ -15,6 +15,8 @@ constexpr uint32_t kFormat8888 = 6;
 constexpr uint32_t kFormatDxt1 = 18;
 constexpr uint32_t kFormatDxt23 = 19;
 constexpr uint32_t kFormatDxt45 = 20;
+constexpr uint32_t kFormat16161616Float = 32;
+constexpr uint32_t kFormat32Float = 36;
 constexpr uint32_t kFormat2101010As16 = 54;
 
 constexpr uint32_t kFetchTypeTexture = 2;
@@ -229,6 +231,14 @@ bool ParseTextureFetch(const uint32_t words[6], TextureDesc& d) {
       break;
     case kFormat8888:
       d.vk_format = kVkFormatR8G8B8A8Unorm;
+      d.bytes_per_block = 4;
+      break;
+    case kFormat16161616Float:
+      d.vk_format = kVkFormatR16G16B16A16Sfloat;
+      d.bytes_per_block = 8;
+      break;
+    case kFormat32Float:
+      d.vk_format = kVkFormatR32Sfloat;
       d.bytes_per_block = 4;
       break;
     case kFormat2101010As16:

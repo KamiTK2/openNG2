@@ -19,6 +19,8 @@ param(
   [int]$TimeoutSec = 60,
   [string[]]$Cvars = @(),
   [string[]]$Settings = @(),   # recomp_settings.toml keys, 'k=v', over the pinned test values
+  [string[]]$SavePatch = @(),  # sandbox saves only: 'ng2stryd20.dat:0x24=05' (file:offset=hex byte)
+  [switch]$OtherSlot,  # sandbox only: load the ng2stryd20 story save in place of ng2stryd23
   [switch]$Movies,   # let the boot movie play (it is skipped by the autopilot's Start) instead of Skip Intro
   [int]$PulseMs = 0,
   [int]$Shots = 1,
@@ -75,6 +77,25 @@ $firstCopy = -not (Test-Path (Join-Path $sandbox 'cache'))
 $xd = @('/XD', 'save_backups'); if (-not $firstCopy) { $xd += 'cache' }
 Robo $real $sandbox (@('/MIR') + $xd)
 $before = Fingerprint
+if ($OtherSlot) {
+  $src = Get-ChildItem $sandbox -Recurse -File -Filter 'ng2stryd20.dat' | Select-Object -First 1
+  $dst = Get-ChildItem $sandbox -Recurse -File -Filter 'ng2stryd23.dat' | Select-Object -First 1
+  if (-not $src -or -not $dst -or -not $dst.FullName.StartsWith($sandbox)) { Fail-Early 'story saves not found in the sandbox' }
+  Copy-Item $src.FullName $dst.FullName -Force
+}
+foreach ($sp in @($SavePatch | ForEach-Object { $_ -split ',' } | Where-Object { $_ })) {
+  $file, $edit = $sp -split ':', 2; $off, $val = $edit -split '=', 2
+  $f = Get-ChildItem $sandbox -Recurse -File -Filter $file | Select-Object -First 1
+  if (-not $f -or -not $f.FullName.StartsWith($sandbox)) { Fail-Early "save $file not found in the sandbox" }
+  $bytes = [IO.File]::ReadAllBytes($f.FullName); $bytes[[Convert]::ToInt32($off, 16)] = [Convert]::ToByte($val, 16)
+  # Story save checksum: sum of the 7712 big-endian words before 0x7880, stored at 0x7880 (#136)
+  [uint32]$sum = 0; for ($i = 0; $i -lt 0x7880; $i += 4) {
+    $w = ([uint64]$bytes[$i] -shl 24) -bor ([uint64]$bytes[$i + 1] -shl 16) -bor ([uint64]$bytes[$i + 2] -shl 8) -bor [uint64]$bytes[$i + 3]
+    $sum = [uint32](([uint64]$sum + $w) -band 0xFFFFFFFFL) }
+  $bytes[0x7880] = [byte]($sum -shr 24); $bytes[0x7881] = [byte](($sum -shr 16) -band 255)
+  $bytes[0x7882] = [byte](($sum -shr 8) -band 255); $bytes[0x7883] = [byte]($sum -band 255)
+  [IO.File]::WriteAllBytes($f.FullName, $bytes)
+}
 $settingsHash = (Get-FileHash $settingsReal).Hash
 
 # Test settings: the user's file with the display / audio / update keys pinned
@@ -146,7 +167,7 @@ $p = Start-Process (Join-Path $bin 'ng2.exe') -WorkingDirectory $bin -PassThru -
 try {
   while ($true) {
     if ($p.HasExited) { $reason = "exited early, code $($p.ExitCode)"; break }
-    if ($clock.Elapsed.TotalSeconds -ge $TimeoutSec) { $reason = "timeout after $TimeoutSec s"; break }
+    if ($clock.Elapsed.TotalSeconds -ge $TimeoutSec) { Shot "timeout"; $reason = "timeout after $TimeoutSec s"; break }
     if (Read-Log | Select-String -SimpleMatch 'NG2 AUTOPILOT' | Select-String -SimpleMatch ' GOAL ') {
       $goalSec = [math]::Round($clock.Elapsed.TotalSeconds, 1); break
     }

@@ -26,6 +26,11 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
 
+uint16_t Ng2GuestU16(uint32_t address) {
+  auto* mem = REX_KERNEL_STATE()->memory();
+  return rex::memory::load_and_swap<uint16_t>(mem->TranslateVirtual(address));
+}
+
 namespace {
 
 uint32_t GuestLoadU32(uint32_t address) {
