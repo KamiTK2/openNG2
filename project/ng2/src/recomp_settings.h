@@ -89,7 +89,8 @@ struct RecompSettings {
   int window_x = INT_MIN;  // INT_MIN = never saved
   int window_y = INT_MIN;
   // Graphics
-  int resolution_scale = 1;  // 1..5 (live: rebuilds the GPU context)
+  int renderer = 0;          // 0 Vulkan (native), 1 D3D12 (cvar gpu_backend; next start)
+  int resolution_scale = 1;  // 1..5, 1..10 on the native renderer (live)
   int anti_aliasing = 0;     // 0 off, 1 FXAA, 2 FXAA extreme (live)
   // Scaling of the game image to the window: 0 bilinear, 1 AMD FSR 1.0 (EASU + RCAS),
   // 2 AMD CAS. Drives cvar present_effect (applied live through the presenter).

@@ -9,7 +9,8 @@ Layout:
                                    config/, shaders/ (shader manifest: hashes + addresses only) and
                                    generated/rexglue.cmake (the SDK's build template)
   payload/sdk/                     ReXGlue SDK install, Release + RelWithDebInfo only: bin/
-                                   (rexglue.exe codegen + runtime DLLs), include/, lib/, share/
+                                   (rexglue.exe codegen + runtime DLLs), include/, lib/, share/,
+                                   and translator/ (the shader translator sources ng2 compiles in)
 The launcher copies payload/project into <install>/build, runs the codegen + compile against
 the player's own game files, and installs ng2.exe (findings #67).
 """
@@ -203,6 +204,29 @@ def main():
             if is_debug_variant(name, names) or name.endswith(".pdb"):
                 continue
             copy(src, os.path.join(sdk_out, sub, name))
+
+    # Shader translator sources: ng2 compiles them in for its shader pack and bind-time shaders.
+    tr_out = os.path.join(sdk_out, "translator")
+    sdk_tree = os.path.join(ROOT, "tools", "rexglue-sdk")
+    g = "src/graphics/"
+    for rel in ("flags.cpp", "format/ucode.cpp", "util/draw.cpp", "registers.cpp"):
+        copy(os.path.join(sdk_tree, g + rel), os.path.join(tr_out, g + rel))
+    shader_dir = os.path.join(sdk_tree, "src", "graphics", "pipeline", "shader")
+    for name in os.listdir(shader_dir):
+        if name.endswith(".cpp") and (name in ("shader.cpp", "spirv.cpp", "spirv_builder.cpp")
+                                      or name.startswith("translator")
+                                      or name.startswith("spirv_translator")):
+            copy(os.path.join(shader_dir, name), os.path.join(tr_out, g + "pipeline/shader/" + name))
+    shutil.copytree(os.path.join(sdk_tree, "include"), os.path.join(tr_out, "include"))
+    for sub_dir in ("glslang", "spirv-headers/include"):
+        top = os.path.join(sdk_tree, "thirdparty", sub_dir.replace("/", os.sep))
+        for base, dirs, files in os.walk(top):
+            dirs[:] = [d for d in dirs if d not in (".git", "Test", "Test2", "gtests")]
+            for fn in files:
+                if fn.endswith((".h", ".hpp", ".hpp11", ".inc")):
+                    s = os.path.join(base, fn)
+                    rel = os.path.relpath(s, os.path.join(sdk_tree, "thirdparty"))
+                    copy(s, os.path.join(tr_out, "thirdparty", rel))
 
     write_notices(os.path.join(OUT, "THIRD-PARTY-NOTICES.txt"))
     total = sum(os.path.getsize(os.path.join(b, f)) for b, _, fs in os.walk(OUT) for f in fs)

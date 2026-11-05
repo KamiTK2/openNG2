@@ -14,7 +14,12 @@ include(generated/rexglue.cmake)
 set(NG2_SOURCES
     src/main.cpp
     src/crash_handler.cpp
+    src/ng2_autopilot.cpp
     src/ng2_hooks.cpp
+    src/native/ng2_native_d3d.cpp
+    src/native/native_renderer.cpp
+    src/native/native_shaders.cpp
+    src/native/native_textures.cpp
     src/ps_prompts.cpp
     src/recomp_settings.cpp
     src/shader_precompile.cpp
@@ -43,6 +48,40 @@ set_source_files_properties(src/update_check.cpp src/recomp_settings.cpp PROPERT
     COMPILE_DEFINITIONS "OPENNG2_VERSION=\"${OPENNG2_VERSION}\"")
 target_link_libraries(ng2 PRIVATE winhttp windowscodecs ole32)
 
+# The native renderer uses the SDK Vulkan headers, which include RenderDoc's from their own folder.
+target_include_directories(ng2 SYSTEM PRIVATE "${REXGLUE_SHARE_DIR}/../../include/renderdoc")
+
+# Bind-time translation for vertex shaders the game patches at runtime, which the offline pack can't
+# hold in full. The plugin doesn't export the translator, so its sources are compiled in here, as
+# in tools/native-shader-tool.
+set(NG2_SDK ${CMAKE_CURRENT_SOURCE_DIR}/../../tools/rexglue-sdk)
+if(NOT EXISTS ${NG2_SDK}/src/graphics)
+    set(NG2_SDK ${CMAKE_CURRENT_SOURCE_DIR}/../../sdk/translator)  # launcher install (make_release.py)
+endif()
+set(NG2_G ${NG2_SDK}/src/graphics)
+target_sources(ng2 PRIVATE
+    ${NG2_G}/flags.cpp
+    ${NG2_G}/format/ucode.cpp
+    ${NG2_G}/util/draw.cpp
+    ${NG2_G}/registers.cpp
+    ${NG2_G}/pipeline/shader/shader.cpp
+    ${NG2_G}/pipeline/shader/translator.cpp
+    ${NG2_G}/pipeline/shader/translator_disasm.cpp
+    ${NG2_G}/pipeline/shader/spirv.cpp
+    ${NG2_G}/pipeline/shader/spirv_builder.cpp
+    ${NG2_G}/pipeline/shader/spirv_translator.cpp
+    ${NG2_G}/pipeline/shader/spirv_translator_alu.cpp
+    ${NG2_G}/pipeline/shader/spirv_translator_fetch.cpp
+    ${NG2_G}/pipeline/shader/spirv_translator_memexport.cpp
+    ${NG2_G}/pipeline/shader/spirv_translator_rb.cpp)
+set_source_files_properties(src/native/native_shaders.cpp src/native/native_renderer.cpp PROPERTIES
+    COMPILE_DEFINITIONS NG2_NATIVE_WITH_TRANSLATOR=1)
+target_include_directories(ng2 BEFORE PRIVATE ${NG2_SDK}/include)
+target_include_directories(ng2 SYSTEM PRIVATE
+    ${NG2_SDK}/thirdparty/glslang
+    ${NG2_SDK}/thirdparty/spirv-headers/include)
+target_link_libraries(ng2 PRIVATE rex::SPIRV rex::glslang)
+
 # NG2 DIAG: whole-program guest function counter (tools/gen_trace_all.py). Off by default.
 option(NG2_TRACE_ALL "Count guest function entries (diagnostic)" OFF)
 if(NG2_TRACE_ALL)
@@ -57,4 +96,8 @@ add_custom_command(TARGET ng2 POST_BUILD
         ${CMAKE_CURRENT_SOURCE_DIR}/ng2.toml $<TARGET_FILE_DIR:ng2>/ng2.toml
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         ${CMAKE_CURRENT_SOURCE_DIR}/shaders $<TARGET_FILE_DIR:ng2>/shaders
+    COMMAND ${CMAKE_COMMAND}
+        -DPACK=${CMAKE_CURRENT_SOURCE_DIR}/../../tools/native-shader-tool/out/ng2_native_shaders.pack
+        -DDEST=$<TARGET_FILE_DIR:ng2>/ng2_native_shaders.pack
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/src/native/deploy_pack.cmake
     VERBATIM)

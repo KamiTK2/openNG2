@@ -32,6 +32,8 @@
 #include <rex/ui/presenter.h>
 #include <rex/ui/window.h>
 
+#include "native/native_renderer.h"
+
 #pragma comment(lib, "xinput.lib")
 #pragma comment(lib, "shell32.lib")
 
@@ -39,6 +41,7 @@ bool Ng2IngameRecompRowSelected();  // ng2_hooks.cpp
 int64_t Ng2IngameMenuHiddenMs();     // ng2_hooks.cpp
 bool Ng2MainMenuUp();                // ng2_hooks.cpp: the main menu (NEW GAME ...) is on screen
 int Ng2MainMenuCursor();             // ng2_hooks.cpp: its cursor 0..6, -1 when not up
+void Ng2AutopilotPad(uint32_t user_index, rex::input::X_INPUT_STATE* st);  // ng2_autopilot.cpp
 
 REXCVAR_DEFINE_BOOL(ng2_prompt_device_diag, false, "NG2",
                     "Log what switches button prompts between controller and keyboard");
@@ -49,6 +52,13 @@ int CurrentPromptStyle();  // ps_prompts.cpp
 bool PromptsUseKeyboard();
 
 namespace {
+// Only the native renderer goes past 5x: the emulated path is limited to 7x by the SDK.
+int MaxResolutionScale() {
+  return rex::cvar::GetFlagByName("ng2_native_d3d") == "true" &&
+                 rex::cvar::GetFlagByName("gpu_backend") == "vulkan"
+             ? 10
+             : 5;
+}
 
 // ---- helpers -----------------------------------------------------------------------
 
@@ -446,6 +456,7 @@ bool RecompSettingsBlocksGameInput() {
 void InstallRecompInputFilters() {
   rex::input::SetStateFilter([](uint32_t user_index, rex::input::X_INPUT_STATE* st) {
     auto& g = st->gamepad;
+    Ng2AutopilotPad(user_index, st);
     // In-game menu, cursor on Recomp Settings (the old NINJA CINEMA row): Left/Right/A would
     // change the hidden NINJA CINEMA value; A opens our panel instead (read directly by
     // PadInput), so the game sees none of them.
@@ -700,7 +711,8 @@ bool RecompSettings::Load(const std::filesystem::path& path) {
     // `present_vsync` = host present sync. The old `vsync` key (guest vblank) is ignored.
     else if (k == "present_vsync") vsync = ParseBool(v, vsync);
     else if (k == "monitor") monitor = ParseInt(v, monitor, 0, 16);
-    else if (k == "resolution_scale") resolution_scale = ParseInt(v, resolution_scale, 1, 5);
+    else if (k == "gpu_backend") renderer = v == "d3d12" ? 1 : 0;
+    else if (k == "resolution_scale") resolution_scale = ParseInt(v, resolution_scale, 1, 10);
     else if (k == "swap_post_effect") anti_aliasing = AaFromCvar(v);
     else if (k == "present_effect") upscaler = UpscalerFromCvar(v);
     else if (k == "ng2_sharpness") sharpness = ParseInt(v, sharpness, 0, 10);
@@ -764,6 +776,7 @@ bool RecompSettings::Save(const std::filesystem::path& path) const {
       << "fullscreen = " << b(fullscreen) << "\n"
       << "present_vsync = " << b(vsync) << "\n"
       << "monitor = " << monitor << "\n"
+      << "gpu_backend = \"" << (renderer == 1 ? "d3d12" : "vulkan") << "\"\n"
       << "resolution_scale = " << resolution_scale << "\n"
       << "swap_post_effect = \"" << AaCvarValue(anti_aliasing) << "\"\n"
       << "present_effect = \"" << UpscalerCvarValue(upscaler) << "\"\n"
@@ -812,10 +825,27 @@ bool RecompSettings::Save(const std::filesystem::path& path) const {
   return bool(out);
 }
 
+// Runs with or without a settings file. A PC that can't run the native renderer starts on D3D12
+// (a command line choice still wins), and D3D12 stops at 5x however the setting was left.
+static void ApplyRendererChoice() {
+  if (rex::cvar::GetFlagByName("gpu_backend") == "vulkan" && !native::HostSupportsNative()) {
+    REXLOG_WARN("RECOMP SETTINGS: no usable Vulkan 1.3 device, starting on D3D12");
+    rex::cvar::SetFlagByName("gpu_backend", "d3d12");
+  }
+  if (rex::cvar::GetFlagByName("gpu_backend") != "vulkan" &&
+      std::atoi(rex::cvar::GetFlagByName("resolution_scale").c_str()) > 5) {
+    rex::cvar::SetFlagByName("resolution_scale", "5");
+  }
+}
+
 void RecompSettings::ApplyStartup(const std::filesystem::path& path) {
   RecompSettings s;
-  if (!s.Load(path)) return;
+  if (!s.Load(path)) {
+    ApplyRendererChoice();
+    return;
+  }
   rex::cvar::LoadConfig(path);  // cvar keys (handles plugin cvars registered later)
+  ApplyRendererChoice();
   // The guest `vsync` cvar is the emulated 60 Hz vblank that paces NG2's fixed-step
   // simulation; off makes the game run 2-6x too fast (findings #28). Older settings files
   // wrote it from the VSync row, so force it on; VSync now maps to present_vsync.
@@ -1195,8 +1225,9 @@ RecompOptionsPane::RecompOptionsPane(rex::ui::ImGuiDrawer* drawer, rex::ui::Wind
       update_(std::make_shared<UpdateCheckState>()) {
   settings_.Load(settings_path_);
   // Show what this session actually runs with (may come from the command line).
+  settings_.renderer = rex::cvar::GetFlagByName("gpu_backend") == "vulkan" ? 0 : 1;
   settings_.resolution_scale =
-      std::clamp(std::atoi(rex::cvar::GetFlagByName("resolution_scale").c_str()), 1, 5);
+      std::clamp(std::atoi(rex::cvar::GetFlagByName("resolution_scale").c_str()), 1, MaxResolutionScale());
   settings_.monitor = std::clamp(std::atoi(rex::cvar::GetFlagByName("monitor").c_str()), 0, 16);
   settings_.anti_aliasing = AaFromCvar(rex::cvar::GetFlagByName("swap_post_effect"));
   // Upscaling is live, but show what is running (it may come from the command line).
@@ -1748,6 +1779,11 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
     }
     case 1: {  // Graphics
       {
+        const char* renderers[] = {"Vulkan", "D3D12"};
+        step_row("Renderer", renderers[s.renderer], s.renderer, 0, 1, 1,
+                 [&s](int v) { s.renderer = v; });
+      }
+      {
         // Presets set the image rows below together (not the Framerate Cap); "Custom" when
         // they match none of them.
         struct Preset { const char* name; int res, aa, upscaler, sharpness; };
@@ -1782,7 +1818,7 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
                         }});
       }
       std::snprintf(buf, sizeof(buf), "%dx", s.resolution_scale);
-      step_row("Internal Resolution", buf, s.resolution_scale, 1, 5, 1,
+      step_row("Internal Resolution", buf, s.resolution_scale, 1, MaxResolutionScale(), 1,
                [&s](int v) { s.resolution_scale = v; });
       const char* aa[] = {"Off", "FXAA", "FXAA Extreme"};
       step_row("Anti-Aliasing", aa[s.anti_aliasing], s.anti_aliasing, 0, 2, 1,
@@ -2197,7 +2233,8 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
   float fy = Y(slots) + px * 0.2f;
   // Internal Resolution and Anti-Aliasing apply live (SDK cvar callbacks; a resolution
   // change rebuilds the GPU context with a brief hitch).
-  const bool needs_restart = s.cheat_difficulties != startup_.cheat_difficulties ||
+  const bool needs_restart = s.renderer != startup_.renderer ||
+                             s.cheat_difficulties != startup_.cheat_difficulties ||
                              s.cheat_costumes != startup_.cheat_costumes ||
                              s.skip_intro != startup_.skip_intro;
   if (needs_restart) {
@@ -2210,6 +2247,13 @@ void RecompOptionsPane::OnDraw(ImGuiIO& io) {
       std::strcmp(rows[row_].label, "Preset") == 0) {
     text_at(X(L.label_x), fy, kGrey,
             "Low suits weaker PCs. Ultra renders at 4x and needs a strong GPU.", false, note_px);
+    fy += note_px * 1.5f;
+  }
+  if (focused_ && row_ >= 0 && row_ < int(rows.size()) &&
+      std::strcmp(rows[row_].label, "Renderer") == 0) {
+    text_at(X(L.label_x), fy, kGrey,
+            "Vulkan is the native renderer. D3D12 is the emulated one, slower and capped at 5x.",
+            false, note_px);
     fy += note_px * 1.5f;
   }
   if (focused_ && row_ >= 0 && row_ < int(rows.size()) &&

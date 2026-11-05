@@ -4,3 +4,20 @@
 # Ninja Gaiden II's cutscenes render black (whole frames) with the default RTV
 # EDRAM path; the ROV path renders them correctly (notes\findings.md #16).
 render_target_path_d3d12 = "rov"
+
+# Native renderer work (branch native-vulkan-renderer, notes\native_renderer.md). These only
+# affect host render target paths (Vulkan, or D3D12 with render_target_path_d3d12 = "rtv"),
+# not the default D3D12 ROV path:
+# - each render target is its own surface, no EDRAM copies between aliasing surfaces except
+#   clears and MSAA switches; resolves read their own surface (fixes black cutscenes, #113);
+native_render_targets = true
+# - Vulkan: resolved render targets reach textures as image copies instead of
+#   untile-and-upload (#109, #111).
+native_resolves = true
+# - Vulkan: NG2's 2x / 4x MSAA scene surfaces are stored as the 1x surface the game reads them
+#   back as (supersampling), which removes the MSAA copies (#117).
+ng2_msaa_supersample = true
+# The native renderer (notes/native/design.md) is the default. Recomp Settings > Graphics > Renderer
+# writes gpu_backend to the player's settings; "d3d12" runs the emulated path instead.
+gpu_backend = "vulkan"
+ng2_native_d3d = true

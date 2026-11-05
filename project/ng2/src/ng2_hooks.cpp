@@ -26,6 +26,11 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/xmemory.h>
 
+uint16_t Ng2GuestU16(uint32_t address) {
+  auto* mem = REX_KERNEL_STATE()->memory();
+  return rex::memory::load_and_swap<uint16_t>(mem->TranslateVirtual(address));
+}
+
 namespace {
 
 uint32_t GuestLoadU32(uint32_t address) {
@@ -323,8 +328,10 @@ extern "C" REX_FUNC(sub_8375E538) {
 }
 REXCVAR_DEFINE_BOOL(ng2_fast_loading, true, "NG2",
                     "Run loading screens unthrottled (guest vblank off while loading)");
+void Ng2AutopilotOnPresent();  // ng2_autopilot.cpp
 void Ng2OnPresent() {
   ng2::RecompCountGameFrame();
+  Ng2AutopilotOnPresent();
   ApplyAspectOverride();
   {
     // Fast Loading (findings #57): NG2 loads a fixed amount of work per frame while its
@@ -479,6 +486,8 @@ std::atomic<bool> g_in_gameplay{false};
 }  // namespace
 
 bool Ng2InGameplay() { return g_in_gameplay.load(std::memory_order_relaxed); }
+bool Ng2LoadingScreenUp() { return g_loading_screen.load(std::memory_order_relaxed); }
+bool Ng2ChapterScreenUp() { return g_chapter_screen.load(std::memory_order_relaxed); }
 
 
 void Ng2IngameMenuFrame(bool drawn);
@@ -1182,6 +1191,12 @@ extern "C" REX_FUNC(sub_836602D0) {
 // the hook sets the seen byte when the button is pressed (the event then ends and would be
 // marked seen anyway) and the game skips it itself (findings #48).
 REXCVAR_DEFINE_BOOL(ng2_skip_any_cutscene, true, "NG2", "Let any cutscene be skipped");
+// A movie scene or a real-time cutscene in its skippable state (test autopilot).
+bool Ng2CutsceneUp() {
+  auto* mem = REX_KERNEL_STATE()->memory();
+  const uint16_t event_skip = rex::memory::load_and_swap<uint16_t>(mem->TranslateVirtual(0x84A69AEA));
+  return event_skip == 1 || int32_t(GuestLoadU32(0x84C5580C)) > 0;
+}
 void Ng2SkipCutsceneFrame() {
   if (!REXCVAR_GET(ng2_skip_any_cutscene)) return;
   constexpr uint32_t kMovieState = 0x84C5580C;   // > 0 while the movie scene runs
